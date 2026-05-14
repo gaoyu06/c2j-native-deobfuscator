@@ -146,19 +146,24 @@ class TraceTranslator(private val manifest: ManifestJson) {
     }
 
     fun translate(method: MethodKey, jniEvents: List<JsonNode>, confidence: String): RecoveredMethod {
-        val out = mutableListOf<RecoveredInsn>()
+        // Look up the access flags so we know whether `this` is available
+        val mc = manifest.classes.firstOrNull { it.name == method.owner }
+        val mm = mc?.methods?.firstOrNull { it.name == method.name && it.desc == method.desc }
+        val isStatic = mm != null && (mm.access and 0x0008) != 0  // ACC_STATIC
+        val balancer = StackBalancer(isStatic)
         for (ev in jniEvents) {
             val call = ev["call"]?.asText() ?: continue
-            translateCall(call, ev, out)
+            translateCall(call, ev, balancer)
         }
-        out += RecoveredInsn(op = returnOp(method.desc))
+        // Final return instruction
+        balancer.out += RecoveredInsn(op = returnOp(method.desc))
         return RecoveredMethod(
             owner = method.owner,
             name = method.name,
             desc = method.desc,
             source = "dynamic",
             confidence = confidence,
-            instructions = out,
+            instructions = balancer.out,
         )
     }
 
@@ -174,150 +179,225 @@ class TraceTranslator(private val manifest: ManifestJson) {
         }
     }
 
-    private fun translateCall(call: String, ev: JsonNode, out: MutableList<RecoveredInsn>) {
+    private fun translateCall(call: String, ev: JsonNode, b: StackBalancer) {
         // Always update the symbol table first; THEN emit any bytecode.
         updateSymbols(call, ev)
 
         val args = ev["args"]
-        val ret = ev["ret"]
+        val midDesc = ev["midDesc"]?.asText()
         when (call) {
             "GetStaticObjectField", "GetStaticBooleanField", "GetStaticByteField",
             "GetStaticCharField", "GetStaticShortField", "GetStaticIntField",
             "GetStaticLongField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                out += RecoveredInsn(
-                    op = "GETSTATIC",
-                    owner = fid.owner,
-                    name = fid.name,
-                    desc = fid.desc,
+                val produce = produceFor(fid.desc, ev["ret"]?.asText())
+                b.emitRaw(
+                    RecoveredInsn(op = "GETSTATIC", owner = fid.owner, name = fid.name, desc = fid.desc),
+                    consume = 0, produce = produce,
                 )
             }
 
             "GetObjectField", "GetBooleanField", "GetByteField",
             "GetCharField", "GetShortField", "GetIntField", "GetLongField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                out += RecoveredInsn(
-                    op = "GETFIELD",
-                    owner = fid.owner,
-                    name = fid.name,
-                    desc = fid.desc,
+                b.ensureReceiver(args?.get(0)?.asText())
+                val produce = produceFor(fid.desc, ev["ret"]?.asText())
+                b.emitRaw(
+                    RecoveredInsn(op = "GETFIELD", owner = fid.owner, name = fid.name, desc = fid.desc),
+                    consume = 1, produce = produce,
                 )
             }
 
             "SetObjectField", "SetBooleanField", "SetByteField",
             "SetCharField", "SetShortField", "SetIntField", "SetLongField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                out += RecoveredInsn(
-                    op = "PUTFIELD",
-                    owner = fid.owner,
-                    name = fid.name,
-                    desc = fid.desc,
+                b.ensureReceiver(args?.get(0)?.asText())
+                b.pushArg(extractScalar(args?.get(2)), fid.desc ?: "I")
+                b.emitRaw(
+                    RecoveredInsn(op = "PUTFIELD", owner = fid.owner, name = fid.name, desc = fid.desc),
+                    consume = 2, produce = null,
                 )
+            }
+
+            "AllocObject" -> {
+                val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
+                val retHex = ev["ret"]?.asText()
+                if (cls != null) {
+                    // NEW pushes 1; DUP duplicates so subsequent INVOKESPECIAL
+                    // (consumes 1) leaves exactly one instance on the stack.
+                    b.emitRaw(RecoveredInsn(op = "NEW", type = cls.internalName), 0,
+                              if (retHex != null) StackBalancer.V.ObjHex(retHex) else StackBalancer.V.Obj)
+                    b.emitRaw(RecoveredInsn(op = "DUP"), 0,
+                              if (retHex != null) StackBalancer.V.ObjHex(retHex) else StackBalancer.V.Obj)
+                }
             }
 
             "NewObject" -> {
                 val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
                 val mid = symbols[args?.get(1)?.asText()] as? Sym.MethodId
-                if (cls != null) out += RecoveredInsn(op = "NEW", type = cls.internalName)
-                out += RecoveredInsn(op = "DUP")
-                if (mid != null) {
-                    out += RecoveredInsn(
-                        op = "INVOKESPECIAL",
-                        owner = mid.owner,
-                        name = mid.name,
-                        desc = mid.desc,
-                    )
+                val newRetHex = ev["ret"]?.asText()
+                if (cls != null) {
+                    b.emitRaw(RecoveredInsn(op = "NEW", type = cls.internalName), 0,
+                              if (newRetHex != null) StackBalancer.V.ObjHex(newRetHex) else StackBalancer.V.Obj)
+                    b.emitRaw(RecoveredInsn(op = "DUP"), 0,
+                              if (newRetHex != null) StackBalancer.V.ObjHex(newRetHex) else StackBalancer.V.Obj)
+                }
+                if (mid != null && mid.owner != null) {
+                    val ctorDesc = mid.desc ?: midDesc
+                    val pairs = collectVariadicPairs(ev, mid.desc, midDesc, varadicStartIdx = 2)
+                    // For NewObject the receiver-equivalent (the just-NEWed object) is already on stack.
+                    b.prepareCall(receiverHex = newRetHex, argDescAndHex = pairs)
+                    b.emitInvoke(RecoveredInsn(op = "INVOKESPECIAL", owner = mid.owner, name = mid.name, desc = ctorDesc))
+                }
+            }
+
+            "CallNonvirtualVoidMethod", "CallNonvirtualObjectMethod" -> {
+                val mid = symbols[args?.get(2)?.asText()] as? Sym.MethodId
+                if (mid != null && mid.owner != null) {
+                    val pairs = collectVariadicPairs(ev, mid.desc, midDesc, varadicStartIdx = 3)
+                    b.prepareCall(receiverHex = args?.get(0)?.asText(), argDescAndHex = pairs)
+                    b.emitInvoke(RecoveredInsn(op = "INVOKESPECIAL", owner = mid.owner, name = mid.name, desc = mid.desc ?: midDesc),
+                                 returnHex = ev["ret"]?.asText())
                 }
             }
 
             in CALL_OBJECT_VARIANTS, in CALL_PRIM_VARIANTS -> {
-                val isStatic = call.startsWith("CallStatic")
+                val isStaticCall = call.startsWith("CallStatic")
                 val mid = symbols[args?.get(1)?.asText()] as? Sym.MethodId
-                val midDesc = ev["midDesc"]?.asText()
                 if (mid != null && mid.owner != null) {
-                    out += RecoveredInsn(
-                        op = if (isStatic) "INVOKESTATIC" else "INVOKEVIRTUAL",
-                        owner = mid.owner,
-                        name = mid.name,
-                        desc = mid.desc ?: midDesc,
+                    val pairs = collectVariadicPairs(ev, mid.desc, midDesc, varadicStartIdx = 2)
+                    b.prepareCall(
+                        receiverHex = if (isStaticCall) null else args?.get(0)?.asText(),
+                        argDescAndHex = pairs,
                     )
-                }
-                // Drop calls whose method ID we couldn't bind to an owner
-                // (these are native-obfuscator's find_class_wo_static and
-                // similar infrastructure that aren't part of the source bytecode).
-            }
-
-            "CallNonvirtualVoidMethod", "CallNonvirtualObjectMethod" -> {
-                // args[0]=obj, args[1]=cls, args[2]=mid, args[3+]=variadic
-                val mid = symbols[args?.get(2)?.asText()] as? Sym.MethodId
-                val midDesc = ev["midDesc"]?.asText()
-                if (mid != null && mid.owner != null) {
-                    out += RecoveredInsn(
-                        op = "INVOKESPECIAL",
-                        owner = mid.owner,
-                        name = mid.name,
-                        desc = mid.desc ?: midDesc,
+                    b.emitInvoke(
+                        RecoveredInsn(
+                            op = if (isStaticCall) "INVOKESTATIC" else "INVOKEVIRTUAL",
+                            owner = mid.owner, name = mid.name, desc = mid.desc ?: midDesc,
+                        ),
+                        returnHex = ev["ret"]?.asText(),
                     )
-                }
-            }
-
-            "AllocObject" -> {
-                val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
-                if (cls != null) {
-                    out += RecoveredInsn(op = "NEW", type = cls.internalName)
-                    out += RecoveredInsn(op = "DUP")
                 }
             }
 
             "IsInstanceOf" -> {
                 val cls = symbols[args?.get(1)?.asText()] as? Sym.Class
                 if (cls != null) {
-                    out += RecoveredInsn(op = "INSTANCEOF", type = cls.internalName)
+                    b.ensureReceiver(args?.get(0)?.asText())
+                    b.emitRaw(RecoveredInsn(op = "INSTANCEOF", type = cls.internalName), 1, StackBalancer.V.Int)
                 }
             }
 
-            "GetArrayLength" -> out += RecoveredInsn(op = "ARRAYLENGTH")
+            "GetArrayLength" -> {
+                b.ensureReceiver(args?.get(0)?.asText())
+                b.emitRaw(RecoveredInsn(op = "ARRAYLENGTH"), 1, StackBalancer.V.Int)
+            }
 
             "NewObjectArray" -> {
                 val cls = symbols[args?.get(1)?.asText()] as? Sym.Class
                 if (cls != null) {
-                    out += RecoveredInsn(op = "ANEWARRAY", type = cls.internalName)
+                    b.pushInt(args?.get(0)?.asInt() ?: 0)
+                    b.emitRaw(RecoveredInsn(op = "ANEWARRAY", type = cls.internalName), 1, StackBalancer.V.Obj)
                 }
             }
 
-            "NewBooleanArray" -> out += RecoveredInsn(op = "NEWARRAY", value = 4)
-            "NewCharArray"    -> out += RecoveredInsn(op = "NEWARRAY", value = 5)
-            "NewFloatArray"   -> out += RecoveredInsn(op = "NEWARRAY", value = 6)
-            "NewDoubleArray"  -> out += RecoveredInsn(op = "NEWARRAY", value = 7)
-            "NewByteArray"    -> out += RecoveredInsn(op = "NEWARRAY", value = 8)
-            "NewShortArray"   -> out += RecoveredInsn(op = "NEWARRAY", value = 9)
-            "NewIntArray"     -> out += RecoveredInsn(op = "NEWARRAY", value = 10)
-            "NewLongArray"    -> out += RecoveredInsn(op = "NEWARRAY", value = 11)
+            "NewBooleanArray" -> { b.pushInt(args?.get(0)?.asInt() ?: 0); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 4), 1, StackBalancer.V.Obj) }
+            "NewCharArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 5), 1, StackBalancer.V.Obj) }
+            "NewFloatArray"   -> { b.pushInt(args?.get(0)?.asInt() ?: 0); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 6), 1, StackBalancer.V.Obj) }
+            "NewDoubleArray"  -> { b.pushInt(args?.get(0)?.asInt() ?: 0); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 7), 1, StackBalancer.V.Obj) }
+            "NewByteArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 8), 1, StackBalancer.V.Obj) }
+            "NewShortArray"   -> { b.pushInt(args?.get(0)?.asInt() ?: 0); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 9), 1, StackBalancer.V.Obj) }
+            "NewIntArray"     -> { b.pushInt(args?.get(0)?.asInt() ?: 0); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 10), 1, StackBalancer.V.Obj) }
+            "NewLongArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 11), 1, StackBalancer.V.Obj) }
 
-            "GetObjectArrayElement" -> out += RecoveredInsn(op = "AALOAD")
-            "SetObjectArrayElement" -> out += RecoveredInsn(op = "AASTORE")
+            "GetObjectArrayElement" -> {
+                b.ensureReceiver(args?.get(0)?.asText())
+                b.pushInt(args?.get(1)?.asInt() ?: 0)
+                b.emitRaw(RecoveredInsn(op = "AALOAD"), 2, StackBalancer.V.Obj)
+            }
+            "SetObjectArrayElement" -> {
+                b.ensureReceiver(args?.get(0)?.asText())
+                b.pushInt(args?.get(1)?.asInt() ?: 0)
+                b.pushObjLiteral(args?.get(2)?.asText() ?: "0x0")
+                b.emitRaw(RecoveredInsn(op = "AASTORE"), 3, null)
+            }
 
-            "GetBooleanArrayRegion" -> out += RecoveredInsn(op = "BALOAD")
-            "GetByteArrayRegion"    -> out += RecoveredInsn(op = "BALOAD")
-            "GetCharArrayRegion"    -> out += RecoveredInsn(op = "CALOAD")
-            "GetShortArrayRegion"   -> out += RecoveredInsn(op = "SALOAD")
-            "GetIntArrayRegion"     -> out += RecoveredInsn(op = "IALOAD")
-            "GetLongArrayRegion"    -> out += RecoveredInsn(op = "LALOAD")
-            "GetFloatArrayRegion"   -> out += RecoveredInsn(op = "FALOAD")
-            "GetDoubleArrayRegion"  -> out += RecoveredInsn(op = "DALOAD")
-
-            "SetBooleanArrayRegion" -> out += RecoveredInsn(op = "BASTORE")
-            "SetByteArrayRegion"    -> out += RecoveredInsn(op = "BASTORE")
-            "SetCharArrayRegion"    -> out += RecoveredInsn(op = "CASTORE")
-            "SetShortArrayRegion"   -> out += RecoveredInsn(op = "SASTORE")
-            "SetIntArrayRegion"     -> out += RecoveredInsn(op = "IASTORE")
-            "SetLongArrayRegion"    -> out += RecoveredInsn(op = "LASTORE")
-            "SetFloatArrayRegion"   -> out += RecoveredInsn(op = "FASTORE")
-            "SetDoubleArrayRegion"  -> out += RecoveredInsn(op = "DASTORE")
-
-            "Throw", "ThrowNew" -> out += RecoveredInsn(op = "ATHROW")
+            "Throw", "ThrowNew" -> b.emitRaw(RecoveredInsn(op = "ATHROW"), 1, null)
 
             else -> {}
+        }
+    }
+
+    private fun extractScalar(node: JsonNode?): Any? {
+        if (node == null) return null
+        return when {
+            node.isTextual -> node.asText()
+            node.isLong -> node.asLong()
+            node.isInt -> node.asInt()
+            node.isDouble -> node.asDouble()
+            else -> null
+        }
+    }
+
+    private fun produceFor(desc: String?, retHex: String? = null): StackBalancer.V? = when (desc?.firstOrNull() ?: '?') {
+        'V' -> null
+        'I', 'B', 'S', 'C', 'Z' -> StackBalancer.V.Int
+        'J' -> StackBalancer.V.Long
+        'F' -> StackBalancer.V.Float
+        'D' -> StackBalancer.V.Double
+        else -> if (retHex != null) StackBalancer.V.ObjHex(retHex) else StackBalancer.V.Obj
+    }
+
+    private fun collectVariadicPairs(ev: JsonNode, knownDesc: String?, fallbackDesc: String?, varadicStartIdx: Int): List<Pair<String, Any?>> {
+        val desc = knownDesc ?: fallbackDesc ?: return emptyList()
+        val argTypes = StackBalancer.parseArgTypes(desc)
+        val args = ev["args"] ?: return emptyList()
+        val out = mutableListOf<Pair<String, Any?>>()
+        for (i in argTypes.indices) {
+            val n = args[varadicStartIdx + i] ?: continue
+            val v: Any? = when {
+                n.isTextual -> n.asText()
+                n.isLong -> n.asLong()
+                n.isInt -> n.asInt()
+                n.isDouble -> n.asDouble()
+                else -> null
+            }
+            out.add(argTypes[i] to v)
+        }
+        return out
+    }
+
+    private fun pushVariadicArgs(b: StackBalancer, ev: JsonNode, knownDesc: String?, fallbackDesc: String?) {
+        val desc = knownDesc ?: fallbackDesc ?: return
+        val argTypes = StackBalancer.parseArgTypes(desc)
+        val args = ev["args"] ?: return
+        for (i in argTypes.indices) {
+            val n = args[2 + i] ?: continue
+            val v: Any? = when {
+                n.isTextual -> n.asText()
+                n.isLong -> n.asLong()
+                n.isInt -> n.asInt()
+                n.isDouble -> n.asDouble()
+                else -> null
+            }
+            b.pushArg(v, argTypes[i])
+        }
+    }
+
+    private fun pushVariadicArgsForNonvirtual(b: StackBalancer, ev: JsonNode, knownDesc: String?, fallbackDesc: String?) {
+        val desc = knownDesc ?: fallbackDesc ?: return
+        val argTypes = StackBalancer.parseArgTypes(desc)
+        val args = ev["args"] ?: return
+        for (i in argTypes.indices) {
+            val n = args[3 + i] ?: continue   // Nonvirtual has [obj, cls, mid, ...varargs]
+            val v: Any? = when {
+                n.isTextual -> n.asText()
+                n.isLong -> n.asLong()
+                n.isInt -> n.asInt()
+                n.isDouble -> n.asDouble()
+                else -> null
+            }
+            b.pushArg(v, argTypes[i])
         }
     }
 
