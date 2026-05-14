@@ -54,6 +54,24 @@ class StackBalancer(private val isStatic: Boolean) {
         stack.addLast(V.Obj)
     }
 
+    /**
+     * Push a null reference cast to the given type. Verifier accepts this
+     * (null is assignable to any reference type, CHECKCAST never throws on
+     * null). At runtime this NPEs if used, but the goal is verification +
+     * readability, not execution.
+     *
+     * `type` should be either an internal class name ("java/lang/String"),
+     * an array descriptor ("[I", "[Ljava/lang/Object;"), or `null`/`?` to
+     * fall back to plain ACONST_NULL.
+     */
+    fun pushNullAs(type: String?) {
+        out += RecoveredInsn(op = "ACONST_NULL")
+        if (!type.isNullOrEmpty() && type != "?") {
+            out += RecoveredInsn(op = "CHECKCAST", type = type)
+        }
+        stack.addLast(V.Obj)
+    }
+
     fun pushThis() {
         out += RecoveredInsn(op = "ALOAD", `var` = 0)
         stack.addLast(V.Obj)
@@ -81,17 +99,17 @@ class StackBalancer(private val isStatic: Boolean) {
     fun pushFloat(v: Double) { out += RecoveredInsn(op = "LDC", value = v, desc = "float"); stack.addLast(V.Float) }
     fun pushDouble(v: Double) { out += RecoveredInsn(op = "LDC", value = v, desc = "double"); stack.addLast(V.Double) }
 
-    fun pushObjPlaceholder() {
-        if (!isStatic) pushThis() else pushNull()
+    fun pushObjPlaceholder(type: String?) {
+        pushNullAs(type)
     }
 
-    fun pushObjLiteral(hex: String) {
-        // unknown source; emit a placeholder (this/null) marked with the hex
-        // so later matchers can identify "this is the same jobject as ..."
-        if (!isStatic) {
-            out += RecoveredInsn(op = "ALOAD", `var` = 0)
-        } else {
-            out += RecoveredInsn(op = "ACONST_NULL")
+    fun pushObjLiteral(hex: String, type: String? = null) {
+        // unknown source; emit `aconst_null + checkcast type` so the
+        // verifier sees a value of the expected reference type. The model
+        // remembers the hex so subsequent calls can detect chains.
+        out += RecoveredInsn(op = "ACONST_NULL")
+        if (!type.isNullOrEmpty() && type != "?") {
+            out += RecoveredInsn(op = "CHECKCAST", type = type)
         }
         stack.addLast(V.ObjHex(hex))
     }
@@ -115,11 +133,11 @@ class StackBalancer(private val isStatic: Boolean) {
      * placeholder (`this` for instance methods, null otherwise) since we
      * don't track the true origin of every jobject.
      */
-    fun ensureReceiver(wantHex: String?) {
+    fun ensureReceiver(wantHex: String?, type: String? = null) {
         if (wantHex == null) return
         val top = stack.lastOrNull()
         if (top is V.ObjHex && top.hex == wantHex) return
-        pushObjLiteral(wantHex)
+        pushObjLiteral(wantHex, type)
     }
 
     /**
@@ -131,10 +149,31 @@ class StackBalancer(private val isStatic: Boolean) {
      * `argDescAndHex` is a list of (jvm-type-letter, value) where value is
      * either a jobject hex string (for L/[ types) or a Number/String literal.
      */
-    fun prepareCall(receiverHex: String?, argDescAndHex: List<Pair<String, Any?>>) {
+    fun prepareCall(
+        receiverHex: String?,
+        receiverType: String?,
+        argDescAndHex: List<Pair<String, Any?>>,
+    ) {
         // Case 1: stack already has [receiver, args...] on top — perfect chain
         // (common for ``b.append(...).append(...)``).
         if (matchesTop(receiverHex, argDescAndHex)) return
+
+        // If the receiver is somewhere DEEPER on the stack (e.g. NEW+DUP put
+        // it at -2 and an intervening GETSTATIC pushed an unrelated value at
+        // -1), pop items above it so the receiver becomes the new top.  This
+        // is the common shape when a constructor has args that come from
+        // GETSTATIC / GETFIELD in between AllocObject and the <init> call —
+        // native-obfuscator's cstack scheduling can interleave them.
+        if (receiverHex != null) {
+            val depth = findReceiverDepth(receiverHex)
+            if (depth > 0) {
+                repeat(depth) {
+                    val t = stack.removeLast()
+                    if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
+                    else out += RecoveredInsn(op = "POP")
+                }
+            }
+        }
 
         // Case 2: receiver is on top (e.g. just produced by NEW+DUP or a
         // previous INVOKE returning self). Just push the args.
@@ -144,8 +183,23 @@ class StackBalancer(private val isStatic: Boolean) {
         }
 
         // Case 3: nothing matches — push receiver (if any) then all args.
-        if (receiverHex != null) pushObjLiteral(receiverHex)
+        if (receiverHex != null) pushObjLiteral(receiverHex, receiverType)
         for ((desc, value) in argDescAndHex) pushArg(value, desc)
+    }
+
+    /**
+     * Scan the stack from top down looking for an ObjHex matching `hex`.
+     * Returns the number of items above it (0 if it's already on top, -1 if
+     * not found).
+     */
+    private fun findReceiverDepth(hex: String): Int {
+        for (i in stack.indices.reversed()) {
+            val v = stack[i]
+            if (v is V.ObjHex && v.hex == hex) {
+                return stack.size - 1 - i
+            }
+        }
+        return -1
     }
 
     private fun matchesTop(receiverHex: String?, argDescAndHex: List<Pair<String, Any?>>): Boolean {
@@ -192,15 +246,22 @@ class StackBalancer(private val isStatic: Boolean) {
     fun pushArg(value: Any?, desc: String) {
         when (val c = desc.firstOrNull() ?: '?') {
             'L', '[' -> {
+                // The expected reference type comes from the descriptor.
+                // For L-types, strip the leading 'L' and trailing ';'. For
+                // array types ([I, [Ljava/lang/Object;) use the whole desc.
+                val refType: String? = when (c) {
+                    '[' -> desc
+                    'L' -> if (desc.length > 2 && desc.endsWith(";")) desc.substring(1, desc.length - 1) else null
+                    else -> null
+                }
                 if (value is String && !value.startsWith("0x")) {
                     pushString(value)
                 } else if (value is String && value.startsWith("0x")) {
-                    // Maybe a known jobject — if top matches keep it, else placeholder
                     val top = stack.lastOrNull()
                     if (top is V.ObjHex && top.hex == value) return
-                    pushObjLiteral(value)
+                    pushObjLiteral(value, refType)
                 } else {
-                    pushNull()
+                    pushNullAs(refType)
                 }
             }
             'I', 'B', 'S', 'C', 'Z' -> when (value) {
@@ -229,6 +290,94 @@ class StackBalancer(private val isStatic: Boolean) {
      * so downstream `ensureReceiver` calls can avoid spurious pushes when
      * the same jobject is used as the next receiver.
      */
+    /**
+     * Make sure the operand stack at the end of a method matches what the
+     * declared return type requires. Inserts a default value if the stack
+     * is short or has the wrong type — guarantees the closing RETURN/IRETURN
+     * etc. doesn't underflow.
+     */
+    fun fixupReturn(methodDesc: String) {
+        val ret = methodDesc.substringAfterLast(')')
+        val c = ret.firstOrNull() ?: 'V'
+        when (c) {
+            'V' -> {
+                // pop everything left on stack
+                while (stack.isNotEmpty()) {
+                    val t = stack.removeLast()
+                    if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
+                    else out += RecoveredInsn(op = "POP")
+                }
+                out += RecoveredInsn(op = "RETURN")
+            }
+            'I', 'B', 'S', 'C', 'Z' -> {
+                if (stack.lastOrNull() !is V.Int) {
+                    while (stack.isNotEmpty()) {
+                        val t = stack.removeLast()
+                        if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
+                        else out += RecoveredInsn(op = "POP")
+                    }
+                    out += RecoveredInsn(op = "ICONST_0"); stack.addLast(V.Int)
+                }
+                stack.removeLast(); out += RecoveredInsn(op = "IRETURN")
+            }
+            'J' -> {
+                if (stack.lastOrNull() !is V.Long) {
+                    while (stack.isNotEmpty()) {
+                        val t = stack.removeLast()
+                        if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
+                        else out += RecoveredInsn(op = "POP")
+                    }
+                    out += RecoveredInsn(op = "LCONST_0"); stack.addLast(V.Long)
+                }
+                stack.removeLast(); out += RecoveredInsn(op = "LRETURN")
+            }
+            'F' -> {
+                if (stack.lastOrNull() !is V.Float) {
+                    while (stack.isNotEmpty()) {
+                        val t = stack.removeLast()
+                        if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
+                        else out += RecoveredInsn(op = "POP")
+                    }
+                    out += RecoveredInsn(op = "FCONST_0"); stack.addLast(V.Float)
+                }
+                stack.removeLast(); out += RecoveredInsn(op = "FRETURN")
+            }
+            'D' -> {
+                if (stack.lastOrNull() !is V.Double) {
+                    while (stack.isNotEmpty()) {
+                        val t = stack.removeLast()
+                        if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
+                        else out += RecoveredInsn(op = "POP")
+                    }
+                    out += RecoveredInsn(op = "DCONST_0"); stack.addLast(V.Double)
+                }
+                stack.removeLast(); out += RecoveredInsn(op = "DRETURN")
+            }
+            else -> {
+                // 'L' or '['
+                val expectedType = if (c == '[') ret else if (ret.startsWith("L") && ret.endsWith(";")) ret.substring(1, ret.length - 1) else null
+                val top = stack.lastOrNull()
+                val topOk = top is V.Obj || top is V.ObjHex
+                if (!topOk) {
+                    while (stack.isNotEmpty()) {
+                        val t = stack.removeLast()
+                        if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
+                        else out += RecoveredInsn(op = "POP")
+                    }
+                    pushNullAs(expectedType)
+                } else if (expectedType != null
+                    && expectedType != "java/lang/Object"
+                    && expectedType != "[Ljava/lang/Object;") {
+                    // Insert a CHECKCAST to keep the verifier's type system
+                    // narrow enough — we tracked the value as generic Object,
+                    // but the declared return type may be more specific.
+                    out += RecoveredInsn(op = "CHECKCAST", type = expectedType)
+                }
+                stack.removeLast(); out += RecoveredInsn(op = "ARETURN")
+            }
+        }
+    }
+
     fun emitInvoke(insn: RecoveredInsn, returnHex: String? = null) {
         val desc = insn.desc ?: return out.run { add(insn) }
         val isStaticCall = insn.op == "INVOKESTATIC"

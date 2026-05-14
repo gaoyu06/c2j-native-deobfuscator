@@ -155,8 +155,8 @@ class TraceTranslator(private val manifest: ManifestJson) {
             val call = ev["call"]?.asText() ?: continue
             translateCall(call, ev, balancer)
         }
-        // Final return instruction
-        balancer.out += RecoveredInsn(op = returnOp(method.desc))
+        // Final return instruction with stack fixup
+        balancer.fixupReturn(method.desc)
         return RecoveredMethod(
             owner = method.owner,
             name = method.name,
@@ -200,7 +200,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
             "GetObjectField", "GetBooleanField", "GetByteField",
             "GetCharField", "GetShortField", "GetIntField", "GetLongField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                b.ensureReceiver(args?.get(0)?.asText())
+                b.ensureReceiver(args?.get(0)?.asText(), fid.owner)
                 val produce = produceFor(fid.desc, ev["ret"]?.asText())
                 b.emitRaw(
                     RecoveredInsn(op = "GETFIELD", owner = fid.owner, name = fid.name, desc = fid.desc),
@@ -211,7 +211,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
             "SetObjectField", "SetBooleanField", "SetByteField",
             "SetCharField", "SetShortField", "SetIntField", "SetLongField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                b.ensureReceiver(args?.get(0)?.asText())
+                b.ensureReceiver(args?.get(0)?.asText(), fid.owner)
                 b.pushArg(extractScalar(args?.get(2)), fid.desc ?: "I")
                 b.emitRaw(
                     RecoveredInsn(op = "PUTFIELD", owner = fid.owner, name = fid.name, desc = fid.desc),
@@ -245,8 +245,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
                 if (mid != null && mid.owner != null) {
                     val ctorDesc = mid.desc ?: midDesc
                     val pairs = collectVariadicPairs(ev, mid.desc, midDesc, varadicStartIdx = 2)
-                    // For NewObject the receiver-equivalent (the just-NEWed object) is already on stack.
-                    b.prepareCall(receiverHex = newRetHex, argDescAndHex = pairs)
+                    b.prepareCall(receiverHex = newRetHex, receiverType = mid.owner, argDescAndHex = pairs)
                     b.emitInvoke(RecoveredInsn(op = "INVOKESPECIAL", owner = mid.owner, name = mid.name, desc = ctorDesc))
                 }
             }
@@ -255,7 +254,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
                 val mid = symbols[args?.get(2)?.asText()] as? Sym.MethodId
                 if (mid != null && mid.owner != null) {
                     val pairs = collectVariadicPairs(ev, mid.desc, midDesc, varadicStartIdx = 3)
-                    b.prepareCall(receiverHex = args?.get(0)?.asText(), argDescAndHex = pairs)
+                    b.prepareCall(receiverHex = args?.get(0)?.asText(), receiverType = mid.owner, argDescAndHex = pairs)
                     b.emitInvoke(RecoveredInsn(op = "INVOKESPECIAL", owner = mid.owner, name = mid.name, desc = mid.desc ?: midDesc),
                                  returnHex = ev["ret"]?.asText())
                 }
@@ -268,6 +267,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
                     val pairs = collectVariadicPairs(ev, mid.desc, midDesc, varadicStartIdx = 2)
                     b.prepareCall(
                         receiverHex = if (isStaticCall) null else args?.get(0)?.asText(),
+                        receiverType = if (isStaticCall) null else mid.owner,
                         argDescAndHex = pairs,
                     )
                     b.emitInvoke(
@@ -283,13 +283,13 @@ class TraceTranslator(private val manifest: ManifestJson) {
             "IsInstanceOf" -> {
                 val cls = symbols[args?.get(1)?.asText()] as? Sym.Class
                 if (cls != null) {
-                    b.ensureReceiver(args?.get(0)?.asText())
+                    b.ensureReceiver(args?.get(0)?.asText(), "java/lang/Object")
                     b.emitRaw(RecoveredInsn(op = "INSTANCEOF", type = cls.internalName), 1, StackBalancer.V.Int)
                 }
             }
 
             "GetArrayLength" -> {
-                b.ensureReceiver(args?.get(0)?.asText())
+                b.ensureReceiver(args?.get(0)?.asText(), "[Ljava/lang/Object;")
                 b.emitRaw(RecoveredInsn(op = "ARRAYLENGTH"), 1, StackBalancer.V.Int)
             }
 
@@ -311,21 +311,54 @@ class TraceTranslator(private val manifest: ManifestJson) {
             "NewLongArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 11), 1, StackBalancer.V.Obj) }
 
             "GetObjectArrayElement" -> {
-                b.ensureReceiver(args?.get(0)?.asText())
+                b.ensureReceiver(args?.get(0)?.asText(), "[Ljava/lang/Object;")
                 b.pushInt(args?.get(1)?.asInt() ?: 0)
                 b.emitRaw(RecoveredInsn(op = "AALOAD"), 2, StackBalancer.V.Obj)
             }
             "SetObjectArrayElement" -> {
-                b.ensureReceiver(args?.get(0)?.asText())
+                b.ensureReceiver(args?.get(0)?.asText(), "[Ljava/lang/Object;")
                 b.pushInt(args?.get(1)?.asInt() ?: 0)
-                b.pushObjLiteral(args?.get(2)?.asText() ?: "0x0")
+                b.pushObjLiteral(args?.get(2)?.asText() ?: "0x0", "java/lang/Object")
                 b.emitRaw(RecoveredInsn(op = "AASTORE"), 3, null)
             }
+
+            "GetBooleanArrayRegion" -> emitArrayLoad(b, args, "[Z", "BALOAD", StackBalancer.V.Int)
+            "GetByteArrayRegion"    -> emitArrayLoad(b, args, "[B", "BALOAD", StackBalancer.V.Int)
+            "GetCharArrayRegion"    -> emitArrayLoad(b, args, "[C", "CALOAD", StackBalancer.V.Int)
+            "GetShortArrayRegion"   -> emitArrayLoad(b, args, "[S", "SALOAD", StackBalancer.V.Int)
+            "GetIntArrayRegion"     -> emitArrayLoad(b, args, "[I", "IALOAD", StackBalancer.V.Int)
+            "GetLongArrayRegion"    -> emitArrayLoad(b, args, "[J", "LALOAD", StackBalancer.V.Long)
+            "GetFloatArrayRegion"   -> emitArrayLoad(b, args, "[F", "FALOAD", StackBalancer.V.Float)
+            "GetDoubleArrayRegion"  -> emitArrayLoad(b, args, "[D", "DALOAD", StackBalancer.V.Double)
+
+            "SetBooleanArrayRegion" -> emitArrayStore(b, args, "[Z", "Z", "BASTORE")
+            "SetByteArrayRegion"    -> emitArrayStore(b, args, "[B", "B", "BASTORE")
+            "SetCharArrayRegion"    -> emitArrayStore(b, args, "[C", "C", "CASTORE")
+            "SetShortArrayRegion"   -> emitArrayStore(b, args, "[S", "S", "SASTORE")
+            "SetIntArrayRegion"     -> emitArrayStore(b, args, "[I", "I", "IASTORE")
+            "SetLongArrayRegion"    -> emitArrayStore(b, args, "[J", "J", "LASTORE")
+            "SetFloatArrayRegion"   -> emitArrayStore(b, args, "[F", "F", "FASTORE")
+            "SetDoubleArrayRegion"  -> emitArrayStore(b, args, "[D", "D", "DASTORE")
 
             "Throw", "ThrowNew" -> b.emitRaw(RecoveredInsn(op = "ATHROW"), 1, null)
 
             else -> {}
         }
+    }
+
+    private fun emitArrayLoad(b: StackBalancer, args: JsonNode?, arrType: String, op: String, produces: StackBalancer.V) {
+        // ArrayRegion args: [array, start, len, (value)] — when len==1 we
+        // treat this as a single element load (xALOAD).
+        b.ensureReceiver(args?.get(0)?.asText(), arrType)
+        b.pushInt(args?.get(1)?.asInt() ?: 0)
+        b.emitRaw(RecoveredInsn(op = op), 2, produces)
+    }
+
+    private fun emitArrayStore(b: StackBalancer, args: JsonNode?, arrType: String, elemDesc: String, op: String) {
+        b.ensureReceiver(args?.get(0)?.asText(), arrType)
+        b.pushInt(args?.get(1)?.asInt() ?: 0)
+        b.pushArg(extractScalar(args?.get(3)), elemDesc)
+        b.emitRaw(RecoveredInsn(op = op), 3, null)
     }
 
     private fun extractScalar(node: JsonNode?): Any? {
