@@ -83,6 +83,93 @@ private fun parseTrace(path: Path): List<JsonNode> {
     return list
 }
 
+/**
+ * Detect and collapse repeated multi-event patterns within a single
+ * method-invocation frame.
+ *
+ * Long-running programs (game loops, request handlers, etc.) produce
+ * traces with the same call sequence repeated N times — e.g. a game loop
+ * running 8 iterations gives 8 copies of `[NEW Piece, INVOKESPECIAL <init>,
+ * INVOKEVIRTUAL collides, ..., INVOKEVIRTUAL lock]`. Without collapsing,
+ * the recovered bytecode contains 8 unrolled copies, making the
+ * decompiled output hundreds of lines instead of one iteration.
+ *
+ * Strategy: scan left-to-right; at each position try pattern lengths
+ * 1..maxLen and find the (length, repetition-count) pair maximizing
+ * total covered events. Keep one copy of the pattern, advance past the
+ * rest. Two events are considered "same shape" iff their `call` and
+ * `midDesc` fields match — concrete jobject hexes and primitive values
+ * are ignored, which is the right granularity for loops where each
+ * iteration touches fresh objects with the same operation sequence.
+ */
+private fun collapseRepeats(events: MutableList<JsonNode>, maxLen: Int = 32): MutableList<JsonNode> {
+    if (events.size < 4) return events
+    /**
+     * Shape signature: identifies "the same kind of operation" across loop
+     * iterations while ignoring concrete jobject hexes and primitive values
+     * (those typically differ each iteration).  But it DOES include literal
+     * string args so that e.g. `GetMethodID(c, "head", "()LCell;")` is not
+     * confused with `GetMethodID(c, "tail", "()V")` — those have the same
+     * call name and empty midDesc but are entirely different operations.
+     */
+    fun sig(e: JsonNode): String {
+        val call = e["call"]?.asText() ?: return "?"
+        val midDesc = e["midDesc"]?.asText() ?: ""
+        val sb = StringBuilder()
+        sb.append(call).append('|').append(midDesc)
+        val args = e["args"]
+        if (args != null) {
+            for (i in 0 until args.size()) {
+                val v = args[i]
+                sb.append('|')
+                when {
+                    v.isTextual && v.asText().startsWith("0x") -> sb.append('h')  // opaque jobject
+                    v.isTextual -> sb.append('s').append(v.asText().take(80))    // literal string content
+                    v.isInt || v.isLong -> sb.append('p')                          // primitive value
+                    v.isNull -> sb.append('n')
+                    else -> sb.append('?')
+                }
+            }
+        }
+        return sb.toString()
+    }
+    val out = ArrayList<JsonNode>(events.size)
+    var i = 0
+    while (i < events.size) {
+        var bestL = 0
+        var bestReps = 1
+        var L = 1
+        val ceil = minOf(maxLen, (events.size - i) / 2)
+        while (L <= ceil) {
+            // count consecutive immediate repetitions of events[i..i+L) at strides of L
+            var reps = 1
+            while (i + reps * L + L <= events.size) {
+                var match = true
+                for (k in 0 until L) {
+                    if (sig(events[i + k]) != sig(events[i + reps * L + k])) { match = false; break }
+                }
+                if (!match) break
+                reps++
+            }
+            if (reps > 1 && L * reps > bestL * bestReps) {
+                bestL = L; bestReps = reps
+            }
+            L++
+        }
+        if (bestReps > 1 && bestL > 0) {
+            for (k in 0 until bestL) out.add(events[i + k])
+            i += bestL * bestReps
+        } else {
+            out.add(events[i])
+            i++
+        }
+    }
+    // If we actually collapsed something, return a fresh list; otherwise
+    // return the original to avoid extra allocation.
+    return if (out.size != events.size) out.toMutableList() else events
+}
+
+
 private fun groupByMethodInvocation(events: List<JsonNode>): List<TraceGroup> {
     // Per-thread stack of active enter events; we collect all `jni` events
     // between an enter and its matching exit and attribute them to the
@@ -105,7 +192,7 @@ private fun groupByMethodInvocation(events: List<JsonNode>): List<TraceGroup> {
             "exit" -> {
                 val stack = perThread[thr] ?: continue
                 val frame = stack.removeLastOrNull() ?: continue
-                result.add(TraceGroup(frame.key, frame.jniBuf))
+                result.add(TraceGroup(frame.key, collapseRepeats(frame.jniBuf)))
             }
             "jni" -> {
                 val stack = perThread[thr] ?: continue
@@ -145,7 +232,13 @@ class TraceTranslator(private val manifest: ManifestJson) {
         }
     }
 
+    /** The class of the method currently being translated — used as a
+     *  fallback owner when a GETFIELD/PUTFIELD/INVOKE's owner couldn't be
+     *  resolved from the trace. Set by `translate`. */
+    private var currentOwner: String = "java/lang/Object"
+
     fun translate(method: MethodKey, jniEvents: List<JsonNode>, confidence: String): RecoveredMethod {
+        currentOwner = method.owner
         // Look up the access flags so we know whether `this` is available
         val mc = manifest.classes.firstOrNull { it.name == method.owner }
         val mm = mc?.methods?.firstOrNull { it.name == method.name && it.desc == method.desc }
@@ -255,9 +348,11 @@ class TraceTranslator(private val manifest: ManifestJson) {
             "GetStaticCharField", "GetStaticShortField", "GetStaticIntField",
             "GetStaticLongField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
+                val rawOwner = fid.owner ?: currentOwner
+                val owner = if (rawOwner.startsWith("[")) currentOwner else rawOwner
                 val produce = produceFor(fid.desc, ev["ret"]?.asText())
                 b.emitRaw(
-                    RecoveredInsn(op = "GETSTATIC", owner = fid.owner, name = fid.name, desc = fid.desc),
+                    RecoveredInsn(op = "GETSTATIC", owner = owner, name = fid.name, desc = fid.desc),
                     consume = 0, produce = produce,
                 )
                 if (call == "GetStaticObjectField") b.maybeStash(ev["ret"]?.asText())
@@ -266,10 +361,12 @@ class TraceTranslator(private val manifest: ManifestJson) {
             "GetObjectField", "GetBooleanField", "GetByteField",
             "GetCharField", "GetShortField", "GetIntField", "GetLongField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                b.ensureReceiver(args?.get(0)?.asText(), fid.owner)
+                val rawOwner = fid.owner ?: currentOwner
+                val owner = if (rawOwner.startsWith("[")) currentOwner else rawOwner
+                b.ensureReceiver(args?.get(0)?.asText(), owner)
                 val produce = produceFor(fid.desc, ev["ret"]?.asText())
                 b.emitRaw(
-                    RecoveredInsn(op = "GETFIELD", owner = fid.owner, name = fid.name, desc = fid.desc),
+                    RecoveredInsn(op = "GETFIELD", owner = owner, name = fid.name, desc = fid.desc),
                     consume = 1, produce = produce,
                 )
                 if (call == "GetObjectField") b.maybeStash(ev["ret"]?.asText())
@@ -278,10 +375,12 @@ class TraceTranslator(private val manifest: ManifestJson) {
             "SetObjectField", "SetBooleanField", "SetByteField",
             "SetCharField", "SetShortField", "SetIntField", "SetLongField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                b.ensureReceiver(args?.get(0)?.asText(), fid.owner)
+                val rawOwner = fid.owner ?: currentOwner
+                val owner = if (rawOwner.startsWith("[")) currentOwner else rawOwner
+                b.ensureReceiver(args?.get(0)?.asText(), owner)
                 b.pushArg(extractScalar(args?.get(2)), fid.desc ?: "I")
                 b.emitRaw(
-                    RecoveredInsn(op = "PUTFIELD", owner = fid.owner, name = fid.name, desc = fid.desc),
+                    RecoveredInsn(op = "PUTFIELD", owner = owner, name = fid.name, desc = fid.desc),
                     consume = 2, produce = null,
                 )
             }

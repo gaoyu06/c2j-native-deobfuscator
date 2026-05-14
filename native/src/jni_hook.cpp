@@ -49,7 +49,15 @@ void register_string(jobject o, std::string s) {
 
 thread_local int t_frame_depth = 0;
 thread_local int t_suppress_depth = 0;
+thread_local int t_frame_event_count = 0;   // events emitted within current frame
+thread_local bool t_frame_truncated = false;
 thread_local const char* t_current_method = nullptr;
+
+// Max events per `enter` frame. After this many JNI events have been emitted
+// within a single user-native-frame, further events are dropped. Prevents
+// trace bloat on long-running programs (game loops, request handlers, etc.).
+// Configurable via the `max-frame-events=N` agent option; 0 = unlimited.
+int g_max_frame_events = 50000;
 
 // Parse a method descriptor into a list of arg-type tokens.
 // Example: "(ILjava/lang/String;[I)V" -> ["I", "Ljava/lang/String;", "[I"].
@@ -228,6 +236,19 @@ std::string hex_ptr(const void* p) {
 void emit(const std::string& call, const std::string& args, const std::string& ret,
           jmethodID mid = nullptr) {
     if (!in_native_frame() || t_suppress_depth > 0) return;
+    if (g_max_frame_events > 0 && t_frame_event_count >= g_max_frame_events) {
+        if (!t_frame_truncated) {
+            t_frame_truncated = true;
+            // emit a single truncation marker once per frame
+            std::ostringstream os;
+            os << "{\"ev\":\"truncate\",\"ts\":" << TraceWriter::ts_now()
+               << ",\"thr\":" << TraceWriter::tid()
+               << ",\"limit\":" << g_max_frame_events << "}";
+            TraceWriter::instance().write_line(os.str());
+        }
+        return;
+    }
+    ++t_frame_event_count;
     std::ostringstream os;
     os << "{\"ev\":\"jni\",\"ts\":" << TraceWriter::ts_now()
        << ",\"thr\":" << TraceWriter::tid()
@@ -993,9 +1014,19 @@ void install(JNIEnv* env) {
     env->functions = g_hooked;
 }
 
-void enter_native_frame() { ++t_frame_depth; }
+void enter_native_frame() {
+    ++t_frame_depth;
+    // Reset the per-frame event counter on the OUTERMOST entry (depth 1).
+    // Nested native frames share the outermost's budget.
+    if (t_frame_depth == 1) {
+        t_frame_event_count = 0;
+        t_frame_truncated = false;
+    }
+}
 void exit_native_frame()  { if (t_frame_depth > 0) --t_frame_depth; }
 bool in_native_frame()    { return t_frame_depth > 0; }
+
+void set_max_frame_events(int n) { g_max_frame_events = n; }
 
 void enter_suppress_frame() { ++t_suppress_depth; }
 void exit_suppress_frame()  { if (t_suppress_depth > 0) --t_suppress_depth; }

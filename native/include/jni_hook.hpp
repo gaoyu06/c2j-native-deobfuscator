@@ -25,6 +25,9 @@ bool in_native_frame();
 void enter_suppress_frame();
 void exit_suppress_frame();
 
+// Configure the max events per outermost-native-frame budget. <=0 disables.
+void set_max_frame_events(int n);
+
 // Current method being entered (for "fn" field of enter/exit events).
 void set_current_native_method(const char* sig);
 const char* current_native_method();

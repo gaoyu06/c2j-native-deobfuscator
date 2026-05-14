@@ -69,6 +69,9 @@ void parse_options(const char* options) {
         std::string v = eq == std::string::npos ? "" : pair.substr(eq + 1);
         if (k == "trace") g_trace_path = v;
         else if (k == "log-all" && (v == "1" || v == "true")) g_log_all = true;
+        else if (k == "max-frame-events") {
+            try { hook::set_max_frame_events(std::stoi(v)); } catch (...) {}
+        }
         i = j + 1;
     }
 }
