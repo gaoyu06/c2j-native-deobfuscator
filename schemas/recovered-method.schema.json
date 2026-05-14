@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "recovered-method",
+  "description": "A method body recovered by trace-to-bytecode or static-reverse.",
+  "type": "object",
+  "required": ["schemaVersion", "owner", "name", "desc", "source", "instructions"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "owner":         { "type": "string", "description": "Internal class name, e.g. com/example/Foo" },
+    "name":          { "type": "string" },
+    "desc":          { "type": "string" },
+    "source":        { "enum": ["dynamic", "static", "merged"] },
+    "confidence":    { "enum": ["high", "medium", "low"] },
+    "instructions": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/Insn" }
+    },
+    "tryCatchBlocks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["start", "end", "handler"],
+        "properties": {
+          "start":   { "type": "string" },
+          "end":     { "type": "string" },
+          "handler": { "type": "string" },
+          "type":    { "type": ["string", "null"] }
+        }
+      }
+    },
+    "localVariables": { "type": "array" },
+    "lineNumbers":    { "type": "array" }
+  },
+  "definitions": {
+    "Insn": {
+      "type": "object",
+      "required": ["op"],
+      "properties": {
+        "op":     { "type": "string", "description": "JVM opcode mnemonic, e.g. ILOAD, INVOKEVIRTUAL, LABEL" },
+        "var":    { "type": "integer", "description": "local variable index (xLOAD/xSTORE/IINC)" },
+        "incr":   { "type": "integer", "description": "IINC delta" },
+        "value":  {                    "description": "literal for LDC/BIPUSH/SIPUSH/etc." },
+        "owner":  { "type": "string", "description": "field/method owner internal name" },
+        "name":   { "type": "string" },
+        "desc":   { "type": "string" },
+        "itf":    { "type": "boolean", "description": "INVOKEINTERFACE flag" },
+        "label":  { "type": "string", "description": "for LABEL/jump targets" },
+        "target": { "type": "string", "description": "jump label" },
+        "type":   { "type": "string", "description": "for NEW/CHECKCAST/INSTANCEOF/NEWARRAY" },
+        "dims":   { "type": "integer", "description": "MULTIANEWARRAY dimensions" },
+        "min":    { "type": "integer" },
+        "max":    { "type": "integer" },
+        "keys":   { "type": "array" },
+        "labels": { "type": "array" },
+        "default": { "type": "string" }
+      }
+    }
+  }
+}

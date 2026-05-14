@@ -1,0 +1,22 @@
+[project]
+name = "j2c-dumper-py"
+version = "0.1.0"
+description = "Python modules for j2c-dumper"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv.workspace]
+members = [
+    "j2c_dumper_cli",
+    "binary_introspect",
+    "manifest_merge",
+    "ast_matcher",
+    "snippet_importer",
+]
+
+[tool.uv.sources]
+j2c-dumper-cli = { workspace = true }
+binary-introspect = { workspace = true }
+manifest-merge = { workspace = true }
+ast-matcher = { workspace = true }
+snippet-importer = { workspace = true }

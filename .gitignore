@@ -1,0 +1,27 @@
+# JVM
+build/
+.gradle/
+*.class
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.uv-cache/
+uv.lock
+
+# Native
+native/build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Local intermediate
+e2e-test/

@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "trace event",
+  "description": "One line of trace.jsonl emitted by the JVMTI agent.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["ev", "ts", "thr", "fn"],
+      "properties": {
+        "ev":   { "const": "enter" },
+        "ts":   { "type": "integer" },
+        "thr":  { "type": "integer" },
+        "fn":   { "type": "string", "description": "JNI mangled native function name" },
+        "args": { "type": "array" }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["ev", "ts", "thr", "fn"],
+      "properties": {
+        "ev":  { "const": "exit" },
+        "ts":  { "type": "integer" },
+        "thr": { "type": "integer" },
+        "fn":  { "type": "string" },
+        "ret": {}
+      }
+    },
+    {
+      "type": "object",
+      "required": ["ev", "ts", "thr", "call"],
+      "properties": {
+        "ev":   { "const": "jni" },
+        "ts":   { "type": "integer" },
+        "thr":  { "type": "integer" },
+        "call": { "type": "string", "description": "JNI function name (e.g. CallIntMethod)" },
+        "args": { "type": "array" },
+        "ret":  {}
+      }
+    },
+    {
+      "type": "object",
+      "required": ["ev", "ts", "thr", "kind", "slot"],
+      "properties": {
+        "ev":   { "const": "slot" },
+        "ts":   { "type": "integer" },
+        "thr":  { "type": "integer" },
+        "kind": { "enum": ["cstack", "clocal"] },
+        "slot": { "type": "integer" },
+        "field":{ "enum": ["i", "j", "f", "d", "l"] },
+        "val":  {}
+      }
+    }
+  ]
+}

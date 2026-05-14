@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "classes.json",
+  "description": "Output of jar-parser: class skeletons extracted from a jar.",
+  "type": "object",
+  "required": ["schemaVersion", "input", "classes"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "input": {
+      "type": "object",
+      "required": ["jarPath", "sha256"],
+      "properties": {
+        "jarPath": { "type": "string" },
+        "sha256":  { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "loaderClass": { "type": ["string", "null"] },
+    "nativeDir":   { "type": ["string", "null"] },
+    "classes": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/ClassInfo" }
+    }
+  },
+  "definitions": {
+    "ClassInfo": {
+      "type": "object",
+      "required": ["name", "version", "access", "fields", "methods"],
+      "properties": {
+        "name":       { "type": "string" },
+        "superName":  { "type": ["string", "null"] },
+        "interfaces": { "type": "array", "items": { "type": "string" } },
+        "version":    { "type": "integer" },
+        "access":     { "type": "integer" },
+        "signature":  { "type": ["string", "null"] },
+        "sourceFile": { "type": ["string", "null"] },
+        "fields":  { "type": "array", "items": { "$ref": "#/definitions/FieldInfo" } },
+        "methods": { "type": "array", "items": { "$ref": "#/definitions/MethodInfo" } }
+      }
+    },
+    "FieldInfo": {
+      "type": "object",
+      "required": ["name", "desc", "access"],
+      "properties": {
+        "name":      { "type": "string" },
+        "desc":      { "type": "string" },
+        "access":    { "type": "integer" },
+        "signature": { "type": ["string", "null"] },
+        "value":     {}
+      }
+    },
+    "MethodInfo": {
+      "type": "object",
+      "required": ["name", "desc", "access", "isNative", "isObfuscatedNative"],
+      "properties": {
+        "name":               { "type": "string" },
+        "desc":               { "type": "string" },
+        "access":             { "type": "integer" },
+        "signature":          { "type": ["string", "null"] },
+        "isNative":           { "type": "boolean" },
+        "isObfuscatedNative": { "type": "boolean" },
+        "tryCatchBlocks":     { "type": "array" },
+        "maxStack":           { "type": "integer" },
+        "maxLocals":          { "type": "integer" },
+        "originalBody":       { "type": ["string", "null"], "description": "base64-encoded bytecode if method was not converted to native" }
+      }
+    }
+  }
+}

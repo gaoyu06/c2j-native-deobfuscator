@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "binary.json",
+  "description": "Output of binary-introspect: metadata extracted from a native library.",
+  "type": "object",
+  "required": ["schemaVersion", "input", "stringPool", "nativeRegistry"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "input": {
+      "type": "object",
+      "required": ["libPath", "format", "arch", "sha256"],
+      "properties": {
+        "libPath": { "type": "string" },
+        "format":  { "enum": ["PE", "ELF", "MachO"] },
+        "arch":    { "type": "string" },
+        "sha256":  { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "stringPool": {
+      "type": "object",
+      "required": ["totalBytes", "strings"],
+      "properties": {
+        "base":       { "type": ["string", "null"], "description": "Hex VA of the pool start when locatable" },
+        "totalBytes": { "type": "integer" },
+        "strings":    { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "nativeRegistry": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["classId", "className", "methods"],
+        "properties": {
+          "classId":          { "type": "integer" },
+          "className":        { "type": "string" },
+          "registerFunction": {
+            "type": ["object", "null"],
+            "properties": {
+              "addr":   { "type": "string" },
+              "symbol": { "type": ["string", "null"] }
+            }
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "desc", "fnAddr"],
+              "properties": {
+                "name":     { "type": "string" },
+                "desc":     { "type": "string" },
+                "fnAddr":   { "type": "string", "description": "Hex VA (e.g. 0x180001234)" },
+                "fnSymbol": { "type": ["string", "null"] }
+              }
+            }
+          }
+        }
+      }
+    },
+    "perClassLookups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["classId"],
+        "properties": {
+          "classId":  { "type": "integer" },
+          "cstrings": { "$ref": "#/definitions/LookupTable" },
+          "cclasses": { "$ref": "#/definitions/LookupTable" },
+          "cmethods": { "$ref": "#/definitions/LookupTable" },
+          "cfields":  { "$ref": "#/definitions/LookupTable" }
+        }
+      }
+    },
+    "hiddenClasses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["embeddedAt", "size", "classData"],
+        "properties": {
+          "embeddedAt": { "type": "string" },
+          "size":       { "type": "integer" },
+          "classData":  { "type": "string", "description": "base64-encoded .class bytes" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "LookupTable": {
+      "type": "object",
+      "required": ["entries"],
+      "properties": {
+        "addr":    { "type": ["string", "null"] },
+        "entries": { "type": "array" }
+      }
+    }
+  }
+}

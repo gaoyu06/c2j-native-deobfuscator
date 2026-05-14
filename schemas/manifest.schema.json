@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "manifest.json",
+  "description": "Output of manifest-merge: classes joined with native registry + lookups.",
+  "type": "object",
+  "required": ["schemaVersion", "classes"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "input": {
+      "type": "object",
+      "properties": {
+        "jar": { "type": ["string", "null"] },
+        "lib": { "type": ["string", "null"] }
+      }
+    },
+    "loaderClass": { "type": ["string", "null"] },
+    "nativeDir":   { "type": ["string", "null"] },
+    "stringPool":  { "type": "array", "items": { "type": "string" } },
+    "classes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "fields", "methods"],
+        "properties": {
+          "name":       { "type": "string" },
+          "superName":  { "type": ["string", "null"] },
+          "interfaces": { "type": "array", "items": { "type": "string" } },
+          "version":    { "type": "integer" },
+          "access":     { "type": "integer" },
+          "signature":  { "type": ["string", "null"] },
+          "sourceFile": { "type": ["string", "null"] },
+          "classId":    { "type": ["integer", "null"] },
+          "fields":     { "type": "array" },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "desc", "access"],
+              "properties": {
+                "name":               { "type": "string" },
+                "desc":               { "type": "string" },
+                "access":             { "type": "integer" },
+                "signature":          { "type": ["string", "null"] },
+                "isObfuscatedNative": { "type": "boolean" },
+                "fnAddr":             { "type": ["string", "null"] },
+                "fnSymbol":           { "type": ["string", "null"] },
+                "originalBody":       { "type": ["string", "null"] }
+              }
+            }
+          },
+          "lookups": {
+            "type": "object",
+            "properties": {
+              "cstrings": { "type": "array" },
+              "cclasses": { "type": "array" },
+              "cmethods": { "type": "array" },
+              "cfields":  { "type": "array" }
+            }
+          }
+        }
+      }
+    },
+    "hiddenClasses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "classData": { "type": "string" }
+        }
+      }
+    }
+  }
+}
