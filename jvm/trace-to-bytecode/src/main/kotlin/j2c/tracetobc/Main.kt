@@ -151,6 +151,71 @@ class TraceTranslator(private val manifest: ManifestJson) {
         val mm = mc?.methods?.firstOrNull { it.name == method.name && it.desc == method.desc }
         val isStatic = mm != null && (mm.access and 0x0008) != 0  // ACC_STATIC
         val balancer = StackBalancer(isStatic)
+        val slotMap = mutableMapOf<String, Int>()
+
+        // 1) Identify `this` via the first GetObjectClass call (native-obfuscator's
+        //    prologue always does this for non-static methods).
+        if (!isStatic) {
+            for (ev in jniEvents) {
+                if (ev["ev"]?.asText() != "jni") continue
+                if (ev["call"]?.asText() == "GetObjectClass") {
+                    val thisHex = ev["args"]?.get(0)?.asText()
+                    if (thisHex != null) slotMap[thisHex] = 0
+                    break
+                }
+            }
+        }
+
+        // 2) Allocate SSA slots for every jobject that's used as an arg in
+        //    some later event. Slots start at paramSlots(desc, isStatic).
+        var nextSlot = paramSlotCount(method.desc, isStatic)
+        if (slotMap.values.any { it == 0 }) nextSlot = maxOf(nextSlot, 1)
+
+        // Position-aware: only allocate a slot for hex H if there exists a
+        // producer event at index i with ret=H AND a consumer event at
+        // index j > i with H in args. Also skip hexes used as args only
+        // *adjacent* to their producer (those are the "chain" case that
+        // prepareCall's matchesTop already handles for free).
+        val producers = mutableMapOf<String, Int>()  // hex -> earliest producer idx
+        for ((i, ev) in jniEvents.withIndex()) {
+            if (ev["ev"]?.asText() != "jni") continue
+            val retHex = ev["ret"]?.takeIf { it.isTextual }?.asText() ?: continue
+            if (retHex.startsWith("0x") && retHex !in producers) producers[retHex] = i
+        }
+        val needSlot = mutableSetOf<String>()
+        for ((i, ev) in jniEvents.withIndex()) {
+            if (ev["ev"]?.asText() != "jni") continue
+            val args = ev["args"] ?: continue
+            for (k in 0 until args.size()) {
+                val v = args[k]
+                if (!v.isTextual) continue
+                val h = v.asText()
+                if (!h.startsWith("0x")) continue
+                val pIdx = producers[h] ?: continue
+                if (i > pIdx + 1) needSlot.add(h)  // skip chain case (i == pIdx+1)
+            }
+        }
+        for ((retHex, _) in producers.entries.sortedBy { it.value }) {
+            if (retHex in needSlot && retHex !in slotMap) {
+                slotMap[retHex] = nextSlot
+                nextSlot += 1
+            }
+        }
+
+        balancer.slotMap = slotMap
+
+        // 3) Initialize each SSA slot to `null` at method entry. Subsequent
+        //    producers will overwrite via DUP+ASTORE; consumers (ALOAD) are
+        //    then always safe even if the producer event didn't actually
+        //    emit (e.g. it was dropped as infrastructure noise). Slot 0 (=
+        //    `this` for non-static) is NOT initialized — JVM already has the
+        //    real receiver there.
+        for ((_, slot) in slotMap.toList().sortedBy { it.second }) {
+            if (slot == 0 && !isStatic) continue
+            balancer.out += RecoveredInsn(op = "ACONST_NULL")
+            balancer.out += RecoveredInsn(op = "ASTORE", `var` = slot)
+        }
+
         for (ev in jniEvents) {
             val call = ev["call"]?.asText() ?: continue
             translateCall(call, ev, balancer)
@@ -195,6 +260,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
                     RecoveredInsn(op = "GETSTATIC", owner = fid.owner, name = fid.name, desc = fid.desc),
                     consume = 0, produce = produce,
                 )
+                if (call == "GetStaticObjectField") b.maybeStash(ev["ret"]?.asText())
             }
 
             "GetObjectField", "GetBooleanField", "GetByteField",
@@ -206,6 +272,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
                     RecoveredInsn(op = "GETFIELD", owner = fid.owner, name = fid.name, desc = fid.desc),
                     consume = 1, produce = produce,
                 )
+                if (call == "GetObjectField") b.maybeStash(ev["ret"]?.asText())
             }
 
             "SetObjectField", "SetBooleanField", "SetByteField",
@@ -247,6 +314,8 @@ class TraceTranslator(private val manifest: ManifestJson) {
                     val pairs = collectVariadicPairs(ev, mid.desc, midDesc, varadicStartIdx = 2)
                     b.prepareCall(receiverHex = newRetHex, receiverType = mid.owner, argDescAndHex = pairs)
                     b.emitInvoke(RecoveredInsn(op = "INVOKESPECIAL", owner = mid.owner, name = mid.name, desc = ctorDesc))
+                    // After init, the just-constructed object is on stack (initialized).
+                    b.maybeStash(newRetHex)
                 }
             }
 
@@ -257,6 +326,9 @@ class TraceTranslator(private val manifest: ManifestJson) {
                     b.prepareCall(receiverHex = args?.get(0)?.asText(), receiverType = mid.owner, argDescAndHex = pairs)
                     b.emitInvoke(RecoveredInsn(op = "INVOKESPECIAL", owner = mid.owner, name = mid.name, desc = mid.desc ?: midDesc),
                                  returnHex = ev["ret"]?.asText())
+                    // <init> via Nonvirtual leaves the receiver initialized on stack
+                    if (mid.name == "<init>") b.maybeStash(args?.get(0)?.asText())
+                    else if (call == "CallNonvirtualObjectMethod") b.maybeStash(ev["ret"]?.asText())
                 }
             }
 
@@ -277,6 +349,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
                         ),
                         returnHex = ev["ret"]?.asText(),
                     )
+                    if (call in CALL_OBJECT_VARIANTS) b.maybeStash(ev["ret"]?.asText())
                 }
             }
 
@@ -344,6 +417,15 @@ class TraceTranslator(private val manifest: ManifestJson) {
 
             else -> {}
         }
+    }
+
+    private fun paramSlotCount(desc: String, isStatic: Boolean): Int {
+        var slots = if (isStatic) 0 else 1
+        val args = StackBalancer.parseArgTypes(desc)
+        for (a in args) {
+            slots += if (a == "J" || a == "D") 2 else 1
+        }
+        return slots
     }
 
     private fun emitArrayLoad(b: StackBalancer, args: JsonNode?, arrType: String, op: String, produces: StackBalancer.V) {

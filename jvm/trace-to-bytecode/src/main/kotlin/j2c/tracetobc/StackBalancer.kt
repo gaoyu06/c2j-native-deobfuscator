@@ -38,6 +38,16 @@ class StackBalancer(private val isStatic: Boolean) {
     val out: MutableList<RecoveredInsn> = mutableListOf()
     private val stack = ArrayDeque<V>()
 
+    /**
+     * SSA-style mapping: `jobject hex -> local var slot`. Populated once per
+     * method-translation. When set, each producer-event emit will stash its
+     * jobject return (via DUP + ASTORE), and any subsequent push of the same
+     * jobject will ALOAD from the slot instead of falling back to a typed
+     * null placeholder. Result: the recovered jar reuses real references
+     * across the method body instead of NPE'ing on synthetic nulls.
+     */
+    var slotMap: Map<String, Int> = emptyMap()
+
     fun stackTop(): V? = stack.lastOrNull()
     fun stackSize(): Int = stack.size
 
@@ -137,6 +147,19 @@ class StackBalancer(private val isStatic: Boolean) {
         if (wantHex == null) return
         val top = stack.lastOrNull()
         if (top is V.ObjHex && top.hex == wantHex) return
+        // If the requested jobject is in the SSA slot map, reload it.
+        val slot = slotMap[wantHex]
+        if (slot != null) {
+            out += RecoveredInsn(op = "ALOAD", `var` = slot)
+            if (type != null && type != "java/lang/Object" && type != "?") {
+                // ASTORE doesn't preserve the precise declared type; ALOAD
+                // returns Object (or the slot's "merged" type). Cast to the
+                // receiver type so verify sees the right narrow type.
+                out += RecoveredInsn(op = "CHECKCAST", type = type)
+            }
+            stack.addLast(V.ObjHex(wantHex))
+            return
+        }
         pushObjLiteral(wantHex, type)
     }
 
@@ -259,6 +282,16 @@ class StackBalancer(private val isStatic: Boolean) {
                 } else if (value is String && value.startsWith("0x")) {
                     val top = stack.lastOrNull()
                     if (top is V.ObjHex && top.hex == value) return
+                    // Try the SSA slot map before falling back to null+checkcast.
+                    val slot = slotMap[value]
+                    if (slot != null) {
+                        out += RecoveredInsn(op = "ALOAD", `var` = slot)
+                        if (refType != null && refType != "java/lang/Object") {
+                            out += RecoveredInsn(op = "CHECKCAST", type = refType)
+                        }
+                        stack.addLast(V.ObjHex(value))
+                        return
+                    }
                     pushObjLiteral(value, refType)
                 } else {
                     pushNullAs(refType)
@@ -282,6 +315,24 @@ class StackBalancer(private val isStatic: Boolean) {
             }
             else -> pushNull()
         }
+    }
+
+    /**
+     * If `hex` has been allocated an SSA slot, emit `DUP + ASTORE <slot>`
+     * so subsequent uses of that jobject can `ALOAD <slot>`. Called by the
+     * translator after each event that produces a jobject return.
+     *
+     * Net stack effect: zero (DUP pushes, ASTORE pops).
+     */
+    fun maybeStash(hex: String?) {
+        if (hex == null) return
+        val slot = slotMap[hex] ?: return
+        if (stack.isEmpty()) return
+        val top = stack.last()
+        if (top !is V.Obj && top !is V.ObjHex) return
+        out += RecoveredInsn(op = "DUP")
+        out += RecoveredInsn(op = "ASTORE", `var` = slot)
+        // model unchanged: DUP added one, ASTORE removed one
     }
 
     /**
