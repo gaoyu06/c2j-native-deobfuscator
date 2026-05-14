@@ -150,6 +150,117 @@ GhidraScript 把 j2c 转译产物反编译为伪 C JSON → Python tree-sitter A
 
 ---
 
+## 5. 栈平衡 + verify 通过率：4/5 通过，advanced 失败
+
+### 背景
+v8/v9 迭代加了 SSA 风格的合成 local var 槽位（每个 producer JNI 返回的 jobject DUP + ASTORE 进 slot；consumer 处 ALOAD）+ CHECKCAST 兜底 + return-value 收尾保护。在 5 个测试 fixture 上的 verify 状态：
+
+| 测例 | verify | 真实跑到多深 |
+|---|---|---|
+| comprehensive | ✓ | NPE on `<local10>` (内部数组空) |
+| snake | ✓ | NPE on `Board.rng` |
+| tetris | ✓ | NPE on `Board.height` |
+| httpserver | ✓ | **服务器真的 start 起来了** (listening on 55320)，hit() 因 URL spec=null NPE |
+| **advanced** | ✗ | bci=2219 stack[52] 'Object' 不能赋给 'Throwable' |
+
+### advanced 失败的根因
+含 lambda + invokedynamic + stream + reflection。native-obfuscator 的 `IndyPreprocessor` 把 `invokedynamic` 改写成 bootstrap-then-call 链路，单个 lambda 表达式会展开成几十条 JNI 调用（`MethodHandles.lookup`, `MethodHandleNatives.linkCallSite`, ...）。我们的 trace 收到几千条 JNI 事件，translator 顺序模型扛不住操作数栈高 50+。
+
+### 替代/后续路径
+1. **专门识别 indy bootstrap 模式**：在 trace-to-bytecode 加一个 pattern matcher：连续若干条 `MethodHandles$Lookup.findStatic/findVirtual` / `LambdaMetafactory.metafactory` 调用塌缩成单条合成 `INVOKEDYNAMIC` 指令。约 200 行 Kotlin。这是正解，但需要熟悉 indy bootstrap 协议。
+2. **粗粒度跳过 indy 区段**：识别"我们正在 indy 链路中"的启发式（receiver 是 lookup 对象），把这段 trace 事件折叠为单个 `aconst_null + checkcast java/lang/Object`。能让 verify 通过但 lambda 体现不出来。
+3. **直接 emit 原始 invokedynamic**：如果 trace 能识别出 BootstrapMethod 句柄和参数，可以原样 emit `invokedynamic`。但这要求 trace 看到完整的 `CallSite` 创建过程，目前缺。
+
+本阶段不做 (1)/(2)/(3)，因为 lambda 还原是个独立的 sub-project。**建议作为 j2c-dumper v2 的专项任务**。
+
+---
+
+## 6. 纯算术方法还原为空
+
+### 现象
+`Calc.factorial(int)long`、`Calc.add(int,int)int`、`Snake.equals` 等只做加法/比较/赋值的方法，trace 抓到 0 个 JNI 事件，还原结果只剩一条 `IRETURN`/`LRETURN`。
+
+### 根因
+native-obfuscator 把 `ILOAD/ISTORE/IADD` 这类指令翻译成纯 C++ 赋值：
+```cpp
+cstack0.i = clocal1.i;
+cstack1.i = clocal2.i;
+cstack0.i = cstack0.i + cstack1.i;
+```
+这些是栈上 local var 的算术，**完全不触发 JNI**。JVMTI agent 监听不到。
+
+### 已探索的替代路径
+1. **静态反编译 (Ghidra)**：理论上能从二进制反汇编看到 cstack/clocal 的栈帧偏移。**实测在 -O2 优化下失败**：编译器把短生命期的 cstack 提升到寄存器，常量折叠，循环展开，整个函数有时被内联消失（参见 §4）。
+2. **要求被混淆的 .dll 用 -O0 重编**：如果用户控制混淆器配置，Ghidra 反编译会清晰得多。但对野外 jar 不适用。
+3. **JVMTI MethodEntry 拿方法 args**：JVMTI 对 native 方法的 args **不暴露**（`GetLocalObject` 等只对 Java 方法有效）。需要给每个 native 方法生成 trampoline 包装拦截 args——非常侵入性，每个签名都得 hand-roll 或上 libffi。
+4. **修改 native-obfuscator 加 `--trace-mode` 编译选项**：让 cppsnippets 模板额外 emit `j2c_trace_op(opcode, slot, value)` 调用。能 100% 还原但性能爆炸、且只对内部研究用。
+
+### 当前阶段决定
+**不做**。纯算术方法目前是 dynamic 路径的硬性盲区。文档承认这一点。
+- 用户场景 90% 的关注点是业务逻辑方法（带 JNI 调用 = 调外部 API + 字段访问）—— 这些覆盖率 80%+
+- 纯辅助算术方法（getter / 加法 / 比较）即使还原为空，对理解整体程序逻辑也基本无影响——逆向工程师能从被调用上下文反推
+
+**下个阶段**做 §4 列的"完整 GhidraScript + 真实 jar"路径，对大型业务 jar 应该能补回 50%+ 的纯算术方法。
+
+---
+
+## 7. 方法参数识别：只识别 this，其他参数缺失
+
+### 现状
+通过启发式（非 static 方法的首个 `GetObjectClass` 调用 args[0] = this）识别 `this`，绑定到 SSA slot 0。其他方法参数（jobject 或基本类型）**未识别**。
+
+### 影响
+当某个方法参数是 jobject 类型（如 `compute(int[] values)` 的 `values`），它的 jobject hex 出现在 trace 里但没有 producer——SSA 找不到来源，退化为 `aconst_null + checkcast`。结果：方法调用看似 OK 但调用 `values.length` 等 NPE。
+
+### 已探索的替代路径
+1. **JVMTI MethodEntry 拿参数 jobject 值**：对 native 方法**不可用**——JVMTI 的 `GetLocalObject` 只对 Java 字节码方法有效，native 方法的参数在 JVMTI 看来是不可见的。
+2. **在 native-obfuscator 生成的 trampoline 里捕获**：每个 `__ngen_*` 方法函数签名不同，需要为每种签名生成定制的 trampoline，或上 libffi。复杂度高。
+3. **观察推断**：方法首次执行时，如果第一个 jobject-类型的 JNI 调用接受了某个未知 jobject 作为 args[0]，且该 jobject 立刻被作为 receiver 调用了它的实例方法——它**很可能**是某个方法参数。但识别哪个 slot 是不确定的。
+4. **静态识别**：在 cclasses/cstrings 表外，识别 `__ngen_*` 入口处的 `clocal[N].l = obj/arg0/...` 赋值指令。**只在 -O0 下可行**（同 §6 限制）。
+
+### 当前阶段决定
+**只做 this 识别**。其他参数继续退化为 `aconst_null + checkcast`。下个阶段可以做 (3) 启发式，预计能正确识别 60% 的方法参数。
+
+---
+
+## 8. SSA 改善反编译可读性，但 runtime 仍 NPE
+
+### 现状（v9 数据）
+
+SSA 让 receiver 也走 slot 路径后，效果在反编译层非常显著。`httpserver` 的 `App.main` 反编译：
+
+```java
+inetSocketAddress = new InetSocketAddress("127.0.0.1", 0);
+httpServer = HttpServer.create(inetSocketAddress, 0);
+helloHandler = new HelloHandler();
+httpServer.createContext("/hello", helloHandler);
+addHandler = new AddHandler();
+httpServer.createContext("/add", addHandler);
+httpServer.setExecutor(null);
+httpServer.start();
+inetSocketAddress2 = httpServer.getAddress();
+inetSocketAddress2.getPort();
+httpServer.stop(0);
+```
+
+跟源码（`HttpServer server = HttpServer.create(...); server.createContext(...);`）几乎逐行对应——**只差变量名命名**。**服务器真的启动了**（listening on 55320），后面在 `hit(url)` 的 URL 字符串拼接处挂掉。
+
+### 为什么 runtime NPE 还在
+- **方法参数缺失**（§7）：`hit(String url)` 的 `url` 参数我们不知道是哪个 var slot，导致 `new URL(url)` 收到 null。
+- **跨 native 方法边界的 jobject 复用**：jobject `0xABC` 在 `Animal.greet` frame 里是某个 String，跨 frame 到 `Main.main` 时同一个 hex 还在用，但 SSA 槽位是每 frame 独立的——`Main.main` 的 slot map 里没有这个 hex 的条目。
+- **字段读取链未追**：`this.body.addFirst(cell)` 这种"先 GETFIELD 拿到 body，再调 method"——目前 SSA 只追了 INVOKE 返回值，没追 GETFIELD 链返回的 jobject。
+
+### 替代/后续路径
+1. **GETFIELD 链全部加 SSA stash**（已部分实现 §3）：每个 `GetObjectField` 也 DUP+ASTORE。**已实现**。`http` 测例的 NPE 已经从"server is null"消失，证明这个起效了。
+2. **方法参数识别**（§7）：解决 hit() 这类参数级 NPE。
+3. **跨 frame 引用传播**：把 SSA slot map 改成全局而非 per-method，但 slot 编号要分配在每 frame 的 local var 表上——实现上需要 method-level slot prefix。
+
+### 下一步建议
+- 优先做 §7 (方法参数识别 - 启发式)：预计能让 snake/tetris 的 NPE 从"Board.height" 变成更深位置（Game.main 中 Board 自身已经被识别为 SSA slot）
+- §8(3) 跨 frame 引用属于优化项，不是阻塞项
+
+---
+
 ## (后续模块——预留位置)
 
 更多偏离会随实现进度追加到此。

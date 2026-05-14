@@ -114,9 +114,18 @@ class StackBalancer(private val isStatic: Boolean) {
     }
 
     fun pushObjLiteral(hex: String, type: String? = null) {
-        // unknown source; emit `aconst_null + checkcast type` so the
-        // verifier sees a value of the expected reference type. The model
-        // remembers the hex so subsequent calls can detect chains.
+        // If this jobject has been stashed in the SSA slot map, reload it
+        // — far better than synthesizing a null. Only fall through to the
+        // `aconst_null + checkcast` path when no slot is available.
+        val slot = slotMap[hex]
+        if (slot != null) {
+            out += RecoveredInsn(op = "ALOAD", `var` = slot)
+            if (!type.isNullOrEmpty() && type != "?" && type != "java/lang/Object") {
+                out += RecoveredInsn(op = "CHECKCAST", type = type)
+            }
+            stack.addLast(V.ObjHex(hex))
+            return
+        }
         out += RecoveredInsn(op = "ACONST_NULL")
         if (!type.isNullOrEmpty() && type != "?") {
             out += RecoveredInsn(op = "CHECKCAST", type = type)
