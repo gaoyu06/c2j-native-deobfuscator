@@ -48,6 +48,7 @@ void register_string(jobject o, std::string s) {
 }
 
 thread_local int t_frame_depth = 0;
+thread_local int t_suppress_depth = 0;
 thread_local const char* t_current_method = nullptr;
 
 // Parse a method descriptor into a list of arg-type tokens.
@@ -226,7 +227,7 @@ std::string hex_ptr(const void* p) {
 
 void emit(const std::string& call, const std::string& args, const std::string& ret,
           jmethodID mid = nullptr) {
-    if (!in_native_frame()) return;
+    if (!in_native_frame() || t_suppress_depth > 0) return;
     std::ostringstream os;
     os << "{\"ev\":\"jni\",\"ts\":" << TraceWriter::ts_now()
        << ",\"thr\":" << TraceWriter::tid()
@@ -675,6 +676,181 @@ jint JNICALL h_ThrowNew(JNIEnv* env, jclass c, const char* m) {
     return r;
 }
 
+// ---------- Type / instanceof / array / alloc / nonvirtual ----------
+
+jboolean JNICALL h_IsInstanceOf(JNIEnv* env, jobject obj, jclass clazz) {
+    jboolean r = ORIG(IsInstanceOf)(env, obj, clazz);
+    std::ostringstream args; args << hex_ptr(obj) << "," << hex_ptr(clazz);
+    char rb[8]; std::snprintf(rb, sizeof(rb), "%d", (int) r);
+    emit("IsInstanceOf", args.str(), rb);
+    return r;
+}
+
+jboolean JNICALL h_IsAssignableFrom(JNIEnv* env, jclass a, jclass b) {
+    jboolean r = ORIG(IsAssignableFrom)(env, a, b);
+    std::ostringstream args; args << hex_ptr(a) << "," << hex_ptr(b);
+    char rb[8]; std::snprintf(rb, sizeof(rb), "%d", (int) r);
+    emit("IsAssignableFrom", args.str(), rb);
+    return r;
+}
+
+jclass JNICALL h_GetObjectClass(JNIEnv* env, jobject obj) {
+    jclass r = ORIG(GetObjectClass)(env, obj);
+    std::ostringstream args; args << hex_ptr(obj);
+    emit("GetObjectClass", args.str(), hex_ptr(r));
+    return r;
+}
+
+jclass JNICALL h_GetSuperclass(JNIEnv* env, jclass clazz) {
+    jclass r = ORIG(GetSuperclass)(env, clazz);
+    std::ostringstream args; args << hex_ptr(clazz);
+    emit("GetSuperclass", args.str(), hex_ptr(r));
+    return r;
+}
+
+jsize JNICALL h_GetArrayLength(JNIEnv* env, jarray array) {
+    jsize r = ORIG(GetArrayLength)(env, array);
+    std::ostringstream args; args << hex_ptr(array);
+    char rb[16]; std::snprintf(rb, sizeof(rb), "%d", (int) r);
+    emit("GetArrayLength", args.str(), rb);
+    return r;
+}
+
+jobject JNICALL h_AllocObject(JNIEnv* env, jclass clazz) {
+    jobject r = ORIG(AllocObject)(env, clazz);
+    std::ostringstream args; args << hex_ptr(clazz);
+    emit("AllocObject", args.str(), hex_ptr(r));
+    return r;
+}
+
+// ---------- Array constructors ----------
+
+jobjectArray JNICALL h_NewObjectArray(JNIEnv* env, jsize len, jclass clazz, jobject init) {
+    jobjectArray r = ORIG(NewObjectArray)(env, len, clazz, init);
+    std::ostringstream args;
+    args << len << "," << hex_ptr(clazz) << "," << hex_ptr(init);
+    emit("NewObjectArray", args.str(), hex_ptr(r));
+    return r;
+}
+
+#define WRAP_NEW_PRIM_ARRAY(jname, jtype)                                                 \
+    jtype##Array JNICALL h_New##jname##Array(JNIEnv* env, jsize len) {                    \
+        jtype##Array r = ORIG(New##jname##Array)(env, len);                               \
+        char buf[16]; std::snprintf(buf, sizeof(buf), "%d", (int) len);                   \
+        emit("New" #jname "Array", buf, hex_ptr(r));                                      \
+        return r;                                                                          \
+    }
+
+WRAP_NEW_PRIM_ARRAY(Boolean, jboolean)
+WRAP_NEW_PRIM_ARRAY(Byte,    jbyte)
+WRAP_NEW_PRIM_ARRAY(Char,    jchar)
+WRAP_NEW_PRIM_ARRAY(Short,   jshort)
+WRAP_NEW_PRIM_ARRAY(Int,     jint)
+WRAP_NEW_PRIM_ARRAY(Long,    jlong)
+WRAP_NEW_PRIM_ARRAY(Float,   jfloat)
+WRAP_NEW_PRIM_ARRAY(Double,  jdouble)
+
+// ---------- Array element access ----------
+
+jobject JNICALL h_GetObjectArrayElement(JNIEnv* env, jobjectArray arr, jsize index) {
+    jobject r = ORIG(GetObjectArrayElement)(env, arr, index);
+    std::ostringstream args; args << hex_ptr(arr) << "," << (int) index;
+    emit("GetObjectArrayElement", args.str(), hex_ptr(r));
+    return r;
+}
+
+void JNICALL h_SetObjectArrayElement(JNIEnv* env, jobjectArray arr, jsize index, jobject val) {
+    ORIG(SetObjectArrayElement)(env, arr, index, val);
+    std::ostringstream args; args << hex_ptr(arr) << "," << (int) index << "," << hex_ptr(val);
+    emit("SetObjectArrayElement", args.str(), "null");
+}
+
+#define WRAP_GET_ARRAY_REGION(jname, jtype, fmt)                                          \
+    void JNICALL h_Get##jname##ArrayRegion(JNIEnv* env, jtype##Array arr,                 \
+                                            jsize start, jsize len, jtype* buf) {        \
+        ORIG(Get##jname##ArrayRegion)(env, arr, start, len, buf);                         \
+        std::ostringstream args;                                                          \
+        args << hex_ptr(arr) << "," << (int) start << "," << (int) len;                   \
+        if (buf && len > 0) {                                                              \
+            char vb[64]; std::snprintf(vb, sizeof(vb), fmt, (long long) buf[0]);          \
+            args << "," << vb;                                                             \
+        }                                                                                  \
+        emit("Get" #jname "ArrayRegion", args.str(), "null");                             \
+    }
+
+#define WRAP_SET_ARRAY_REGION(jname, jtype, fmt)                                          \
+    void JNICALL h_Set##jname##ArrayRegion(JNIEnv* env, jtype##Array arr,                 \
+                                            jsize start, jsize len, const jtype* buf) {  \
+        ORIG(Set##jname##ArrayRegion)(env, arr, start, len, buf);                         \
+        std::ostringstream args;                                                          \
+        args << hex_ptr(arr) << "," << (int) start << "," << (int) len;                   \
+        if (buf && len > 0) {                                                              \
+            char vb[64]; std::snprintf(vb, sizeof(vb), fmt, (long long) buf[0]);          \
+            args << "," << vb;                                                             \
+        }                                                                                  \
+        emit("Set" #jname "ArrayRegion", args.str(), "null");                             \
+    }
+
+WRAP_GET_ARRAY_REGION(Boolean, jboolean, "%lld")
+WRAP_GET_ARRAY_REGION(Byte,    jbyte,    "%lld")
+WRAP_GET_ARRAY_REGION(Char,    jchar,    "%lld")
+WRAP_GET_ARRAY_REGION(Short,   jshort,   "%lld")
+WRAP_GET_ARRAY_REGION(Int,     jint,     "%lld")
+WRAP_GET_ARRAY_REGION(Long,    jlong,    "%lld")
+WRAP_GET_ARRAY_REGION(Float,   jfloat,   "%lld")
+WRAP_GET_ARRAY_REGION(Double,  jdouble,  "%lld")
+
+WRAP_SET_ARRAY_REGION(Boolean, jboolean, "%lld")
+WRAP_SET_ARRAY_REGION(Byte,    jbyte,    "%lld")
+WRAP_SET_ARRAY_REGION(Char,    jchar,    "%lld")
+WRAP_SET_ARRAY_REGION(Short,   jshort,   "%lld")
+WRAP_SET_ARRAY_REGION(Int,     jint,     "%lld")
+WRAP_SET_ARRAY_REGION(Long,    jlong,    "%lld")
+WRAP_SET_ARRAY_REGION(Float,   jfloat,   "%lld")
+WRAP_SET_ARRAY_REGION(Double,  jdouble,  "%lld")
+
+// ---------- Nonvirtual method calls (INVOKESPECIAL for <init>) ----------
+
+void JNICALL h_CallNonvirtualVoidMethodV(JNIEnv* env, jobject obj, jclass cls,
+                                          jmethodID m, va_list ap) {
+    va_list ap2; va_copy(ap2, ap);
+    va_list ap3; va_copy(ap3, ap);
+    ORIG(CallNonvirtualVoidMethodV)(env, obj, cls, m, ap2);
+    va_end(ap2);
+    std::ostringstream args;
+    args << hex_ptr(obj) << "," << hex_ptr(cls) << "," << hex_ptr(m) << decode_variadic(m, ap3);
+    va_end(ap3);
+    emit("CallNonvirtualVoidMethod", args.str(), "null", m);
+}
+
+void JNICALL h_CallNonvirtualVoidMethod(JNIEnv* env, jobject obj, jclass cls,
+                                         jmethodID m, ...) {
+    va_list ap; va_start(ap, m);
+    h_CallNonvirtualVoidMethodV(env, obj, cls, m, ap);
+    va_end(ap);
+}
+
+jobject JNICALL h_CallNonvirtualObjectMethodV(JNIEnv* env, jobject obj, jclass cls,
+                                               jmethodID m, va_list ap) {
+    va_list ap2; va_copy(ap2, ap);
+    va_list ap3; va_copy(ap3, ap);
+    jobject r = ORIG(CallNonvirtualObjectMethodV)(env, obj, cls, m, ap2);
+    va_end(ap2);
+    std::ostringstream args;
+    args << hex_ptr(obj) << "," << hex_ptr(cls) << "," << hex_ptr(m) << decode_variadic(m, ap3);
+    va_end(ap3);
+    emit("CallNonvirtualObjectMethod", args.str(), hex_ptr(r), m);
+    return r;
+}
+
+jobject JNICALL h_CallNonvirtualObjectMethod(JNIEnv* env, jobject obj, jclass cls,
+                                              jmethodID m, ...) {
+    va_list ap; va_start(ap, m);
+    jobject r = h_CallNonvirtualObjectMethodV(env, obj, cls, m, ap);
+    va_end(ap);
+    return r;
+}
+
 void build_hook_table() {
     g_hooked = new JNINativeInterface_(*g_original);
     g_hooked->FindClass             = h_FindClass;
@@ -750,6 +926,47 @@ void build_hook_table() {
     g_hooked->DeleteLocalRef      = h_DeleteLocalRef;
     g_hooked->DeleteGlobalRef     = h_DeleteGlobalRef;
     g_hooked->DeleteWeakGlobalRef = h_DeleteWeakGlobalRef;
+
+    g_hooked->IsInstanceOf      = h_IsInstanceOf;
+    g_hooked->IsAssignableFrom  = h_IsAssignableFrom;
+    g_hooked->GetObjectClass    = h_GetObjectClass;
+    g_hooked->GetSuperclass     = h_GetSuperclass;
+    g_hooked->GetArrayLength    = h_GetArrayLength;
+    g_hooked->AllocObject       = h_AllocObject;
+
+    g_hooked->NewObjectArray  = h_NewObjectArray;
+    g_hooked->NewBooleanArray = h_NewBooleanArray;
+    g_hooked->NewByteArray    = h_NewByteArray;
+    g_hooked->NewCharArray    = h_NewCharArray;
+    g_hooked->NewShortArray   = h_NewShortArray;
+    g_hooked->NewIntArray     = h_NewIntArray;
+    g_hooked->NewLongArray    = h_NewLongArray;
+    g_hooked->NewFloatArray   = h_NewFloatArray;
+    g_hooked->NewDoubleArray  = h_NewDoubleArray;
+
+    g_hooked->GetObjectArrayElement = h_GetObjectArrayElement;
+    g_hooked->SetObjectArrayElement = h_SetObjectArrayElement;
+    g_hooked->GetBooleanArrayRegion = h_GetBooleanArrayRegion;
+    g_hooked->GetByteArrayRegion    = h_GetByteArrayRegion;
+    g_hooked->GetCharArrayRegion    = h_GetCharArrayRegion;
+    g_hooked->GetShortArrayRegion   = h_GetShortArrayRegion;
+    g_hooked->GetIntArrayRegion     = h_GetIntArrayRegion;
+    g_hooked->GetLongArrayRegion    = h_GetLongArrayRegion;
+    g_hooked->GetFloatArrayRegion   = h_GetFloatArrayRegion;
+    g_hooked->GetDoubleArrayRegion  = h_GetDoubleArrayRegion;
+    g_hooked->SetBooleanArrayRegion = h_SetBooleanArrayRegion;
+    g_hooked->SetByteArrayRegion    = h_SetByteArrayRegion;
+    g_hooked->SetCharArrayRegion    = h_SetCharArrayRegion;
+    g_hooked->SetShortArrayRegion   = h_SetShortArrayRegion;
+    g_hooked->SetIntArrayRegion     = h_SetIntArrayRegion;
+    g_hooked->SetLongArrayRegion    = h_SetLongArrayRegion;
+    g_hooked->SetFloatArrayRegion   = h_SetFloatArrayRegion;
+    g_hooked->SetDoubleArrayRegion  = h_SetDoubleArrayRegion;
+
+    g_hooked->CallNonvirtualVoidMethod    = h_CallNonvirtualVoidMethod;
+    g_hooked->CallNonvirtualVoidMethodV   = h_CallNonvirtualVoidMethodV;
+    g_hooked->CallNonvirtualObjectMethod  = h_CallNonvirtualObjectMethod;
+    g_hooked->CallNonvirtualObjectMethodV = h_CallNonvirtualObjectMethodV;
 }
 
 } // namespace
@@ -779,6 +996,9 @@ void install(JNIEnv* env) {
 void enter_native_frame() { ++t_frame_depth; }
 void exit_native_frame()  { if (t_frame_depth > 0) --t_frame_depth; }
 bool in_native_frame()    { return t_frame_depth > 0; }
+
+void enter_suppress_frame() { ++t_suppress_depth; }
+void exit_suppress_frame()  { if (t_suppress_depth > 0) --t_suppress_depth; }
 
 void set_current_native_method(const char* sig) { t_current_method = sig; }
 const char* current_native_method() { return t_current_method; }

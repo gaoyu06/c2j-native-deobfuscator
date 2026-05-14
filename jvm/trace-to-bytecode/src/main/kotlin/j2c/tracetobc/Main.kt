@@ -247,6 +247,74 @@ class TraceTranslator(private val manifest: ManifestJson) {
                 // similar infrastructure that aren't part of the source bytecode).
             }
 
+            "CallNonvirtualVoidMethod", "CallNonvirtualObjectMethod" -> {
+                // args[0]=obj, args[1]=cls, args[2]=mid, args[3+]=variadic
+                val mid = symbols[args?.get(2)?.asText()] as? Sym.MethodId
+                val midDesc = ev["midDesc"]?.asText()
+                if (mid != null && mid.owner != null) {
+                    out += RecoveredInsn(
+                        op = "INVOKESPECIAL",
+                        owner = mid.owner,
+                        name = mid.name,
+                        desc = mid.desc ?: midDesc,
+                    )
+                }
+            }
+
+            "AllocObject" -> {
+                val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
+                if (cls != null) {
+                    out += RecoveredInsn(op = "NEW", type = cls.internalName)
+                    out += RecoveredInsn(op = "DUP")
+                }
+            }
+
+            "IsInstanceOf" -> {
+                val cls = symbols[args?.get(1)?.asText()] as? Sym.Class
+                if (cls != null) {
+                    out += RecoveredInsn(op = "INSTANCEOF", type = cls.internalName)
+                }
+            }
+
+            "GetArrayLength" -> out += RecoveredInsn(op = "ARRAYLENGTH")
+
+            "NewObjectArray" -> {
+                val cls = symbols[args?.get(1)?.asText()] as? Sym.Class
+                if (cls != null) {
+                    out += RecoveredInsn(op = "ANEWARRAY", type = cls.internalName)
+                }
+            }
+
+            "NewBooleanArray" -> out += RecoveredInsn(op = "NEWARRAY", value = 4)
+            "NewCharArray"    -> out += RecoveredInsn(op = "NEWARRAY", value = 5)
+            "NewFloatArray"   -> out += RecoveredInsn(op = "NEWARRAY", value = 6)
+            "NewDoubleArray"  -> out += RecoveredInsn(op = "NEWARRAY", value = 7)
+            "NewByteArray"    -> out += RecoveredInsn(op = "NEWARRAY", value = 8)
+            "NewShortArray"   -> out += RecoveredInsn(op = "NEWARRAY", value = 9)
+            "NewIntArray"     -> out += RecoveredInsn(op = "NEWARRAY", value = 10)
+            "NewLongArray"    -> out += RecoveredInsn(op = "NEWARRAY", value = 11)
+
+            "GetObjectArrayElement" -> out += RecoveredInsn(op = "AALOAD")
+            "SetObjectArrayElement" -> out += RecoveredInsn(op = "AASTORE")
+
+            "GetBooleanArrayRegion" -> out += RecoveredInsn(op = "BALOAD")
+            "GetByteArrayRegion"    -> out += RecoveredInsn(op = "BALOAD")
+            "GetCharArrayRegion"    -> out += RecoveredInsn(op = "CALOAD")
+            "GetShortArrayRegion"   -> out += RecoveredInsn(op = "SALOAD")
+            "GetIntArrayRegion"     -> out += RecoveredInsn(op = "IALOAD")
+            "GetLongArrayRegion"    -> out += RecoveredInsn(op = "LALOAD")
+            "GetFloatArrayRegion"   -> out += RecoveredInsn(op = "FALOAD")
+            "GetDoubleArrayRegion"  -> out += RecoveredInsn(op = "DALOAD")
+
+            "SetBooleanArrayRegion" -> out += RecoveredInsn(op = "BASTORE")
+            "SetByteArrayRegion"    -> out += RecoveredInsn(op = "BASTORE")
+            "SetCharArrayRegion"    -> out += RecoveredInsn(op = "CASTORE")
+            "SetShortArrayRegion"   -> out += RecoveredInsn(op = "SASTORE")
+            "SetIntArrayRegion"     -> out += RecoveredInsn(op = "IASTORE")
+            "SetLongArrayRegion"    -> out += RecoveredInsn(op = "LASTORE")
+            "SetFloatArrayRegion"   -> out += RecoveredInsn(op = "FASTORE")
+            "SetDoubleArrayRegion"  -> out += RecoveredInsn(op = "DASTORE")
+
             "Throw", "ThrowNew" -> out += RecoveredInsn(op = "ATHROW")
 
             else -> {}

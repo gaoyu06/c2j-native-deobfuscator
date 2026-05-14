@@ -19,6 +19,12 @@ void enter_native_frame();
 void exit_native_frame();
 bool in_native_frame();
 
+// Suspend / resume emission while inside JDK-native methods invoked from
+// within a user native frame (their JNI calls are noise from the
+// reverse-engineering POV).
+void enter_suppress_frame();
+void exit_suppress_frame();
+
 // Current method being entered (for "fn" field of enter/exit events).
 void set_current_native_method(const char* sig);
 const char* current_native_method();

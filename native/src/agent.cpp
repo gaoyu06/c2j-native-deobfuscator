@@ -126,19 +126,23 @@ void JNICALL on_native_method_bind(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
     TraceWriter::instance().write_line(os.str());
 }
 
+bool is_jdk_native(const std::string& cname) {
+    return cname.rfind("java/", 0) == 0 ||
+           cname.rfind("javax/", 0) == 0 ||
+           cname.rfind("sun/", 0) == 0 ||
+           cname.rfind("jdk/", 0) == 0 ||
+           cname.rfind("com/sun/", 0) == 0;
+}
+
 void JNICALL on_method_entry(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
                              jmethodID method) {
     if (!method_is_native(jvmti, method)) return;
     auto [cname, nm, ds] = method_info(jvmti, method);
-    // Filter: only methods that look like j2c-generated stubs (heuristic:
-    // user classes, not the JDK).  The simplest filter is "not java/*,
-    // javax/*, sun/*, jdk/*, com/sun/*".  This avoids flooding the trace with
-    // JDK native methods.
-    if (cname.rfind("java/", 0) == 0 ||
-        cname.rfind("javax/", 0) == 0 ||
-        cname.rfind("sun/", 0) == 0 ||
-        cname.rfind("jdk/", 0) == 0 ||
-        cname.rfind("com/sun/", 0) == 0) {
+    // JDK native methods called from inside a user native frame should not
+    // contribute JNI events to the recovery trace — they're internal noise
+    // (e.g. String.getBytes uses byte-array ops we'd otherwise capture).
+    if (is_jdk_native(cname)) {
+        if (hook::in_native_frame()) hook::enter_suppress_frame();
         return;
     }
     hook::enter_native_frame();
@@ -156,11 +160,8 @@ void JNICALL on_method_exit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
                             jvalue return_value) {
     if (!method_is_native(jvmti, method)) return;
     auto [cname, nm, ds] = method_info(jvmti, method);
-    if (cname.rfind("java/", 0) == 0 ||
-        cname.rfind("javax/", 0) == 0 ||
-        cname.rfind("sun/", 0) == 0 ||
-        cname.rfind("jdk/", 0) == 0 ||
-        cname.rfind("com/sun/", 0) == 0) {
+    if (is_jdk_native(cname)) {
+        if (hook::in_native_frame()) hook::exit_suppress_frame();
         return;
     }
     std::ostringstream os;
