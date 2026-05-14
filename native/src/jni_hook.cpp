@@ -259,15 +259,34 @@ jclass JNICALL h_FindClass(JNIEnv* env, const char* name) {
     return r;
 }
 
+void emit_outside_frame(const std::string& call, const std::string& args, const std::string& ret) {
+    std::ostringstream os;
+    os << "{\"ev\":\"jni-init\",\"ts\":" << TraceWriter::ts_now()
+       << ",\"thr\":" << TraceWriter::tid()
+       << ",\"call\":" << esc(call.c_str())
+       << ",\"args\":[" << args << "]"
+       << ",\"ret\":" << ret
+       << "}";
+    TraceWriter::instance().write_line(os.str());
+}
+
 jmethodID JNICALL h_GetMethodID(JNIEnv* env, jclass clazz, const char* name, const char* sig) {
     jmethodID r = ORIG(GetMethodID)(env, clazz, name, sig);
     if (r && sig) {
         std::lock_guard<std::mutex> g(g_mid_mu);
-        g_mid_desc.emplace(r, sig);
+        // Use insert_or_assign-equivalent: erase + emplace so we always store
+        // the latest descriptor for a given jmethodID. (Defensive — should
+        // never trigger if JNI gives stable IDs, but guards against any
+        // internal reuse.)
+        g_mid_desc[r] = sig;
     }
     std::ostringstream args;
     args << hex_ptr(clazz) << "," << esc(name) << "," << esc(sig);
-    emit("GetMethodID", args.str(), hex_ptr(r));
+    if (in_native_frame()) {
+        emit("GetMethodID", args.str(), hex_ptr(r));
+    } else {
+        emit_outside_frame("GetMethodID", args.str(), hex_ptr(r));
+    }
     return r;
 }
 
@@ -275,11 +294,15 @@ jmethodID JNICALL h_GetStaticMethodID(JNIEnv* env, jclass clazz, const char* nam
     jmethodID r = ORIG(GetStaticMethodID)(env, clazz, name, sig);
     if (r && sig) {
         std::lock_guard<std::mutex> g(g_mid_mu);
-        g_mid_desc.emplace(r, sig);
+        g_mid_desc[r] = sig;
     }
     std::ostringstream args;
     args << hex_ptr(clazz) << "," << esc(name) << "," << esc(sig);
-    emit("GetStaticMethodID", args.str(), hex_ptr(r));
+    if (in_native_frame()) {
+        emit("GetStaticMethodID", args.str(), hex_ptr(r));
+    } else {
+        emit_outside_frame("GetStaticMethodID", args.str(), hex_ptr(r));
+    }
     return r;
 }
 
@@ -356,6 +379,33 @@ jobject JNICALL h_NewLocalRef(JNIEnv* env, jobject ref) {
     if (!content.empty()) register_string(r, content);
     emit_propagate("NewLocalRef", ref, r);
     return r;
+}
+
+void JNICALL h_DeleteLocalRef(JNIEnv* env, jobject ref) {
+    // Crucial: local-ref jobject pointers are reused after deletion. Drop
+    // the cached string content so the next caller of the same pointer
+    // doesn't see a stale value.
+    if (ref != nullptr) {
+        std::lock_guard<std::mutex> g(g_str_mu);
+        g_str_content.erase(ref);
+    }
+    ORIG(DeleteLocalRef)(env, ref);
+}
+
+void JNICALL h_DeleteGlobalRef(JNIEnv* env, jobject ref) {
+    if (ref != nullptr) {
+        std::lock_guard<std::mutex> g(g_str_mu);
+        g_str_content.erase(ref);
+    }
+    ORIG(DeleteGlobalRef)(env, ref);
+}
+
+void JNICALL h_DeleteWeakGlobalRef(JNIEnv* env, jweak ref) {
+    if (ref != nullptr) {
+        std::lock_guard<std::mutex> g(g_str_mu);
+        g_str_content.erase(ref);
+    }
+    ORIG(DeleteWeakGlobalRef)(env, ref);
 }
 
 // Field accessors (one set per type) — we only wrap GetObjectField / GetIntField
@@ -696,6 +746,10 @@ void build_hook_table() {
     g_hooked->NewGlobalRef     = h_NewGlobalRef;
     g_hooked->NewWeakGlobalRef = h_NewWeakGlobalRef;
     g_hooked->NewLocalRef      = h_NewLocalRef;
+
+    g_hooked->DeleteLocalRef      = h_DeleteLocalRef;
+    g_hooked->DeleteGlobalRef     = h_DeleteGlobalRef;
+    g_hooked->DeleteWeakGlobalRef = h_DeleteWeakGlobalRef;
 }
 
 } // namespace
