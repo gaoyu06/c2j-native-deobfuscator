@@ -41,11 +41,15 @@ class TraceToBytecodeCmd : Callable<Int> {
             byMethod.getOrPut(g.method) { mutableListOf() }.add(g.events)
         }
         Files.createDirectories(output)
+        // One shared translator so symbols (jclass/jmethodID/jfieldID/jstring
+        // observed in any frame) carry across method invocations.
+        val translator = TraceTranslator(mani)
+        translator.warmup(events)
         var produced = 0
         for ((mk, invocations) in byMethod) {
             // Pick the longest (most informative) trace for this method
             val pick = invocations.maxByOrNull { it.size } ?: continue
-            val recovered = TraceTranslator(mani).translate(mk, pick, confidence)
+            val recovered = translator.translate(mk, pick, confidence)
             val file = output.resolve("${safeFilename(mk)}.json")
             JsonIO.write(file, recovered)
             produced++
@@ -114,16 +118,32 @@ private fun groupByMethodInvocation(events: List<JsonNode>): List<TraceGroup> {
 
 class TraceTranslator(private val manifest: ManifestJson) {
 
-    // Symbol table: maps jobject hex string -> known semantic
+    // Symbol table: maps jobject hex string -> known semantic.
+    // Persists across method translations so jclass / jmethodID observed in
+    // (e.g.) Loader.registerNativesForClass remain usable in Hello.main.
     private sealed class Sym {
         data class Class(val internalName: String) : Sym()
-        data class MethodId(val owner: String, val name: String, val desc: String) : Sym()
-        data class FieldId(val owner: String, val name: String, val desc: String) : Sym()
+        data class MethodId(val owner: String?, val name: String?, val desc: String?) : Sym()
+        data class FieldId(val owner: String?, val name: String?, val desc: String?) : Sym()
         data class StringLit(val value: String) : Sym()
         data class Unknown(val origin: String) : Sym()
     }
 
     private val symbols = mutableMapOf<String, Sym>()
+
+    /**
+     * First pass over the entire trace: feed every JNI event through the
+     * symbol-table updates (without emitting instructions). After this, the
+     * symbol table is populated with every jclass / jmethodID / jfieldID /
+     * jstring observed at agent load time and during class-loader bootstrap.
+     */
+    fun warmup(allEvents: List<JsonNode>) {
+        for (ev in allEvents) {
+            if (ev["ev"]?.asText() != "jni") continue
+            val call = ev["call"]?.asText() ?: continue
+            updateSymbols(call, ev)
+        }
+    }
 
     fun translate(method: MethodKey, jniEvents: List<JsonNode>, confidence: String): RecoveredMethod {
         val out = mutableListOf<RecoveredInsn>()
@@ -155,39 +175,12 @@ class TraceTranslator(private val manifest: ManifestJson) {
     }
 
     private fun translateCall(call: String, ev: JsonNode, out: MutableList<RecoveredInsn>) {
+        // Always update the symbol table first; THEN emit any bytecode.
+        updateSymbols(call, ev)
+
         val args = ev["args"]
         val ret = ev["ret"]
         when (call) {
-            "NewStringUTF" -> {
-                val s = args?.get(0)?.asText() ?: return
-                val retHex = ret?.asText() ?: return
-                symbols[retHex] = Sym.StringLit(s)
-                // We emit LDC only when this constant is USED — the symbol
-                // table records it for now.
-            }
-
-            "FindClass" -> {
-                val n = args?.get(0)?.asText() ?: return
-                val retHex = ret?.asText() ?: return
-                symbols[retHex] = Sym.Class(n)
-            }
-
-            "GetMethodID", "GetStaticMethodID" -> {
-                val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
-                val name = args?.get(1)?.asText() ?: return
-                val desc = args?.get(2)?.asText() ?: return
-                val retHex = ret?.asText() ?: return
-                if (cls != null) symbols[retHex] = Sym.MethodId(cls.internalName, name, desc)
-            }
-
-            "GetFieldID", "GetStaticFieldID" -> {
-                val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
-                val name = args?.get(1)?.asText() ?: return
-                val desc = args?.get(2)?.asText() ?: return
-                val retHex = ret?.asText() ?: return
-                if (cls != null) symbols[retHex] = Sym.FieldId(cls.internalName, name, desc)
-            }
-
             "GetStaticObjectField", "GetStaticBooleanField", "GetStaticByteField",
             "GetStaticCharField", "GetStaticShortField", "GetStaticIntField",
             "GetStaticLongField" -> {
@@ -198,7 +191,6 @@ class TraceTranslator(private val manifest: ManifestJson) {
                     name = fid.name,
                     desc = fid.desc,
                 )
-                if (ret != null) symbols[ret.asText()] = Sym.Unknown("getstatic-${fid.owner}.${fid.name}")
             }
 
             "GetObjectField", "GetBooleanField", "GetByteField",
@@ -210,7 +202,6 @@ class TraceTranslator(private val manifest: ManifestJson) {
                     name = fid.name,
                     desc = fid.desc,
                 )
-                if (ret != null) symbols[ret.asText()] = Sym.Unknown("getfield-${fid.owner}.${fid.name}")
             }
 
             "SetObjectField", "SetBooleanField", "SetByteField",
@@ -225,9 +216,9 @@ class TraceTranslator(private val manifest: ManifestJson) {
             }
 
             "NewObject" -> {
-                val cls = symbols[args?.get(0)?.asText()] as? Sym.Class ?: return
+                val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
                 val mid = symbols[args?.get(1)?.asText()] as? Sym.MethodId
-                out += RecoveredInsn(op = "NEW", type = cls.internalName)
+                if (cls != null) out += RecoveredInsn(op = "NEW", type = cls.internalName)
                 out += RecoveredInsn(op = "DUP")
                 if (mid != null) {
                     out += RecoveredInsn(
@@ -237,32 +228,111 @@ class TraceTranslator(private val manifest: ManifestJson) {
                         desc = mid.desc,
                     )
                 }
-                if (ret != null) symbols[ret.asText()] = Sym.Unknown("new-${cls.internalName}")
             }
 
             in CALL_OBJECT_VARIANTS, in CALL_PRIM_VARIANTS -> {
                 val isStatic = call.startsWith("CallStatic")
-                val mid = symbols[args?.get(1)?.asText()] as? Sym.MethodId ?: return
-                val op = if (isStatic) "INVOKESTATIC" else "INVOKEVIRTUAL"
-                out += RecoveredInsn(
-                    op = op,
-                    owner = mid.owner,
-                    name = mid.name,
-                    desc = mid.desc,
-                )
-                if (ret != null && call != "CallVoidMethod" && call != "CallStaticVoidMethod") {
-                    symbols[ret.asText()] = Sym.Unknown("call-${mid.owner}.${mid.name}")
+                val mid = symbols[args?.get(1)?.asText()] as? Sym.MethodId
+                val midDesc = ev["midDesc"]?.asText()
+                if (mid != null && mid.owner != null) {
+                    out += RecoveredInsn(
+                        op = if (isStatic) "INVOKESTATIC" else "INVOKEVIRTUAL",
+                        owner = mid.owner,
+                        name = mid.name,
+                        desc = mid.desc ?: midDesc,
+                    )
+                }
+                // Drop calls whose method ID we couldn't bind to an owner
+                // (these are native-obfuscator's find_class_wo_static and
+                // similar infrastructure that aren't part of the source bytecode).
+            }
+
+            "Throw", "ThrowNew" -> out += RecoveredInsn(op = "ATHROW")
+
+            else -> {}
+        }
+    }
+
+    /**
+     * Update the symbol table from a single JNI event.
+     *
+     * Handles three special inference cases used by native-obfuscator-style
+     * transpilers:
+     *  1. ``NewStringUTF("foo") -> jstring`` registers the literal.
+     *  2. ``CallObjectMethod`` whose ``midDesc`` ends in ``Ljava/lang/Class;``
+     *     and whose decoded string arg is a class name binds the returned
+     *     jobject to a Class. This covers the ``ClassLoader.loadClass(String)``
+     *     path.
+     *  3. ``CallObjectMethod`` whose ``midDesc`` returns ``Ljava/lang/String;``
+     *     and whose receiver is a known String (e.g. ``String.intern``) keeps
+     *     the same content on the result.
+     */
+    private fun updateSymbols(call: String, ev: JsonNode) {
+        val args = ev["args"]
+        val ret = ev["ret"]
+        val retHex = ret?.takeIf { it.isTextual }?.asText()
+        val midDesc = ev["midDesc"]?.asText()
+
+        when (call) {
+            "NewStringUTF" -> {
+                val s = args?.get(0)?.takeIf { it.isTextual }?.asText() ?: return
+                if (retHex != null) symbols[retHex] = Sym.StringLit(s)
+            }
+
+            "FindClass" -> {
+                val n = args?.get(0)?.takeIf { it.isTextual }?.asText() ?: return
+                if (retHex != null) symbols[retHex] = Sym.Class(n)
+            }
+
+            "GetMethodID", "GetStaticMethodID" -> {
+                val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
+                val name = args?.get(1)?.asText() ?: return
+                val desc = args?.get(2)?.asText() ?: return
+                if (retHex != null) {
+                    symbols[retHex] = Sym.MethodId(cls?.internalName, name, desc)
                 }
             }
 
-            "Throw", "ThrowNew" -> {
-                out += RecoveredInsn(op = "ATHROW")
+            "GetFieldID", "GetStaticFieldID" -> {
+                val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
+                val name = args?.get(1)?.asText() ?: return
+                val desc = args?.get(2)?.asText() ?: return
+                if (retHex != null) {
+                    symbols[retHex] = Sym.FieldId(cls?.internalName, name, desc)
+                }
             }
 
-            else -> {
-                // Untranslated: surface as a comment-like NOP using LABEL with a synthetic name
-                // (downstream class-rebuilder will ignore unknown LABEL refs — they're noise.)
+            "NewGlobalRef", "NewWeakGlobalRef", "NewLocalRef" -> {
+                // Propagate semantic from source jobject to the new reference.
+                val src = symbols[args?.get(0)?.asText()]
+                if (src != null && retHex != null) symbols[retHex] = src
             }
+
+            in CALL_OBJECT_VARIANTS -> {
+                // Heuristic 2: classloader.loadClass(String) -> jclass
+                if (midDesc != null && midDesc.endsWith(")Ljava/lang/Class;")) {
+                    // The first variadic arg starts at args[2]; if it is a
+                    // plain string literal (the agent inlined it), bind the
+                    // result to a Class.
+                    val first = args?.get(2)
+                    val name = if (first != null && first.isTextual) {
+                        val v = first.asText()
+                        if (!v.startsWith("0x")) v.replace('.', '/') else null
+                    } else null
+                    if (name != null && retHex != null) {
+                        symbols[retHex] = Sym.Class(name)
+                    }
+                }
+                // Heuristic 3: String.intern / String.toString — propagate content
+                if (midDesc != null && midDesc.endsWith(")Ljava/lang/String;")) {
+                    val recv = args?.get(0)?.asText()
+                    val lit = symbols[recv] as? Sym.StringLit
+                    if (lit != null && retHex != null) {
+                        symbols[retHex] = Sym.StringLit(lit.value)
+                    }
+                }
+            }
+            else -> {}
         }
     }
 

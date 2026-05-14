@@ -16,6 +16,8 @@ from typing import Any, Iterable
 import tree_sitter
 import tree_sitter_c
 
+from .jni_vtable import rewrite_vtable_calls
+
 
 # ------------------------------------------------------------------
 # Tree-sitter helpers
@@ -420,6 +422,8 @@ def lift_ghidra_dump(ghidra_json_path: Path, manifest_path: Path | None = None) 
         code = entry.get("code", "")
         if not code:
             continue
+        # Pre-process: turn Ghidra's untyped vtable calls into env->Func(args).
+        code = rewrite_vtable_calls(code)
         result = lift_function(code)
         # Heuristically extract (owner, name, desc) from the function symbol if
         # the script generated it as `__ngen_<class>_<method>`.

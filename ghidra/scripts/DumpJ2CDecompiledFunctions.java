@@ -85,11 +85,13 @@ public class DumpJ2CDecompiledFunctions extends GhidraScript {
 
     private static boolean isInteresting(String name) {
         if (name == null) return false;
-        return name.startsWith("__ngen_") ||
-                name.contains("_ngen_") ||
-                name.equals("JNI_OnLoad") ||
-                name.equals("prepare_lib") ||
-                name.contains("register_methods");
+        // Accept all functions; the AST matcher decides what to lift.
+        // Skip a few known C-runtime helpers to keep the dump trim.
+        if (name.startsWith("_") && name.length() > 4 && Character.isLowerCase(name.charAt(1))) {
+            return false; // libc internals (_aligned_*, _initterm, _errno, etc.)
+        }
+        if (name.startsWith("Rtl") || name.startsWith("__")) return false;
+        return true;
     }
 
     private static String jsonString(String s) {
