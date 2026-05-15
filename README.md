@@ -20,6 +20,126 @@ License: **GPLv3**.
 
 ---
 
+## How it works
+
+### Dynamic path
+
+- **JVMTI agent** (`native/`, C++). Loaded via `-agentpath:`. Subscribes
+  to `NativeMethodBind`, `MethodEntry`, `MethodExit`, `Exception`,
+  `ExceptionCatch` JVMTI events.
+- **JNI function table swap**. On `VMInit` and every `ThreadStart`, the
+  agent overwrites the `JNIEnv->functions` pointer with a copy whose
+  ~80 entries are redirected through logging wrappers. Each wrapper
+  delegates to the original function and records the call as a JSON
+  line in `trace.jsonl`. Variadic `Call*Method` flavours decode their
+  `va_list` against a per-class jmethodID descriptor cache.
+- **Symbol-table propagation** (`jvm/trace-to-bytecode/`). The lifter
+  walks the trace, classifies each jobject reference by what produced
+  it (`FindClass` → jclass, `GetMethodID` → jmethodID, etc.), and emits
+  the corresponding JVM op with fully resolved owner / name / desc.
+- **SSA-style synthetic locals**. Each jobject that the method reuses
+  across statements gets a synthetic local slot. The lifter emits
+  `DUP + ASTORE <slot>` after the producing JNI call and `ALOAD <slot>`
+  at every reuse site, so the recovered bytecode keeps real reference
+  identity without re-deriving the value.
+- **Operand-stack balancer**. Tracks the live stack and inserts
+  `POP` / `CHECKCAST` / `ACONST_NULL` corrections so the emitted
+  sequence verifies under ASM `COMPUTE_FRAMES`.
+
+### Static path
+
+- **Disassembly-level table discovery** (`py/binary_introspect/`,
+  `capstone`). Walks the native blob's executable sections, locates
+  every `call qword ptr [reg + 0x6B8]` (the `RegisterNatives` JNI vtable
+  slot), backscans the preceding instructions for PC-relative `lea`s
+  whose targets land in `.text` (= function pointers in the
+  `JNINativeMethod[]` being built on the stack) plus the most recent
+  `mov <nMethods-reg>, imm` (= the table size).
+- **Ghidra decompiler** (`ghidra/scripts/DumpFromManifest.java`,
+  Ghidra Headless). Reads the `(class, method, fnAddr)` triples from
+  `manifest.json` and runs Ghidra's p-code decompiler on each address,
+  yielding a single `ghidra-dump.json` with one pseudo-C body per
+  method.
+- **tree-sitter-c parse** (`py/ast_matcher/`, `tree-sitter-c`). Parses
+  the pseudo-C, then walks the AST with a feature-flagged driver that
+  recognises `env->FnName(args)` calls (rewritten from
+  Ghidra's `(**(code **)(*reg + 0xN))(...)` form), JNI helper patterns,
+  and exception-check guards.
+- **Throw-reason inference**. Native-obfuscator family obfuscators emit
+  `"Cannot invoke X.Y.Z(args)"` strings before every would-be Java call
+  for use in runtime exception messages. The lifter extracts them as
+  invoke hints and uses them as fallback (owner, name, args-desc) when
+  symbol tracking can't resolve a jmethodID through obfuscator helpers.
+- **Profile auto-detection**. The active obfuscator's harvest strategy
+  (per-class vs shared-dispatch), throw-reason regex, and if-guard
+  skip rules all come from a :class:`Profile` selected by scanning the
+  binary against built-in detectors.
+
+### Shared
+
+- **JSON pipeline**. Every stage's input + output is a versioned JSON
+  artifact under `schemas/`.
+- **ASM** (`org.objectweb.asm`) drives all class-file emission.
+  `ClassWriter.COMPUTE_FRAMES` is the verification gate; methods that
+  trip stack-imbalance get a sentinel stub body and the jar still ships.
+
+---
+
+## When to use which path
+
+Both paths target the same input but trade off coverage versus accuracy:
+
+| | Dynamic | Static |
+|---|---|---|
+| **Best fit** | Binary is packed / VM-protected / has anti-debug — the JVMTI agent sits at the Java side of the wall so the native protection layer doesn't matter. | Binary is unprotected (e.g. straight native-obfuscator + zig c++ output). Ghidra can decompile each `fnAddr` directly. |
+| **Requires** | A runnable command line (`java -jar ...`) that exercises the obfuscated classes. | Ghidra 11.x installed. |
+| **Coverage** | Only branches you actually run. Methods never invoked are missed entirely. | Every method registered through `RegisterNatives`, regardless of whether it's ever called. |
+| **Accuracy** | High — every emitted opcode corresponds to a real JNI call the JVM observed. | Best-effort — the lifter does pattern matching on decompiled C and falls back to stubs when stack-balance can't be maintained. |
+| **Speed** | Bounded by how long the target takes to exercise its code paths + agent overhead. | Bounded by Ghidra's auto-analysis (minutes for ~1 MB blobs). |
+
+---
+
+## Limitations
+
+- **Static path correctness is best-effort.** The lifter pattern-matches
+  Ghidra's pseudo-C; methods with control flow Ghidra didn't structure
+  cleanly produce stack-imbalanced bytecode that `class-rebuilder`
+  silently downgrades to a stub. The rest of the class still ships.
+- **Dynamic path only sees branches the target actually executes.** An
+  if/else where only the `if` ran is recovered as if the `else` doesn't
+  exist. Loop bodies show one iteration's worth of trace; concrete
+  values get baked in as LDC unless flagged dynamic by the agent.
+- **Pure-native control flow / arithmetic is invisible to both paths.**
+  When the obfuscator translates a computation that doesn't need a JVM
+  round-trip (char-array manipulation, integer math) entirely to C++,
+  no JNI calls happen, so neither dynamic tracing nor JNI-call-pattern
+  matching sees anything. The recovered method body for these regions
+  ends up empty or stubbed.
+- **AOT-translated logic is unrecoverable.** Higher-end obfuscators
+  detect Java code that doesn't require JVM cooperation (e.g.
+  symmetric crypto, byte-array transformations, file I/O via
+  POSIX/Win32) and emit it as straight native code instead of
+  JNI-callback C++. That output has no JNI signature at all — both
+  paths produce a stub for such methods. The only way back is reading
+  the disassembly by hand.
+- **String literals in `<clinit>`-decrypted tables remain
+  unresolved.** Each obfuscated class wraps its string constants in an
+  XOR/rotate table decoded at class-load time. The lifter preserves
+  the indexed accesses (`Foo.a(0, 17)`) verbatim instead of substituting
+  values; running the cleaned jar's `<clinit>` once + snapshotting the
+  table is on the roadmap (see `docs/ROADMAP.md`).
+
+---
+
+## Screenshots
+
+Side-by-side `javap` / decompiler comparisons between the original
+obfuscated jar and the recovered output live in
+[`screenshots/`](screenshots/). See `screenshots/README.md` for the
+catalogue.
+
+---
+
 ## Quick start
 
 ### One-time build
