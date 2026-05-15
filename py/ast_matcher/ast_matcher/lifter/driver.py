@@ -170,6 +170,69 @@ _JNI_CALL = re.compile(r"(?P<recv>\w+)\s*->\s*(?P<fn>\w+)\s*\(")
 _DAT_RE = re.compile(r"^\s*\(?\s*DAT_([0-9a-fA-F]+)\s*\)?\s*$")
 
 
+def _parse_method_args(method_desc: str) -> list[str]:
+    """Split a JVM method descriptor's args into individual type
+    descriptors. e.g. ``(IJLfoo;[I)V`` -> ``['I', 'J', 'Lfoo;', '[I']``."""
+    inside = method_desc.split("(", 1)[1].rsplit(")", 1)[0]
+    out: list[str] = []
+    i = 0
+    while i < len(inside):
+        c = inside[i]
+        if c == "L":
+            j = inside.index(";", i)
+            out.append(inside[i : j + 1])
+            i = j + 1
+        elif c == "[":
+            j = i
+            while j < len(inside) and inside[j] == "[":
+                j += 1
+            if j < len(inside) and inside[j] == "L":
+                j = inside.index(";", j)
+                out.append(inside[i : j + 1])
+                i = j + 1
+            else:
+                out.append(inside[i : j + 1])
+                i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return out
+
+
+def _jni_param_slot_map(method_desc: str, is_static: bool) -> dict[str, int]:
+    """Map Ghidra's ``param_N`` argument names to the corresponding JVM
+    local-variable slot.
+
+    JNI calling convention (x86_64, both Windows and SysV after the
+    `env` strip): ``param_1`` is the ``JNIEnv*``, ``param_2`` is
+    ``jobject this`` for instance methods or ``jclass clazz`` for
+    static, then ``param_3..`` are the user-declared args in
+    declaration order.
+
+    JVM locals: slot 0 holds ``this`` for instance methods, otherwise
+    slot 0 is the first user arg. Long / double take TWO slots each.
+
+    For static methods we deliberately don't bind ``param_2`` (the
+    ``jclass`` arg has no JVM-local counterpart).
+    """
+    out: dict[str, int] = {}
+    next_param = 2  # param_1 is env, param_2 is this/clazz
+    next_slot = 0
+    if not is_static:
+        out[f"param_{next_param}"] = next_slot
+        next_param += 1
+        next_slot += 1
+    else:
+        # Skip the jclass arg — no JVM-local slot.
+        next_param += 1
+    for arg_desc in _parse_method_args(method_desc):
+        out[f"param_{next_param}"] = next_slot
+        next_param += 1
+        # long / double take two slots in the JVM locals table.
+        next_slot += 2 if arg_desc in ("J", "D") else 1
+    return out
+
+
 def _resolve_cache_ref(ctx: "_Ctx", arg: str, kind: str):
     """Map a raw ``DAT_<hex>`` argument to its cacheTable entry.
 
@@ -847,6 +910,7 @@ def lift_ghidra_function(
     method_owner: str = "?",
     field_descs: dict[str, str] | None = None,
     cache_table: dict[str, Any] | None = None,
+    is_static: bool = False,
 ) -> dict[str, Any]:
     """Lift one Ghidra-decompiled function body to JVM instructions.
 
@@ -888,6 +952,15 @@ def lift_ghidra_function(
         field_descs=dict(field_descs or {}),
         cache_table=cache_table or {},
     )
+
+    # Pre-bind JNI parameter names (`param_2`, `param_3`, ...) to their
+    # corresponding JVM local-variable slots so the lifter emits
+    # ``aload_0`` / ``iload_1`` / ... instead of ``aconst_null`` when
+    # the obfuscated body uses one of the method's args. Without this
+    # the static path renders calls as ``((Snake)null).body`` instead
+    # of ``this.body``.
+    for param_name, slot in _jni_param_slot_map(method_desc, is_static).items():
+        ctx.var_slots[param_name] = slot
     ctx.if_guard = IfGuardMatcher(profile, enabled=options.skip_native_exception_guards)
     if string_pool_entries:
         ctx.pool = {e["offset"]: e["value"] for e in string_pool_entries
@@ -963,6 +1036,9 @@ def lift_ghidra_dump(
     # field-hint resolver can fill descriptors on hint-bound GETFIELDs
     # without re-scanning the manifest per call.
     class_field_descs: dict[str, dict[str, str]] = {}
+    # Also index per-method ACC_STATIC so the lifter knows which JNI
+    # `param_2` is `this` (instance) vs `clazz` (static).
+    method_is_static: dict[tuple[str, str, str], bool] = {}
     if manifest:
         for cls in manifest.get("classes", []):
             cname = cls.get("name")
@@ -973,6 +1049,10 @@ def lift_ghidra_dump(
                 for f in (cls.get("fields") or [])
                 if f.get("name") and f.get("desc")
             }
+            for me in cls.get("methods", []):
+                if me.get("name") and me.get("desc"):
+                    acc = me.get("access") or 0
+                    method_is_static[(cname, me["name"], me["desc"])] = bool(acc & 0x0008)
 
     out: list[dict[str, Any]] = []
     for entry in data.get("functions", []):
@@ -992,12 +1072,13 @@ def lift_ghidra_dump(
         fld_descs = class_field_descs.get(owner or "", {})
 
         if owner and name and desc:
+            is_static = method_is_static.get((owner, name, desc), False)
             result = lift_ghidra_function(
                 code, desc,
                 options=options, profile=profile,
                 lookups=lookups, string_pool_entries=pool_entries,
                 method_owner=owner, field_descs=fld_descs,
-                cache_table=cache_table,
+                cache_table=cache_table, is_static=is_static,
             )
         else:
             # No owner/methodName/methodDesc -> use generic fallback shape.
