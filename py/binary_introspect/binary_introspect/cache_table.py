@@ -332,6 +332,47 @@ def _scan_section(insns, cs, pool_var_addr, string_pool_base, pool_by_offset,
             cstrings[str(result_slot)] = value
 
 
+_REG64 = {}  # populated lazily from capstone
+
+
+def _to64(reg: int) -> int:
+    """Normalise a capstone x86 register id to its 64-bit alias.
+
+    `mov edx, 0x2d9` writes the EDX (32-bit) alias of RDX. Capstone
+    reports a different reg id for each width, so without this
+    normalisation the state stored under EDX is invisible to a later
+    lookup of RDX. We map RAX/EAX/AX/AL → RAX, RDX/EDX/DX/DL → RDX, etc.
+    """
+    from capstone import x86_const
+    global _REG64
+    if not _REG64:
+        aliases = [
+            ("RAX", "EAX", "AX", "AL", "AH"),
+            ("RBX", "EBX", "BX", "BL", "BH"),
+            ("RCX", "ECX", "CX", "CL", "CH"),
+            ("RDX", "EDX", "DX", "DL", "DH"),
+            ("RSI", "ESI", "SI", "SIL"),
+            ("RDI", "EDI", "DI", "DIL"),
+            ("RBP", "EBP", "BP", "BPL"),
+            ("RSP", "ESP", "SP", "SPL"),
+            ("R8",  "R8D", "R8W", "R8B"),
+            ("R9",  "R9D", "R9W", "R9B"),
+            ("R10", "R10D", "R10W", "R10B"),
+            ("R11", "R11D", "R11W", "R11B"),
+            ("R12", "R12D", "R12W", "R12B"),
+            ("R13", "R13D", "R13W", "R13B"),
+            ("R14", "R14D", "R14W", "R14B"),
+            ("R15", "R15D", "R15W", "R15B"),
+        ]
+        for group in aliases:
+            head = getattr(x86_const, f"X86_REG_{group[0]}")
+            for n in group:
+                rid = getattr(x86_const, f"X86_REG_{n}", None)
+                if rid is not None:
+                    _REG64[rid] = head
+    return _REG64.get(reg, reg)
+
+
 def _apply_state(ins, regs: dict[int, _RegState], pool_var_addr: int | None) -> None:
     """Update `regs` to reflect this instruction's effect on register
     state. We only model the patterns the cache-init blocks use."""
@@ -345,24 +386,25 @@ def _apply_state(ins, regs: dict[int, _RegState], pool_var_addr: int | None) -> 
                 src.mem.base == x86_const.X86_REG_RIP and src.mem.index == 0):
                 target = ins.address + ins.size + src.mem.disp
                 if pool_var_addr is not None and target == pool_var_addr:
-                    regs[dst.reg] = _RegState("pool", 0)
+                    regs[_to64(dst.reg)] = _RegState("pool", 0)
                 else:
-                    regs[dst.reg] = _RegState("slot", target)
+                    regs[_to64(dst.reg)] = _RegState("slot", target)
                 return
-            # mov reg, imm
+            # mov reg, imm — track as "imm" so a later
+            # `add reg, [rip + pool_var]` can recover the pool offset.
             if src.type == x86_const.X86_OP_IMM:
-                regs[dst.reg] = _RegState(None, 0)
+                regs[_to64(dst.reg)] = _RegState("imm", src.imm)
                 return
             # mov reg, other_reg     → copy state
             if src.type == x86_const.X86_OP_REG:
-                st = regs.get(src.reg)
+                st = regs.get(_to64(src.reg))
                 if st is not None:
-                    regs[dst.reg] = _RegState(st.kind, st.payload)
+                    regs[_to64(dst.reg)] = _RegState(st.kind, st.payload)
                 else:
-                    regs.pop(dst.reg, None)
+                    regs.pop(_to64(dst.reg), None)
                 return
             # any other mov clobbers dst's tracked state
-            regs[dst.reg] = _RegState(None, 0)
+            regs[_to64(dst.reg)] = _RegState(None, 0)
         return
 
     if ins.mnemonic == "lea" and len(ins.operands) == 2:
@@ -372,27 +414,43 @@ def _apply_state(ins, regs: dict[int, _RegState], pool_var_addr: int | None) -> 
             disp = src.mem.disp
             if src.mem.base == x86_const.X86_REG_RIP:
                 # lea reg, [rip + d]  → reg = absolute address
-                regs[dst.reg] = _RegState("addr", ins.address + ins.size + disp)
+                regs[_to64(dst.reg)] = _RegState("addr", ins.address + ins.size + disp)
                 return
-            base_state = regs.get(src.mem.base)
+            base_state = regs.get(_to64(src.mem.base))
             if base_state is not None and base_state.kind in ("pool", "addr"):
-                regs[dst.reg] = _RegState(base_state.kind,
+                regs[_to64(dst.reg)] = _RegState(base_state.kind,
                                           base_state.payload + disp)
                 return
             # base register is unknown → dst loses state
-            regs[dst.reg] = _RegState(None, 0)
+            regs[_to64(dst.reg)] = _RegState(None, 0)
         return
 
     if ins.mnemonic == "add" and len(ins.operands) == 2:
         dst, src = ins.operands
-        if (dst.type == x86_const.X86_OP_REG and
-            src.type == x86_const.X86_OP_IMM):
-            st = regs.get(dst.reg)
-            if st is not None and st.kind in ("pool", "addr"):
-                regs[dst.reg] = _RegState(st.kind, st.payload + src.imm)
+        if dst.type == x86_const.X86_OP_REG:
+            # add reg, imm — propagate pool/addr/imm states.
+            if src.type == x86_const.X86_OP_IMM:
+                st = regs.get(_to64(dst.reg))
+                if st is not None and st.kind in ("pool", "addr", "imm"):
+                    regs[_to64(dst.reg)] = _RegState(st.kind, st.payload + src.imm)
+                    return
+                regs.pop(_to64(dst.reg), None)
                 return
-            # add to unknown register → clear
-            regs.pop(dst.reg, None)
+            # add reg, [rip + d] — when d resolves to pool_var AND reg
+            # currently holds an immediate, the combination yields
+            # `reg = pool_base + imm` → kind="pool" payload=imm.
+            if (src.type == x86_const.X86_OP_MEM and
+                src.mem.base == x86_const.X86_REG_RIP and src.mem.index == 0):
+                target = ins.address + ins.size + src.mem.disp
+                if pool_var_addr is not None and target == pool_var_addr:
+                    st = regs.get(_to64(dst.reg))
+                    if st is not None and st.kind == "imm":
+                        regs[_to64(dst.reg)] = _RegState("pool", st.payload)
+                        return
+                # otherwise clear: we don't know what was added.
+                regs.pop(_to64(dst.reg), None)
+                return
+            regs.pop(_to64(dst.reg), None)
         return
 
     # Conservative: any other instruction that writes a register clears
@@ -404,7 +462,7 @@ def _apply_state(ins, regs: dict[int, _RegState], pool_var_addr: int | None) -> 
                                  "jg", "jl", "jge", "jle", "ja", "jb",
                                  "jae", "jbe", "jz", "jnz", "call", "nop"):
             dst = ins.operands[0]
-            regs[dst.reg] = _RegState(None, 0)
+            regs[_to64(dst.reg)] = _RegState(None, 0)
 
 
 def _find_get_pool_helper(section_insns, pool_base: int) -> int | None:
@@ -469,13 +527,19 @@ def _is_direct_call_to(ins, target: int) -> bool:
 def _try_bind_class_via_helper(insns, call_idx: int, regs, cstrings, classes):
     """Recognise the ``utils::find_class_wo_static(env, classloader,
     jstring)`` helper-call pattern. We don't know the helper's address
-    a priori; instead, we look at the call's arg-3 state. If r8 came
-    from a known cstrings slot AND the call's result lands in a global
-    via the usual ``mov rdx, rax; ...NewWeakGlobalRef...; mov [rip+ADDR], rax``
-    chain, then ADDR is a cclasses slot whose internal class name is
-    the value cached in that cstrings slot (after a `.replace('.', '/')`
-    fixup since native-obfuscator passes dot-form names through
-    ClassLoader.loadClass)."""
+    a priori; instead, we look at:
+
+      1. The call's arg-3 state — must be a load from a known cstrings
+         slot (r8 = ``mov r8, [rip + CSTRINGS_SLOT]``).
+      2. The post-call wrap chain — must include a ``NewWeakGlobalRef``
+         vtable call (offset ``0x710``) before the final
+         ``mov [rip + CCLASSES_SLOT], rax``.
+
+      Requiring (2) distinguishes cclasses init from generic helpers
+      that happen to take a jstring arg (e.g. logging utilities, string
+      interning). cclasses_mtx-protected init uses NewWeakGlobalRef
+      specifically; cstrings init uses ``NewGlobalRef`` (offset 0xa8).
+    """
     from capstone import x86_const
 
     r8_state = regs.get(x86_const.X86_REG_R8)
@@ -485,13 +549,36 @@ def _try_bind_class_via_helper(insns, call_idx: int, regs, cstrings, classes):
     value = cstrings.get(str(cstrings_slot_addr))
     if value is None:
         return
-    result_slot = _find_result_slot(insns, call_idx, look_forward=24)
+    if not _has_weak_globalref_wrap(insns, call_idx, look_forward=32):
+        return
+    result_slot = _find_result_slot(insns, call_idx, look_forward=32)
     if result_slot is None:
         return
     internal = value.replace(".", "/")
-    # Don't overwrite a class binding we already had from a direct
-    # FindClass (those are array types, more specific).
     classes.setdefault(str(result_slot), internal)
+
+
+def _has_weak_globalref_wrap(insns, call_idx: int, look_forward: int) -> bool:
+    """True iff a ``call qword ptr [reg + 0x710]`` (NewWeakGlobalRef)
+    appears between ``insns[call_idx]`` and the next ``ret``, within
+    ``look_forward`` instructions."""
+    end = min(len(insns), call_idx + 1 + look_forward)
+    for j in range(call_idx + 1, end):
+        ins = insns[j]
+        if ins.mnemonic in ("ret", "retn"):
+            return False
+        if ins.mnemonic != "call":
+            continue
+        m = _VTABLE_CALL_RE.search(ins.op_str)
+        if m is None:
+            continue
+        try:
+            off = int(m.group(1), 16) if m.group(1).startswith("0x") else int(m.group(1))
+        except ValueError:
+            continue
+        if off == 0x710:  # NewWeakGlobalRef
+            return True
+    return False
 
 
 def _find_result_slot(insns, call_idx: int, look_forward: int = 16):
