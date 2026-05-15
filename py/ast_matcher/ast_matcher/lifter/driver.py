@@ -76,6 +76,11 @@ class _Ctx:
     syms: dict[str, Sym] = field(default_factory=dict)
     pool: dict[int, str] = field(default_factory=dict)
     lookups: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    #: Variables bound to the result of ``env->ExceptionCheck()``. Used by
+    #: ``_emit_if`` so guards extracted across two statements
+    #: (``cVar = env->ExceptionCheck(); if (cVar != 0) return 0;``) are
+    #: still recognised as boilerplate to skip.
+    exception_check_vars: set[str] = field(default_factory=set)
     method_owner: str = "?"
     method_desc: str = "()V"
     #: Map of field-name -> JVM descriptor for fields declared on
@@ -470,7 +475,11 @@ def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> 
     if fn in ("Throw", "ThrowNew"):
         ctx.emit(op="ATHROW")
         return
-    # ExceptionCheck and other untracked JNI fns are silently swallowed.
+    if fn == "ExceptionCheck":
+        if assign_to:
+            ctx.exception_check_vars.add(assign_to)
+        return
+    # Other untracked JNI fns are silently swallowed.
 
 
 # --------------------------------------------------------------------
@@ -568,6 +577,35 @@ def _emit_if(
         if alt is not None:
             _walk_stmt(ctx, alt, source)
         return
+
+    # Cross-statement guard recognition: when Ghidra extracts
+    # ``env->ExceptionCheck()`` into a variable, the original
+    # ``if (env->ExceptionCheck()) return 0;`` shows up two statements
+    # apart and the regex skip won't match. Use the ctx-tracked
+    # exception_check_vars set: if the cond compares one of them to
+    # zero, treat the if as the same boilerplate. Two cases:
+    #   * `cVar != 0` body=return0 → skip entirely (exception path)
+    #   * `cVar == 0` body=<work>  → fall through into cons straight-
+    #     line (no exception so do the work; ignore the implicit alt)
+    if ctx.options.skip_native_exception_guards and ctx.exception_check_vars:
+        m = re.fullmatch(
+            r"(\w+)\s*([!=]=)\s*(?:'\\0'|0|0L|\(char\)\s*0)",
+            cond_text,
+        )
+        if m and m.group(1) in ctx.exception_check_vars:
+            op = m.group(2)
+            # exception path branch — true if `!= 0`, false if `== 0`
+            true_is_exception = op == "!="
+            if true_is_exception:
+                # if (exception) <bail> — skip the cons body, walk alt
+                if alt is not None:
+                    _walk_stmt(ctx, alt, source)
+                return
+            else:
+                # if (no exception) <work> — straight-line walk cons
+                if cons is not None:
+                    _walk_stmt(ctx, cons, source)
+                return
 
     # cond+goto-target → IF*
     target: str | None = None
