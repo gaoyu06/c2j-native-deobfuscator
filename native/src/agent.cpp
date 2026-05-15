@@ -158,6 +158,74 @@ void JNICALL on_method_entry(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
     TraceWriter::instance().write_line(os.str());
 }
 
+// Exception thrown inside (or propagated through) a user native frame. We
+// record the throw site + exception type so the translator can credit each
+// native frame that's currently on the per-thread stack — the catch may be
+// far up the call chain, in a frame whose body is what we're recovering.
+// Unlike MethodEntry we do NOT filter by is_jdk_native(throw_site), because
+// the throw is often inside a JDK method (e.g. unboxing NPE from
+// Integer.intValue) that propagates into user code.
+void JNICALL on_exception(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
+                          jmethodID method, jlocation location,
+                          jobject exception,
+                          jmethodID catch_method, jlocation catch_location) {
+    // NOTE: don't gate on in_native_frame() here. With native-obfuscator's
+    // wrappers, exceptions are typically caught + cleared by the C++ side
+    // before MethodExit ever fires, so the exception is reported on what
+    // looks like the "outside" thread state. We record every user-method
+    // exception and let the translator filter at frame association time.
+    auto [tcname, tnm, tds] = method_info(jvmti, method);
+    // Resolve exception class
+    jclass ec = jni->GetObjectClass(exception);
+    char* ec_sig = nullptr;
+    if (ec) jvmti->GetClassSignature(ec, &ec_sig, nullptr);
+    std::string ec_name = ec_sig ? ec_sig : "";
+    if (ec_name.size() >= 2 && ec_name.front() == 'L' && ec_name.back() == ';') {
+        ec_name = ec_name.substr(1, ec_name.size() - 2);
+    }
+    if (ec_sig) jvmti->Deallocate((unsigned char*) ec_sig);
+    std::ostringstream os;
+    os << "{\"ev\":\"exc\",\"ts\":" << TraceWriter::ts_now()
+       << ",\"thr\":" << TraceWriter::tid()
+       << ",\"owner\":" << esc(tcname.c_str())
+       << ",\"name\":" << esc(tnm.c_str())
+       << ",\"desc\":" << esc(tds.c_str())
+       << ",\"loc\":" << static_cast<long long>(location)
+       << ",\"excType\":" << esc(ec_name.c_str());
+    if (catch_method != nullptr) {
+        auto [ccname, cnm, cds] = method_info(jvmti, catch_method);
+        os << ",\"catchOwner\":" << esc(ccname.c_str())
+           << ",\"catchName\":" << esc(cnm.c_str())
+           << ",\"catchDesc\":" << esc(cds.c_str())
+           << ",\"catchLoc\":" << static_cast<long long>(catch_location);
+    }
+    os << "}";
+    TraceWriter::instance().write_line(os.str());
+}
+
+void JNICALL on_exception_catch(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
+                                jmethodID method, jlocation location,
+                                jobject exception) {
+    auto [tcname, tnm, tds] = method_info(jvmti, method);
+    jclass ec = jni->GetObjectClass(exception);
+    char* ec_sig = nullptr;
+    if (ec) jvmti->GetClassSignature(ec, &ec_sig, nullptr);
+    std::string ec_name = ec_sig ? ec_sig : "";
+    if (ec_name.size() >= 2 && ec_name.front() == 'L' && ec_name.back() == ';') {
+        ec_name = ec_name.substr(1, ec_name.size() - 2);
+    }
+    if (ec_sig) jvmti->Deallocate((unsigned char*) ec_sig);
+    std::ostringstream os;
+    os << "{\"ev\":\"excCatch\",\"ts\":" << TraceWriter::ts_now()
+       << ",\"thr\":" << TraceWriter::tid()
+       << ",\"owner\":" << esc(tcname.c_str())
+       << ",\"name\":" << esc(tnm.c_str())
+       << ",\"desc\":" << esc(tds.c_str())
+       << ",\"loc\":" << static_cast<long long>(location)
+       << ",\"excType\":" << esc(ec_name.c_str()) << "}";
+    TraceWriter::instance().write_line(os.str());
+}
+
 void JNICALL on_method_exit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
                             jmethodID method, jboolean was_popped_by_exception,
                             jvalue return_value) {
@@ -199,6 +267,11 @@ Agent_OnLoad(JavaVM* vm, char* options, void* /*reserved*/) {
     caps.can_generate_method_entry_events = 1;
     caps.can_generate_method_exit_events = 1;
     caps.can_generate_native_method_bind_events = 1;
+    // Needed to read parameter values of a native method at MethodEntry —
+    // see read_method_params() and `params` field on enter events.
+    caps.can_access_local_variables = 1;
+    // Exception events drive recovery of try/catch tables — see #4.
+    caps.can_generate_exception_events = 1;
     if (jvmti->AddCapabilities(&caps) != JVMTI_ERROR_NONE) {
         std::fprintf(stderr, "j2c-agent: AddCapabilities failed\n");
         return JNI_ERR;
@@ -210,6 +283,8 @@ Agent_OnLoad(JavaVM* vm, char* options, void* /*reserved*/) {
     cbs.NativeMethodBind = on_native_method_bind;
     cbs.MethodEntry = on_method_entry;
     cbs.MethodExit = on_method_exit;
+    cbs.Exception = on_exception;
+    cbs.ExceptionCatch = on_exception_catch;
     if (jvmti->SetEventCallbacks(&cbs, sizeof(cbs)) != JVMTI_ERROR_NONE) {
         std::fprintf(stderr, "j2c-agent: SetEventCallbacks failed\n");
         return JNI_ERR;
@@ -220,6 +295,8 @@ Agent_OnLoad(JavaVM* vm, char* options, void* /*reserved*/) {
     jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_NATIVE_METHOD_BIND, nullptr);
     jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_METHOD_ENTRY, nullptr);
     jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_METHOD_EXIT, nullptr);
+    jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_EXCEPTION, nullptr);
+    jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_EXCEPTION_CATCH, nullptr);
 
     std::ostringstream os;
     os << "{\"ev\":\"agent-loaded\",\"ts\":" << TraceWriter::ts_now()

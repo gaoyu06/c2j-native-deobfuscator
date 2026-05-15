@@ -234,7 +234,7 @@ std::string hex_ptr(const void* p) {
 }
 
 void emit(const std::string& call, const std::string& args, const std::string& ret,
-          jmethodID mid = nullptr) {
+          jmethodID mid = nullptr, const std::string& ret_str = std::string()) {
     if (!in_native_frame() || t_suppress_depth > 0) return;
     if (g_max_frame_events > 0 && t_frame_event_count >= g_max_frame_events) {
         if (!t_frame_truncated) {
@@ -266,8 +266,39 @@ void emit(const std::string& call, const std::string& args, const std::string& r
             os << ",\"midDesc\":" << esc(desc.c_str());
         }
     }
+    if (!ret_str.empty()) {
+        os << ",\"retStr\":" << esc(ret_str.c_str());
+    }
     os << "}";
     TraceWriter::instance().write_line(os.str());
+}
+
+std::string read_jstring(JNIEnv* env, jobject obj);  // defined below
+
+// If `m` returns Ljava/lang/String;, snapshot the returned jstring content
+// via the *original* GetStringUTFChars (no recursion), register it in
+// g_str_content so downstream wrappers can inline it, and return the content
+// for inclusion as `retStr` on the event. Empty string -> non-String return
+// or read failure.
+std::string maybe_track_string_return(JNIEnv* env, jmethodID m, jobject r) {
+    if (!r || !m) return std::string();
+    std::string desc;
+    {
+        std::lock_guard<std::mutex> g(g_mid_mu);
+        auto it = g_mid_desc.find(m);
+        if (it != g_mid_desc.end()) desc = it->second;
+    }
+    auto rp = desc.rfind(')');
+    if (rp == std::string::npos) return std::string();
+    if (desc.compare(rp + 1, std::string::npos, "Ljava/lang/String;") != 0) {
+        return std::string();
+    }
+    // Already tracked (e.g. propagated from a NewStringUTF via NewGlobalRef)?
+    auto existing = lookup_string(r);
+    if (!existing.empty()) return existing;
+    auto content = read_jstring(env, r);
+    if (!content.empty()) register_string(r, content);
+    return content;
 }
 
 #define ORIG(name) (g_original->name)
@@ -514,7 +545,8 @@ WRAP_GET_STATIC_FIELD(jlong,    Long,    "%lld")
         std::ostringstream args; args << hex_ptr(obj) << "," << hex_ptr(m)                   \
             << decode_variadic(m, ap3);                                                       \
         va_end(ap3);                                                                          \
-        emit(#kindprefix #jname "Method", args.str(), hex_ptr(r), m);                           \
+        auto ret_str = maybe_track_string_return(env, m, r);                                  \
+        emit(#kindprefix #jname "Method", args.str(), hex_ptr(r), m, ret_str);                  \
         return r;                                                                              \
     }                                                                                          \
     jobject JNICALL h_##kindprefix##jname##MethodA(JNIEnv* env, jobject obj, jmethodID m,    \
@@ -522,7 +554,8 @@ WRAP_GET_STATIC_FIELD(jlong,    Long,    "%lld")
         jobject r = ORIG(kindprefix##jname##MethodA)(env, obj, m, a);                        \
         std::ostringstream args; args << hex_ptr(obj) << "," << hex_ptr(m)                   \
             << decode_array(m, a);                                                            \
-        emit(#kindprefix #jname "Method", args.str(), hex_ptr(r), m);                           \
+        auto ret_str = maybe_track_string_return(env, m, r);                                  \
+        emit(#kindprefix #jname "Method", args.str(), hex_ptr(r), m, ret_str);                  \
         return r;                                                                              \
     }
 
@@ -623,7 +656,8 @@ jobject JNICALL h_CallStaticObjectMethodV(JNIEnv* env, jclass c, jmethodID m, va
     va_end(ap2);
     std::ostringstream args; args << hex_ptr(c) << "," << hex_ptr(m) << decode_variadic(m, ap3);
     va_end(ap3);
-    emit("CallStaticObjectMethod", args.str(), hex_ptr(r), m);
+    auto ret_str = maybe_track_string_return(env, m, r);
+    emit("CallStaticObjectMethod", args.str(), hex_ptr(r), m, ret_str);
     return r;
 }
 jobject JNICALL h_CallStaticObjectMethod(JNIEnv* env, jclass c, jmethodID m, ...) {
@@ -860,7 +894,8 @@ jobject JNICALL h_CallNonvirtualObjectMethodV(JNIEnv* env, jobject obj, jclass c
     std::ostringstream args;
     args << hex_ptr(obj) << "," << hex_ptr(cls) << "," << hex_ptr(m) << decode_variadic(m, ap3);
     va_end(ap3);
-    emit("CallNonvirtualObjectMethod", args.str(), hex_ptr(r), m);
+    auto ret_str = maybe_track_string_return(env, m, r);
+    emit("CallNonvirtualObjectMethod", args.str(), hex_ptr(r), m, ret_str);
     return r;
 }
 

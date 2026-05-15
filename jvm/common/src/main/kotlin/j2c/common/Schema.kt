@@ -9,6 +9,8 @@ data class ClassesJson(
     val schemaVersion: Int = 1,
     val input: JarInput,
     val loaderClass: String?,
+    val loaderRegisterMethod: String? = null,   // e.g. "registerNativesForClass" / "initClass"
+    val loaderRegisterDesc: String? = null,     // descriptor of that method
     val nativeDir: String?,
     val classes: List<ClassInfo>,
 )
@@ -57,6 +59,8 @@ data class ManifestJson(
     val schemaVersion: Int = 1,
     val input: ManifestInput? = null,
     val loaderClass: String? = null,
+    val loaderRegisterMethod: String? = null,   // e.g. "registerNativesForClass" / "initClass"
+    val loaderRegisterDesc: String? = null,
     val nativeDir: String? = null,
     val stringPool: List<String> = emptyList(),
     val classes: List<ManifestClass>,
@@ -115,6 +119,12 @@ data class RecoveredMethod(
     val tryCatchBlocks: List<RecoveredTryCatch> = emptyList(),
     val localVariables: List<Any> = emptyList(),
     val lineNumbers: List<Any> = emptyList(),
+    // Exception class names observed propagating out of (or caught within)
+    // this method during the trace. Surfaced by class-rebuilder as part of
+    // the @j2c.RuntimeTrace annotation so the reverse engineer knows what
+    // exception types this method handles at runtime, even when per-bci
+    // try/catch recovery is not yet implemented.
+    val exceptionsObserved: List<String> = emptyList(),
 )
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -136,6 +146,35 @@ data class RecoveredInsn(
     val keys: List<Int>? = null,
     val labels: List<String>? = null,
     val default: String? = null,
+    // Short tag identifying the provenance of a runtime-observed value baked
+    // into this insn (e.g. "int_arg" / "long_arg" / "arr_idx" / "str_computed").
+    // null = source-level constant or structural insn. Surfaced by the
+    // class-rebuilder as @j2c.Trace annotations and/or inline marker invokes.
+    val dynamic: String? = null,
+    // ---- INVOKEDYNAMIC ----
+    // Bootstrap method handle. Tag is one of H_GETFIELD..H_INVOKEINTERFACE
+    // (asm Opcodes.H_*). Itf for the bootstrap (almost always false for
+    // LambdaMetafactory.metafactory which lives on a regular class).
+    val bsmTag: Int? = null,
+    val bsmOwner: String? = null,
+    val bsmName: String? = null,
+    val bsmDesc: String? = null,
+    val bsmItf: Boolean? = null,
+    // Bootstrap args. Each entry is a tagged constant — see [BsmArg].
+    val bsmArgs: List<BsmArg>? = null,
+)
+
+/** A constant pool entry usable as an INVOKEDYNAMIC bootstrap arg. */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+data class BsmArg(
+    /** "int" / "long" / "float" / "double" / "string" / "type" / "handle". */
+    val kind: String,
+    val value: Any? = null,           // int / long / float / double / string / type descriptor
+    val handleTag: Int? = null,        // for kind=handle
+    val handleOwner: String? = null,
+    val handleName: String? = null,
+    val handleDesc: String? = null,
+    val handleItf: Boolean? = null,
 )
 
 @JsonInclude(JsonInclude.Include.NON_NULL)

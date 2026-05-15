@@ -1,5 +1,6 @@
 package j2c.classrebuilder
 
+import j2c.common.BsmArg
 import j2c.common.RecoveredInsn
 import j2c.common.RecoveredMethod
 import org.objectweb.asm.Handle
@@ -14,7 +15,10 @@ import org.objectweb.asm.tree.*
  * `AbstractInsnNode`. Symbolic labels (strings) are resolved via a per-method
  * map so cross-references between jumps / try-catch blocks work.
  */
-class AsmEmitter {
+class AsmEmitter(
+    private val inlineTraceMarkers: Boolean = false,
+    private val onMarkerKindUsed: (String) -> Unit = {},
+) {
 
     data class Result(val list: InsnList, val tryCatches: List<TryCatchBlockNode>)
 
@@ -27,6 +31,24 @@ class AsmEmitter {
         val list = InsnList()
         for (ins in method.instructions) {
             val node = build(ins) ?: continue
+            // Inline trace marker (--inline-trace-markers) — prepend an
+            // INVOKESTATIC j2c/Trace.RT_<kind>:()V right before the dynamic
+            // insn so any decompiler shows it as a visible marker call.
+            // The marker has zero stack effect (no args, void return), so it
+            // never disturbs the recovered stack model.
+            val dyn = ins.dynamic
+            if (inlineTraceMarkers && dyn != null) {
+                onMarkerKindUsed(dyn)
+                list.add(
+                    MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "j2c/Trace",
+                        "RT_$dyn",
+                        "()V",
+                        false,
+                    )
+                )
+            }
             list.add(node)
         }
         val tcb = method.tryCatchBlocks.map { tc ->
@@ -124,7 +146,19 @@ class AsmEmitter {
                 ins.itf ?: (op == "INVOKEINTERFACE")
             )
 
-            "INVOKEDYNAMIC" -> error("INVOKEDYNAMIC recovery not yet supported (see deferred-features)")
+            "INVOKEDYNAMIC" -> {
+                val name = ins.name ?: error("INVOKEDYNAMIC without name")
+                val desc = ins.desc ?: error("INVOKEDYNAMIC without desc")
+                val bsmHandle = Handle(
+                    ins.bsmTag ?: Opcodes.H_INVOKESTATIC,
+                    ins.bsmOwner ?: error("INVOKEDYNAMIC without bsmOwner"),
+                    ins.bsmName ?: error("INVOKEDYNAMIC without bsmName"),
+                    ins.bsmDesc ?: error("INVOKEDYNAMIC without bsmDesc"),
+                    ins.bsmItf ?: false,
+                )
+                val args = (ins.bsmArgs ?: emptyList()).map { decodeBsmArg(it) }.toTypedArray()
+                InvokeDynamicInsnNode(name, desc, bsmHandle, *args)
+            }
 
             // ---- new/checkcast/instanceof ----
             "NEW", "ANEWARRAY", "CHECKCAST", "INSTANCEOF" -> TypeInsnNode(
@@ -168,5 +202,22 @@ class AsmEmitter {
     private fun opcode(name: String): Int {
         val field = Opcodes::class.java.getField(name)
         return field.getInt(null)
+    }
+
+    private fun decodeBsmArg(a: BsmArg): Any = when (a.kind) {
+        "int"    -> (a.value as Number).toInt()
+        "long"   -> (a.value as Number).toLong()
+        "float"  -> (a.value as Number).toFloat()
+        "double" -> (a.value as Number).toDouble()
+        "string" -> a.value as String
+        "type"   -> Type.getType(a.value as String)
+        "handle" -> Handle(
+            a.handleTag ?: error("BsmArg handle without tag"),
+            a.handleOwner ?: error("BsmArg handle without owner"),
+            a.handleName ?: error("BsmArg handle without name"),
+            a.handleDesc ?: error("BsmArg handle without desc"),
+            a.handleItf ?: false,
+        )
+        else -> error("unknown BsmArg kind: ${a.kind}")
     }
 }

@@ -39,6 +39,22 @@ class StackBalancer(private val isStatic: Boolean) {
     private val stack = ArrayDeque<V>()
 
     /**
+     * Re-tag the most recently emitted insn (or insns) with a "dynamic" kind.
+     * Call after a push helper to declare that the value pushed was observed
+     * at runtime rather than coming from a source-level constant. `extraBack`
+     * lets the caller also tag a CHECKCAST that the push helper emitted right
+     * after the value insn (e.g. pushNullAs / pushObjLiteral fallback path).
+     */
+    fun markLastDynamic(kind: String, extraBack: Int = 0) {
+        if (out.isEmpty()) return
+        val lastIdx = out.size - 1
+        for (i in (lastIdx - extraBack).coerceAtLeast(0)..lastIdx) {
+            val cur = out[i]
+            if (cur.dynamic == null) out[i] = cur.copy(dynamic = kind)
+        }
+    }
+
+    /**
      * SSA-style mapping: `jobject hex -> local var slot`. Populated once per
      * method-translation. When set, each producer-event emit will stash its
      * jobject return (via DUP + ASTORE), and any subsequent push of the same
@@ -47,6 +63,15 @@ class StackBalancer(private val isStatic: Boolean) {
      * across the method body instead of NPE'ing on synthetic nulls.
      */
     var slotMap: Map<String, Int> = emptyMap()
+
+    /**
+     * Optional jobject-hex -> internal type name lookup. When the translator
+     * has cross-frame info about a jobject's runtime type (e.g. it was
+     * produced by a CallObjectMethod whose midDesc has a concrete return
+     * type), the StackBalancer can fall back to this instead of a generic
+     * placeholder when emitting a CHECKCAST.
+     */
+    var typeOracle: (String) -> String? = { null }
 
     fun stackTop(): V? = stack.lastOrNull()
     fun stackSize(): Int = stack.size
@@ -87,7 +112,7 @@ class StackBalancer(private val isStatic: Boolean) {
         stack.addLast(V.Obj)
     }
 
-    fun pushInt(v: Int) {
+    fun pushInt(v: Int, dynamicKind: String? = null) {
         when (v) {
             in -1..5 -> out += RecoveredInsn(op = if (v == -1) "ICONST_M1" else "ICONST_$v")
             in Byte.MIN_VALUE.toInt()..Byte.MAX_VALUE.toInt() -> out += RecoveredInsn(op = "BIPUSH", value = v)
@@ -95,19 +120,27 @@ class StackBalancer(private val isStatic: Boolean) {
             else -> out += RecoveredInsn(op = "LDC", value = v)
         }
         stack.addLast(V.Int)
+        if (dynamicKind != null) markLastDynamic(dynamicKind)
     }
 
-    fun pushLong(v: Long) {
+    fun pushLong(v: Long, dynamicKind: String? = null) {
         when (v) {
             0L -> out += RecoveredInsn(op = "LCONST_0")
             1L -> out += RecoveredInsn(op = "LCONST_1")
             else -> out += RecoveredInsn(op = "LDC", value = v, desc = "long")
         }
         stack.addLast(V.Long)
+        if (dynamicKind != null) markLastDynamic(dynamicKind)
     }
 
-    fun pushFloat(v: Double) { out += RecoveredInsn(op = "LDC", value = v, desc = "float"); stack.addLast(V.Float) }
-    fun pushDouble(v: Double) { out += RecoveredInsn(op = "LDC", value = v, desc = "double"); stack.addLast(V.Double) }
+    fun pushFloat(v: Double, dynamicKind: String? = null) {
+        out += RecoveredInsn(op = "LDC", value = v, desc = "float"); stack.addLast(V.Float)
+        if (dynamicKind != null) markLastDynamic(dynamicKind)
+    }
+    fun pushDouble(v: Double, dynamicKind: String? = null) {
+        out += RecoveredInsn(op = "LDC", value = v, desc = "double"); stack.addLast(V.Double)
+        if (dynamicKind != null) markLastDynamic(dynamicKind)
+    }
 
     fun pushObjPlaceholder(type: String?) {
         pushNullAs(type)
@@ -118,17 +151,20 @@ class StackBalancer(private val isStatic: Boolean) {
         // — far better than synthesizing a null. Only fall through to the
         // `aconst_null + checkcast` path when no slot is available.
         val slot = slotMap[hex]
+        // Resolve the effective type: caller's hint takes precedence, but
+        // fall back to cross-frame type oracle when the caller has no idea.
+        val effectiveType = type?.takeIf { it.isNotEmpty() && it != "?" } ?: typeOracle(hex)
         if (slot != null) {
             out += RecoveredInsn(op = "ALOAD", `var` = slot)
-            if (!type.isNullOrEmpty() && type != "?" && type != "java/lang/Object") {
-                out += RecoveredInsn(op = "CHECKCAST", type = type)
+            if (!effectiveType.isNullOrEmpty() && effectiveType != "java/lang/Object") {
+                out += RecoveredInsn(op = "CHECKCAST", type = effectiveType)
             }
             stack.addLast(V.ObjHex(hex))
             return
         }
         out += RecoveredInsn(op = "ACONST_NULL")
-        if (!type.isNullOrEmpty() && type != "?") {
-            out += RecoveredInsn(op = "CHECKCAST", type = type)
+        if (!effectiveType.isNullOrEmpty()) {
+            out += RecoveredInsn(op = "CHECKCAST", type = effectiveType)
         }
         stack.addLast(V.ObjHex(hex))
     }
@@ -185,6 +221,7 @@ class StackBalancer(private val isStatic: Boolean) {
         receiverHex: String?,
         receiverType: String?,
         argDescAndHex: List<Pair<String, Any?>>,
+        argsDynamic: Boolean = true,
     ) {
         // Case 1: stack already has [receiver, args...] on top — perfect chain
         // (common for ``b.append(...).append(...)``).
@@ -210,13 +247,35 @@ class StackBalancer(private val isStatic: Boolean) {
         // Case 2: receiver is on top (e.g. just produced by NEW+DUP or a
         // previous INVOKE returning self). Just push the args.
         if (receiverHex != null && stack.lastOrNull().let { it is V.ObjHex && it.hex == receiverHex }) {
-            for ((desc, value) in argDescAndHex) pushArg(value, desc)
+            for ((desc, value) in argDescAndHex) pushArg(value, desc, argKindFor(desc, value, argsDynamic))
             return
         }
 
         // Case 3: nothing matches — push receiver (if any) then all args.
         if (receiverHex != null) pushObjLiteral(receiverHex, receiverType)
-        for ((desc, value) in argDescAndHex) pushArg(value, desc)
+        for ((desc, value) in argDescAndHex) pushArg(value, desc, argKindFor(desc, value, argsDynamic))
+    }
+
+    /**
+     * Decide whether and how to tag a call-arg push as "dynamic".
+     *
+     * Primitive values (int/long/float/double) that came from a variadic
+     * decode are always runtime-observed — there's no way to tell whether
+     * the source actually hardcoded that literal or computed it, so we tag
+     * them. String literals extracted via NewStringUTF are source-pool
+     * constants and stay untagged. Opaque jobjects pushed via ALOAD/null
+     * placeholders aren't "value" pushes and stay untagged too.
+     */
+    private fun argKindFor(desc: String, value: Any?, enabled: Boolean): String? {
+        if (!enabled) return null
+        if (value !is Number) return null
+        return when (desc.firstOrNull() ?: '?') {
+            'I', 'B', 'S', 'C', 'Z' -> "int_arg"
+            'J' -> "long_arg"
+            'F' -> "float_arg"
+            'D' -> "double_arg"
+            else -> null
+        }
     }
 
     /**
@@ -275,7 +334,7 @@ class StackBalancer(private val isStatic: Boolean) {
      * `desc` (a JVM type descriptor like ``I`` / ``J`` / ``Ljava/lang/String;``)
      * decides primitive vs object handling.
      */
-    fun pushArg(value: Any?, desc: String) {
+    fun pushArg(value: Any?, desc: String, dynamicKind: String? = null) {
         when (val c = desc.firstOrNull() ?: '?') {
             'L', '[' -> {
                 // The expected reference type comes from the descriptor.
@@ -307,19 +366,19 @@ class StackBalancer(private val isStatic: Boolean) {
                 }
             }
             'I', 'B', 'S', 'C', 'Z' -> when (value) {
-                is Number -> pushInt(value.toInt())
+                is Number -> pushInt(value.toInt(), dynamicKind)
                 else -> pushInt(0)
             }
             'J' -> when (value) {
-                is Number -> pushLong(value.toLong())
+                is Number -> pushLong(value.toLong(), dynamicKind)
                 else -> pushLong(0L)
             }
             'F' -> when (value) {
-                is Number -> pushFloat(value.toDouble())
+                is Number -> pushFloat(value.toDouble(), dynamicKind)
                 else -> pushFloat(0.0)
             }
             'D' -> when (value) {
-                is Number -> pushDouble(value.toDouble())
+                is Number -> pushDouble(value.toDouble(), dynamicKind)
                 else -> pushDouble(0.0)
             }
             else -> pushNull()
