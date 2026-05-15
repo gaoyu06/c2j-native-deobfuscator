@@ -337,9 +337,17 @@ class ClassRebuilder(
             // `j2c/Trace.UNVERIFIED_<name>()V` marker so a decompiler view
             // surfaces "this body is best-effort" without us pulling tricks
             // on the bytecode itself.
+            //
+            // Before the write we run a stack balancer over each body so a
+            // decompiler walking the insns doesn't pop from an empty stack
+            // (the typical Vineflower / CFR crash on lifted-but-broken
+            // output — see BytecodeNormalizer).
             if (allowUnverifiedClasses) {
                 try {
-                    for (mm in replacedMethods) prependUnverifiedMarker(mm)
+                    for (mm in replacedMethods) {
+                        BytecodeNormalizer.normalize(mm)
+                        prependUnverifiedMarker(mm)
+                    }
                     val writer = makeWriter(ClassWriter.COMPUTE_MAXS)
                     cn.accept(writer)
                     stats.unverifiedClasses++
