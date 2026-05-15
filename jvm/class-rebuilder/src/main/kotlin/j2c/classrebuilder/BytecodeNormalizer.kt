@@ -31,6 +31,18 @@ object BytecodeNormalizer {
         for (insn in arr) {
             val pops = popsOf(insn)
             if (height < pops) {
+                // Underflowing ATHROW is almost always a lifter mistake — the
+                // static path's exception-check guard recogniser misrendered
+                // `if (env.ExceptionCheck()) return` as a `throw`, with
+                // nothing on the stack to actually throw. If we fabricated
+                // a null and let the throw stand, the decompiler would
+                // correctly treat the rest of the body as unreachable and
+                // hide it. Drop the bogus throw instead so the call chain
+                // below it stays visible.
+                if (insn.opcode == Opcodes.ATHROW) {
+                    insns.set(insn, InsnNode(Opcodes.NOP))
+                    continue
+                }
                 val needed = pops - height
                 repeat(needed) {
                     insns.insertBefore(insn, InsnNode(Opcodes.ACONST_NULL))
