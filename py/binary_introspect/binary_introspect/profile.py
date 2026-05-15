@@ -95,6 +95,19 @@ class Profile:
         )
     )
 
+    #: Regex matching the error-string format emitted before each
+    #: would-be Java field access. Must define named groups ``op``
+    #: (``"read"`` for getfield/getstatic, ``"assign"`` for
+    #: putfield/putstatic) and ``name`` (the field name). Owner is
+    #: inferred from the enclosing method's declaring class — j2cc and
+    #: native-obfuscator both emit the throw at the call site, so the
+    #: containing class is almost always the field's owner.
+    field_error_re: re.Pattern[str] = field(
+        default_factory=lambda: re.compile(
+            r'^Cannot\s+(?P<op>read|assign)\s+field\s+"(?P<name>[^"]+)"'
+        )
+    )
+
     # ---------- if-guard skip patterns ----------
     #: A list of (condition-regex, body-regex) tuples. When the
     #: ast-matcher walks an ``if`` whose condition matches the first

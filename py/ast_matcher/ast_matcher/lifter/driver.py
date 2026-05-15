@@ -29,7 +29,7 @@ from binary_introspect.profile import Profile, detect_profile, get_profile
 
 from .options import LifterOptions
 from .syms import Sym, SymClass, SymFieldId, SymMethodId, SymObject, SymStringLit
-from .throw_reason import InvokeHint, InvokeHintParser
+from .throw_reason import FieldHint, FieldHintParser, InvokeHint, InvokeHintParser
 from .if_guard import IfGuardMatcher
 from . import jni_call
 
@@ -67,6 +67,8 @@ class _Ctx:
     profile: Profile
     invoke_hints: list[InvokeHint]
     invoke_hint_idx: int = 0
+    field_hints: list[FieldHint] = field(default_factory=list)
+    field_hint_idx: int = 0
     if_guard: IfGuardMatcher | None = None
 
     instructions: list[dict[str, Any]] = field(default_factory=list)
@@ -74,7 +76,12 @@ class _Ctx:
     syms: dict[str, Sym] = field(default_factory=dict)
     pool: dict[int, str] = field(default_factory=dict)
     lookups: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    method_owner: str = "?"
     method_desc: str = "()V"
+    #: Map of field-name -> JVM descriptor for fields declared on
+    #: ``method_owner`` and any other classes we have manifest entries
+    #: for. Used to fill descriptors on hint-resolved GETFIELD/PUTFIELD.
+    field_descs: dict[str, str] = field(default_factory=dict)
 
     def emit(self, **kw: Any) -> None:
         self.instructions.append({k: v for k, v in kw.items() if v is not None})
@@ -96,6 +103,22 @@ class _Ctx:
         else:
             ret_desc = "Ljava/lang/Object;"
         return hint.owner, hint.name, args_part + ret_desc
+
+    def next_field_hint(self, op: str) -> tuple[str, str, str] | None:
+        """Return ``(owner, name, desc)`` for the next field-error hint
+        whose ``op`` matches (``"read"`` for getfield/getstatic,
+        ``"assign"`` for the put-flavours). Returns ``None`` when no
+        further matching hint exists or the feature is disabled."""
+        if not self.options.use_throw_reason_field_hints:
+            return None
+        while self.field_hint_idx < len(self.field_hints):
+            hint = self.field_hints[self.field_hint_idx]
+            self.field_hint_idx += 1
+            if hint.op != op:
+                continue
+            desc = self.field_descs.get(hint.name) or "L?;"
+            return self.method_owner, hint.name, desc
+        return None
 
 
 # --------------------------------------------------------------------
@@ -244,7 +267,12 @@ def _emit_push(ctx: _Ctx, value: Any) -> None:
 # --------------------------------------------------------------------
 
 def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> None:
-    real_args = args[1:] if args and re.fullmatch(r"param_\d+|env|\w*VarN?", args[0]) else args
+    # `rewrite_vtable_calls` already consumes the leading env identifier when
+    # rewriting `(**(code **)(*env + 0xN))(env, ...)`, so for Ghidra-dump input
+    # the first arg is already the user-facing first arg. Only strip when the
+    # call form actually carried an explicit env (e.g. C-style
+    # `(*env)->FindClass(env, "X")` from raw native-obfuscator C++ source).
+    real_args = args[1:] if args and args[0].strip() == "env" else args
 
     # Symbol-creating
     if fn == "FindClass":
@@ -341,20 +369,34 @@ def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> 
         fid = _resolve_arg(ctx, real_args[1])
         if isinstance(fid, SymFieldId) and fid.owner and fid.name and fid.desc:
             ctx.emit(op="GETFIELD", owner=fid.owner, name=fid.name, desc=fid.desc)
+            if assign_to:
+                ctx.syms[assign_to] = SymObject(desc=fid.desc)
         else:
-            ctx.emit(op="GETFIELD", owner="?", name="?", desc="L?;")
-        if assign_to and isinstance(fid, SymFieldId) and fid.desc:
-            ctx.syms[assign_to] = SymObject(desc=fid.desc)
+            hint = ctx.next_field_hint("read")
+            if hint:
+                owner, name, desc = hint
+                ctx.emit(op="GETFIELD", owner=owner, name=name, desc=desc)
+                if assign_to and desc != "L?;":
+                    ctx.syms[assign_to] = SymObject(desc=desc)
+            else:
+                ctx.emit(op="GETFIELD", owner="?", name="?", desc="L?;")
         return
     if fn in jni_call.GET_STATIC_FIELD_NAMES:
         if len(real_args) < 2: return
         fid = _resolve_arg(ctx, real_args[1])
         if isinstance(fid, SymFieldId) and fid.owner and fid.name and fid.desc:
             ctx.emit(op="GETSTATIC", owner=fid.owner, name=fid.name, desc=fid.desc)
+            if assign_to:
+                ctx.syms[assign_to] = SymObject(desc=fid.desc)
         else:
-            ctx.emit(op="GETSTATIC", owner="?", name="?", desc="L?;")
-        if assign_to and isinstance(fid, SymFieldId) and fid.desc:
-            ctx.syms[assign_to] = SymObject(desc=fid.desc)
+            hint = ctx.next_field_hint("read")
+            if hint:
+                owner, name, desc = hint
+                ctx.emit(op="GETSTATIC", owner=owner, name=name, desc=desc)
+                if assign_to and desc != "L?;":
+                    ctx.syms[assign_to] = SymObject(desc=desc)
+            else:
+                ctx.emit(op="GETSTATIC", owner="?", name="?", desc="L?;")
         return
     if fn in jni_call.SET_FIELD_NAMES:
         if len(real_args) < 3: return
@@ -364,7 +406,12 @@ def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> 
         if isinstance(fid, SymFieldId) and fid.owner and fid.name and fid.desc:
             ctx.emit(op="PUTFIELD", owner=fid.owner, name=fid.name, desc=fid.desc)
         else:
-            ctx.emit(op="PUTFIELD", owner="?", name="?", desc="L?;")
+            hint = ctx.next_field_hint("assign")
+            if hint:
+                owner, name, desc = hint
+                ctx.emit(op="PUTFIELD", owner=owner, name=name, desc=desc)
+            else:
+                ctx.emit(op="PUTFIELD", owner="?", name="?", desc="L?;")
         return
     if fn in jni_call.SET_STATIC_FIELD_NAMES:
         if len(real_args) < 3: return
@@ -373,7 +420,12 @@ def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> 
         if isinstance(fid, SymFieldId) and fid.owner and fid.name and fid.desc:
             ctx.emit(op="PUTSTATIC", owner=fid.owner, name=fid.name, desc=fid.desc)
         else:
-            ctx.emit(op="PUTSTATIC", owner="?", name="?", desc="L?;")
+            hint = ctx.next_field_hint("assign")
+            if hint:
+                owner, name, desc = hint
+                ctx.emit(op="PUTSTATIC", owner=owner, name=name, desc=desc)
+            else:
+                ctx.emit(op="PUTSTATIC", owner="?", name="?", desc="L?;")
         return
 
     # Method invocation
@@ -617,6 +669,8 @@ def lift_ghidra_function(
     profile: Profile | None = None,
     lookups: dict[str, list[dict[str, Any]]] | None = None,
     string_pool_entries: list[dict[str, Any]] | None = None,
+    method_owner: str = "?",
+    field_descs: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Lift one Ghidra-decompiled function body to JVM instructions.
 
@@ -652,8 +706,10 @@ def lift_ghidra_function(
         options=options,
         profile=profile,
         invoke_hints=[],
+        method_owner=method_owner,
         method_desc=method_desc,
         lookups=lookups or {},
+        field_descs=dict(field_descs or {}),
     )
     ctx.if_guard = IfGuardMatcher(profile, enabled=options.skip_native_exception_guards)
     if string_pool_entries:
@@ -661,6 +717,8 @@ def lift_ghidra_function(
                     if isinstance(e, dict)}
     if options.use_throw_reason_invoke_hints:
         ctx.invoke_hints = InvokeHintParser(profile).parse(code_rewritten)
+    if options.use_throw_reason_field_hints:
+        ctx.field_hints = FieldHintParser(profile).parse(code_rewritten)
 
     tree = _parse(code_rewritten)
     body = None
@@ -723,6 +781,21 @@ def lift_ghidra_dump(
     profile = get_profile(profile_name) if profile_name else get_profile("generic")
     pool_entries = (manifest or {}).get("stringPoolEntries") or []
 
+    # Index every class's fields by simple-name → descriptor so the
+    # field-hint resolver can fill descriptors on hint-bound GETFIELDs
+    # without re-scanning the manifest per call.
+    class_field_descs: dict[str, dict[str, str]] = {}
+    if manifest:
+        for cls in manifest.get("classes", []):
+            cname = cls.get("name")
+            if not cname:
+                continue
+            class_field_descs[cname] = {
+                f["name"]: f["desc"]
+                for f in (cls.get("fields") or [])
+                if f.get("name") and f.get("desc")
+            }
+
     out: list[dict[str, Any]] = []
     for entry in data.get("functions", []):
         code = entry.get("code", "")
@@ -738,12 +811,14 @@ def lift_ghidra_dump(
                 if cls.get("name") == owner and cls.get("lookups"):
                     lookups = cls["lookups"]
                     break
+        fld_descs = class_field_descs.get(owner or "", {})
 
         if owner and name and desc:
             result = lift_ghidra_function(
                 code, desc,
                 options=options, profile=profile,
                 lookups=lookups, string_pool_entries=pool_entries,
+                method_owner=owner, field_descs=fld_descs,
             )
         else:
             # No owner/methodName/methodDesc -> use generic fallback shape.
@@ -751,6 +826,7 @@ def lift_ghidra_dump(
                 code, "()V",
                 options=options, profile=profile,
                 lookups=lookups, string_pool_entries=pool_entries,
+                method_owner=owner or "?", field_descs=fld_descs,
             )
             owner, name, desc = "?", entry.get("name", "?"), "()V"
 

@@ -22,6 +22,12 @@ class LifterOptions:
     #: method-id argument. Profile-controlled regex.
     use_throw_reason_invoke_hints: bool = True
 
+    #: Parse ``"Cannot read field \\"X\\""`` / ``"Cannot assign field \\"X\\""``
+    #: strings in the function body and use the captured field name as
+    #: fallback when symbol-tracking can't resolve a field-id argument.
+    #: Owner is taken from the enclosing method's declaring class.
+    use_throw_reason_field_hints: bool = True
+
     # ---- Symbol-tracking ----
     #: Track variable → jclass / jmethodID / jfieldID / jstring bindings
     #: across statements so ``env->Call*Method(receiver, mid, ...)`` can

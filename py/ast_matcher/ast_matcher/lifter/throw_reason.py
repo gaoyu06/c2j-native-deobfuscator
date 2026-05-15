@@ -53,6 +53,12 @@ class InvokeHint:
     void_desc: str        # ``(args...)V`` — caller patches the return type
 
 
+@dataclass
+class FieldHint:
+    op: str               # ``"read"`` (getfield/static) or ``"assign"`` (put*)
+    name: str             # field name
+
+
 class InvokeHintParser:
     """Scans a function body for invoke-error strings and yields hints
     in source order. The active :class:`Profile`'s :attr:`invoke_error_re`
@@ -80,4 +86,26 @@ class InvokeHintParser:
                 if a.strip()
             ]
             out.append(InvokeHint(owner, name, "(" + "".join(arg_descs) + ")V"))
+        return out
+
+
+class FieldHintParser:
+    """Like :class:`InvokeHintParser` but for field-access error strings
+    (e.g. ``"Cannot read field \\"ADD\\""``). The active profile's
+    :attr:`Profile.field_error_re` controls matching.
+    """
+
+    _LITERAL = re.compile(r'"((?:\\.|[^"\\])*)"')
+
+    def __init__(self, profile: Profile):
+        self.regex = profile.field_error_re
+
+    def parse(self, code: str) -> list[FieldHint]:
+        out: list[FieldHint] = []
+        for m in self._LITERAL.finditer(code):
+            msg = m.group(1).encode("utf-8").decode("unicode_escape", errors="replace")
+            mm = self.regex.match(msg)
+            if not mm:
+                continue
+            out.append(FieldHint(op=mm.group("op"), name=mm.group("name")))
         return out
