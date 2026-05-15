@@ -36,6 +36,7 @@ class BinaryReport:
     exported_functions: list[dict[str, Any]] = field(default_factory=list)
     native_registry: list[dict[str, Any]] = field(default_factory=list)
     per_class_lookups: list[dict[str, Any]] = field(default_factory=list)
+    cache_table: dict[str, Any] = field(default_factory=dict)
 
     def to_json_obj(self) -> dict[str, Any]:
         return {
@@ -56,6 +57,7 @@ class BinaryReport:
             "nativeRegistry": self.native_registry,
             "perClassLookups": self.per_class_lookups,
             "hiddenClasses": self.hidden_classes,
+            "cacheTable": self.cache_table,
         }
 
 
@@ -129,10 +131,16 @@ def extract_string_pool(b: lief.Binary) -> tuple[list[str], int, str | None, lis
       - per-string offset list `[{offset, value}, ...]` from the largest
         contributing section, where `offset` is the byte offset from the
         section's base (matches `string_pool + N` references in disasm).
+
+    Selection is by "JVM-string density", not raw count: a section that
+    contains JVM descriptors (`(I)V`, `Ljava/lang/String;`, …) and
+    obfuscator-runtime error tokens (`INVOKEVIRTUAL Object npe`,
+    `classloader == null`) outranks a section that happens to hold more
+    generic null-terminated runs (typical of CRT data in `.rdata`).
     """
     seen: set[str] = set()
     strings: list[str] = []
-    best_size = 0
+    best_score = -1
     best_base = None
     best_entries: list[dict[str, Any]] = []
     for name in _POOL_SECTIONS:
@@ -142,7 +150,6 @@ def extract_string_pool(b: lief.Binary) -> tuple[list[str], int, str | None, lis
         raw = read_section_bytes(sec)
         i = 0
         n = len(raw)
-        section_added = 0
         section_entries: list[dict[str, Any]] = []
         while i < n:
             if raw[i] == 0:
@@ -162,13 +169,47 @@ def extract_string_pool(b: lief.Binary) -> tuple[list[str], int, str | None, lis
                     if s not in seen:
                         seen.add(s)
                         strings.append(s)
-                        section_added += 1
             i = j + 1
-        if section_added > best_size:
-            best_size = section_added
+        score = _score_jvm_pool(section_entries)
+        if score > best_score:
+            best_score = score
             best_base = hex(b.imagebase + sec.virtual_address) if hasattr(b, "imagebase") else None
             best_entries = section_entries
-    return strings, best_size, best_base, best_entries
+    return strings, len(best_entries), best_base, best_entries
+
+
+_JVM_DESC_RE = re.compile(r"^(?:\([^)]*\)[VZBCSIFJD\[L].*|L[\w/$]+;|\[+[VZBCSIFJDL].*)$")
+_OBFUSCATOR_TOKENS = (
+    "classloader == null",
+    "INVOKEVIRTUAL ",
+    "INVOKESTATIC ",
+    "INVOKESPECIAL ",
+    "INVOKEINTERFACE ",
+    "GETFIELD ",
+    "PUTFIELD ",
+    "AASTORE npe",
+    "ARRAYLENGTH npe",
+    "ANEWARRAY array size < 0",
+)
+
+
+def _score_jvm_pool(entries: list[dict[str, Any]]) -> int:
+    """Heuristic JVM-string density score.
+
+    +5 per obfuscator-runtime literal (rare in CRT data, common in our
+    target pool); +1 per JVM-descriptor-shaped entry; +0 otherwise.
+    """
+    if not entries:
+        return 0
+    score = 0
+    for e in entries:
+        v = e.get("value") or ""
+        if any(tok in v for tok in _OBFUSCATOR_TOKENS):
+            score += 5
+            continue
+        if _JVM_DESC_RE.match(v):
+            score += 1
+    return score
 
 
 _CP_TAG_LEN = {
@@ -346,6 +387,22 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
     native_registry: list[dict[str, Any]] = [
         {"classNameCandidate": name} for name in classes_in_pool
     ] + flat_methods
+    # JNI ID cache-table: bind every cclasses/cfields/cmethods slot
+    # address back to its (owner_slot_addr, name, desc) by scanning the
+    # binary for GetField/MethodID call sites. The lifter consumes this
+    # to resolve raw DAT_xxxxxxx references in Ghidra pseudo-C back to
+    # fully-qualified field/method names.
+    cache_table: dict[str, Any] = {}
+    if pool_base is not None:
+        try:
+            from .cache_table import extract_cache_table
+            cache_table = extract_cache_table(
+                b, pool_entries,
+                string_pool_base=int(pool_base, 16),
+            )
+        except Exception as exc:  # noqa: BLE001
+            cache_table = {"error": f"{type(exc).__name__}: {exc}"}
+
     return BinaryReport(
         schema_version=1,
         input_path=str(path),
@@ -360,6 +417,7 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
         exported_functions=exports,
         native_registry=native_registry,
         per_class_lookups=[],
+        cache_table=cache_table,
     )
 
 

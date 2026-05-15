@@ -105,6 +105,12 @@ class _Ctx:
     #: ``method_owner`` and any other classes we have manifest entries
     #: for. Used to fill descriptors on hint-resolved GETFIELD/PUTFIELD.
     field_descs: dict[str, str] = field(default_factory=dict)
+    #: Per-binary cache-table from binary_introspect.cache_table. Maps
+    #: each ``cfields[N]`` / ``cmethods[N]`` slot's absolute address back
+    #: to its ``(owner, name, desc)`` triple. When pseudo-C references
+    #: a raw ``DAT_<hex>`` and that address is in this table, the lifter
+    #: emits the fully-qualified field/method instead of a `?.?` stub.
+    cache_table: dict[str, Any] = field(default_factory=dict)
 
     def emit(self, **kw: Any) -> None:
         self.instructions.append({k: v for k, v in kw.items() if v is not None})
@@ -160,6 +166,31 @@ class _Ctx:
 # --------------------------------------------------------------------
 
 _JNI_CALL = re.compile(r"(?P<recv>\w+)\s*->\s*(?P<fn>\w+)\s*\(")
+
+_DAT_RE = re.compile(r"^\s*\(?\s*DAT_([0-9a-fA-F]+)\s*\)?\s*$")
+
+
+def _resolve_cache_ref(ctx: "_Ctx", arg: str, kind: str):
+    """Map a raw ``DAT_<hex>`` argument to its cacheTable entry.
+
+    `kind` is ``"fields"`` or ``"methods"``. Returns ``None`` when the
+    address isn't a known cache slot or the entry doesn't have both
+    name and desc resolved.
+    """
+    m = _DAT_RE.match(arg)
+    if not m:
+        return None
+    addr = int(m.group(1), 16)
+    tbl = (ctx.cache_table or {}).get(kind) or {}
+    entry = tbl.get(str(addr))
+    if entry is None:
+        return None
+    name = entry.get("name")
+    desc = entry.get("desc")
+    if not name or not desc:
+        return None
+    owner = entry.get("owner") or "?"
+    return owner, name, desc
 
 # `**(longlong **)PTR_X + 0x2556`  /  `string_pool + 0x14a`
 _POOL_OFFSET = re.compile(
@@ -411,10 +442,16 @@ def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> 
         if len(real_args) < 2: return
         _emit_push(ctx, _resolve_arg(ctx, real_args[0]))
         fid = _resolve_arg(ctx, real_args[1])
+        cache_ref = _resolve_cache_ref(ctx, real_args[1], "fields")
         if isinstance(fid, SymFieldId) and fid.owner and fid.name and fid.desc:
             ctx.emit(op="GETFIELD", owner=fid.owner, name=fid.name, desc=fid.desc)
             if assign_to:
                 ctx.syms[assign_to] = SymObject(desc=fid.desc)
+        elif cache_ref is not None:
+            owner, name, desc = cache_ref
+            ctx.emit(op="GETFIELD", owner=owner, name=name, desc=desc)
+            if assign_to:
+                ctx.syms[assign_to] = SymObject(desc=desc)
         else:
             hint = ctx.next_field_hint("read")
             if hint:
@@ -492,6 +529,7 @@ def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> 
         if mid_idx >= len(real_args):
             return
         mid = _resolve_arg(ctx, real_args[mid_idx])
+        cache_ref = _resolve_cache_ref(ctx, real_args[mid_idx], "methods")
         for a in real_args[vararg_start:]:
             _emit_push(ctx, _resolve_arg(ctx, a))
 
@@ -500,6 +538,13 @@ def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> 
             ctx.emit(op=invoke, owner=mid.owner, name=mid.name, desc=mid.desc)
             if assign_to:
                 ret = mid.desc.rsplit(")", 1)[-1]
+                if ret.startswith(("L", "[")):
+                    ctx.syms[assign_to] = SymObject(desc=ret)
+        elif cache_ref is not None:
+            owner, name, desc = cache_ref
+            ctx.emit(op=invoke, owner=owner, name=name, desc=desc)
+            if assign_to and ret_letter == "L":
+                ret = desc.rsplit(")", 1)[-1]
                 if ret.startswith(("L", "[")):
                     ctx.syms[assign_to] = SymObject(desc=ret)
         else:
@@ -801,6 +846,7 @@ def lift_ghidra_function(
     string_pool_entries: list[dict[str, Any]] | None = None,
     method_owner: str = "?",
     field_descs: dict[str, str] | None = None,
+    cache_table: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Lift one Ghidra-decompiled function body to JVM instructions.
 
@@ -840,6 +886,7 @@ def lift_ghidra_function(
         method_desc=method_desc,
         lookups=lookups or {},
         field_descs=dict(field_descs or {}),
+        cache_table=cache_table or {},
     )
     ctx.if_guard = IfGuardMatcher(profile, enabled=options.skip_native_exception_guards)
     if string_pool_entries:
@@ -910,6 +957,7 @@ def lift_ghidra_dump(
 
     profile = get_profile(profile_name) if profile_name else get_profile("generic")
     pool_entries = (manifest or {}).get("stringPoolEntries") or []
+    cache_table = (manifest or {}).get("cacheTable") or {}
 
     # Index every class's fields by simple-name → descriptor so the
     # field-hint resolver can fill descriptors on hint-bound GETFIELDs
@@ -949,6 +997,7 @@ def lift_ghidra_dump(
                 options=options, profile=profile,
                 lookups=lookups, string_pool_entries=pool_entries,
                 method_owner=owner, field_descs=fld_descs,
+                cache_table=cache_table,
             )
         else:
             # No owner/methodName/methodDesc -> use generic fallback shape.
@@ -957,6 +1006,7 @@ def lift_ghidra_dump(
                 options=options, profile=profile,
                 lookups=lookups, string_pool_entries=pool_entries,
                 method_owner=owner or "?", field_descs=fld_descs,
+                cache_table=cache_table,
             )
             owner, name, desc = "?", entry.get("name", "?"), "()V"
 

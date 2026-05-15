@@ -32,6 +32,7 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
         "stringPoolEntries": ((binary or {}).get("stringPool") or {}).get("entries") or [],
         "classes": [],
         "hiddenClasses": (binary or {}).get("hiddenClasses") or [],
+        "cacheTable": (binary or {}).get("cacheTable") or {},
     }
 
     # Build the candidate-class set from the binary report (Phase 1 hint: which

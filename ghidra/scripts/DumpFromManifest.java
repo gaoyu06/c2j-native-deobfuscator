@@ -76,6 +76,16 @@ public class DumpFromManifest extends GhidraScript {
         DecompInterface dec = new DecompInterface();
         dec.openProgram(program);
 
+        // Helper-function harvest: each obfuscated body references FUN_<hex>
+        // helpers (mutex lock/unlock, find_class_wo_static, etc.). The
+        // cache-table extractor needs to inspect those bodies for the
+        // string-pool LEAs that name each cclasses slot, so we collect
+        // every FUN_<hex> referenced in the obfuscated decompile and dump
+        // them as a second pass — addresses go into `helpers` instead of
+        // `functions` so the consumer can tell them apart.
+        Pattern funRefRe = Pattern.compile("FUN_([0-9a-fA-F]{6,16})");
+        Set<Long> helperAddrs = new HashSet<>();
+
         int decompiled = 0, skipped = 0;
         try (BufferedWriter w = Files.newBufferedWriter(output)) {
             w.write("{\"schemaVersion\":1,\"binary\":");
@@ -117,6 +127,12 @@ public class DumpFromManifest extends GhidraScript {
                     skipped++;
                     continue;
                 }
+                // Collect FUN_<hex> refs for the helper-harvest pass.
+                Matcher fm = funRefRe.matcher(code);
+                while (fm.find()) {
+                    try { helperAddrs.add(Long.parseUnsignedLong(fm.group(1), 16)); }
+                    catch (NumberFormatException ignored) {}
+                }
                 if (!first) w.write(",\n");
                 first = false;
                 w.write("{\"addr\":\"0x" + Long.toHexString(t.fnAddr) + "\"");
@@ -128,10 +144,37 @@ public class DumpFromManifest extends GhidraScript {
                 w.write(",\"code\":" + jsonString(code) + "}");
                 decompiled++;
             }
+            w.write("\n],\n\"helpers\":[\n");
+            // Second pass: dump every referenced helper. Iterate over a
+            // copy of helperAddrs so we don't ConcurrentModify when a
+            // helper references other helpers (deepening of the closure
+            // is intentionally one-level here — the cache-table extractor
+            // only needs the immediate helpers' bodies).
+            int helperCount = 0;
+            boolean firstH = true;
+            Set<Long> helperSeen = new HashSet<>(helperAddrs);
+            for (Long fnAddr : helperAddrs) {
+                if (monitor.isCancelled()) break;
+                Address addr = program.getAddressFactory().getDefaultAddressSpace()
+                                      .getAddress(fnAddr);
+                Function f = getFunctionAt(addr);
+                if (f == null) f = getFunctionContaining(addr);
+                if (f == null) continue;
+                DecompileResults res = dec.decompileFunction(f, 30, monitor);
+                if (res == null || !res.decompileCompleted()) continue;
+                String code = res.getDecompiledFunction().getC();
+                if (code == null) continue;
+                if (!firstH) w.write(",\n");
+                firstH = false;
+                w.write("{\"addr\":\"0x" + Long.toHexString(fnAddr) + "\"");
+                w.write(",\"code\":" + jsonString(code) + "}");
+                helperCount++;
+            }
             w.write("\n]}\n");
+            println("Decompiled " + decompiled + " obfuscated method(s); " +
+                    helperCount + " helper(s); skipped " + skipped + ".");
         }
         dec.dispose();
-        println("Decompiled " + decompiled + " function(s); skipped " + skipped + ".");
         println("Wrote " + output);
     }
 
