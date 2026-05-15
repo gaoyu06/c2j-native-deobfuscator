@@ -1,3 +1,5 @@
+**English** | [中文](README.zh-CN.md)
+
 # c2j-native-deobfuscator
 
 Reverse-engineer **JNI-native-obfuscated JARs** back into readable Java
@@ -133,10 +135,29 @@ Both paths target the same input but trade off coverage versus accuracy:
 
 ## Screenshots
 
-Side-by-side `javap` / decompiler comparisons between the original
-obfuscated jar and the recovered output live in
-[`screenshots/`](screenshots/). See `screenshots/README.md` for the
-catalogue.
+Images live under [`screenshots/showcase/`](screenshots/showcase/). Full
+catalogue in [`screenshots/README.md`](screenshots/README.md).
+
+**Decompiler view (IntelliJ / CFR)**
+
+| Before | After |
+|---|---|
+| ![](screenshots/showcase/decompiler-before.png) | ![](screenshots/showcase/decompiler-after.png) |
+| Native stubs + loader class still present | Bodies reconstructed, loader stripped |
+
+**`javap -c -p` — single method**
+
+| Before | After |
+|---|---|
+| ![](screenshots/showcase/javap-before.png) | ![](screenshots/showcase/javap-after.png) |
+| `native` flag only, no Code attribute | Real Code attribute + opcode stream |
+
+**End-to-end pipeline & Ghidra pseudo-C**
+
+| Recovery pipeline | Ghidra pseudo-C |
+|---|---|
+| ![](screenshots/showcase/pipeline.png) | ![](screenshots/showcase/ghidra-pseudoc.png) |
+| Per-stage output from the dynamic path | The lifter's actual input on the static path |
 
 ---
 
