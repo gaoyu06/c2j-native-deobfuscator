@@ -34,6 +34,16 @@ from .if_guard import IfGuardMatcher
 from . import jni_call
 
 
+@dataclass
+class _SlotRef:
+    """A variable that's been DUP+ASTOREd to a synthetic local slot by the
+    lifter. _emit_push restores it via ALOAD so the value stays live across
+    statements — without this, a `uVar = env->GetField(...)` would emit the
+    GETFIELD and then a later `return uVar;` would push a fresh ACONST_NULL,
+    discarding the field value (and decompilers fold it as dead code)."""
+    slot: int
+
+
 # --------------------------------------------------------------------
 # tree-sitter setup
 # --------------------------------------------------------------------
@@ -81,6 +91,14 @@ class _Ctx:
     #: (``cVar = env->ExceptionCheck(); if (cVar != 0) return 0;``) are
     #: still recognised as boilerplate to skip.
     exception_check_vars: set[str] = field(default_factory=set)
+    #: Map of variable name -> synthetic local slot, populated when a
+    #: value-producing JNI call assigns to a var (the lifter emits a
+    #: DUP+ASTORE pair right after). Later references resolve to ALOAD
+    #: of that slot so the value survives across statements.
+    var_slots: dict[str, int] = field(default_factory=dict)
+    #: Next free slot for the SSA-style binding above. Starts well past
+    #: any plausible method.maxLocals so we don't clash with real locals.
+    next_synthetic_slot: int = 64
     method_owner: str = "?"
     method_desc: str = "()V"
     #: Map of field-name -> JVM descriptor for fields declared on
@@ -108,6 +126,17 @@ class _Ctx:
         else:
             ret_desc = "Ljava/lang/Object;"
         return hint.owner, hint.name, args_part + ret_desc
+
+    def bind_var_to_top(self, var: str) -> int:
+        """Allocate a synthetic local slot for `var` and emit
+        DUP+ASTORE so the current stack-top is saved into it. Caller must
+        have just emitted a single value-producing instruction."""
+        slot = self.next_synthetic_slot
+        self.next_synthetic_slot += 1
+        self.var_slots[var] = slot
+        self.emit(op="DUP")
+        self.emit(op="ASTORE", **{"var": slot})
+        return slot
 
     def next_field_hint(self, op: str) -> tuple[str, str, str] | None:
         """Return ``(owner, name, desc)`` for the next field-error hint
@@ -209,8 +238,15 @@ def _resolve_arg(ctx: _Ctx, arg: str) -> Any:
     if m:
         return int(m.group(1), 16) if m.group(1).startswith("0x") else int(m.group(1))
 
-    if re.fullmatch(r"\w+", s) and ctx.options.track_symbol_table:
-        return ctx.syms.get(s)
+    if re.fullmatch(r"[\w.]+", s):
+        # SSA-style slot ref: variables that were saved to a synthetic
+        # local slot after a value-producing JNI call. Names may contain
+        # `.` because Ghidra renders struct slot access (e.g.
+        # `local_47._23_8_`) as part of a single identifier.
+        if s in ctx.var_slots:
+            return _SlotRef(ctx.var_slots[s])
+        if ctx.options.track_symbol_table:
+            return ctx.syms.get(s)
 
     if ctx.options.resolve_string_pool_offsets:
         off = _extract_pool_offset(s)
@@ -243,6 +279,9 @@ def _resolve_arg(ctx: _Ctx, arg: str) -> Any:
 
 def _emit_push(ctx: _Ctx, value: Any) -> None:
     """Emit a stack-push for a resolved value or placeholder."""
+    if isinstance(value, _SlotRef):
+        ctx.emit(op="ALOAD", **{"var": value.slot})
+        return
     if isinstance(value, SymStringLit):
         ctx.emit(op="LDC", value=value.value)
         return
@@ -385,6 +424,8 @@ def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> 
                     ctx.syms[assign_to] = SymObject(desc=desc)
             else:
                 ctx.emit(op="GETFIELD", owner="?", name="?", desc="L?;")
+        if assign_to:
+            ctx.bind_var_to_top(assign_to)
         return
     if fn in jni_call.GET_STATIC_FIELD_NAMES:
         if len(real_args) < 2: return
@@ -402,6 +443,8 @@ def _handle_call(ctx: _Ctx, fn: str, args: list[str], assign_to: str | None) -> 
                     ctx.syms[assign_to] = SymObject(desc=desc)
             else:
                 ctx.emit(op="GETSTATIC", owner="?", name="?", desc="L?;")
+        if assign_to:
+            ctx.bind_var_to_top(assign_to)
         return
     if fn in jni_call.SET_FIELD_NAMES:
         if len(real_args) < 3: return
@@ -556,7 +599,14 @@ def _handle_rhs(ctx: _Ctx, lhs: str, rhs: str) -> None:
         if isinstance(resolved, (SymStringLit, SymClass, SymMethodId, SymFieldId)):
             ctx.syms[lhs] = resolved
             return
-        if re.fullmatch(r"\w+", rhs) and rhs in ctx.syms:
+        # Slot propagation across var-to-var assignment: when Ghidra
+        # threads a JNI-call result through a few temporaries (`uVar7 =
+        # local_30;` before `return uVar7;`), we want the final return
+        # to still see the original ALOAD slot.
+        if isinstance(resolved, _SlotRef):
+            ctx.var_slots[lhs] = resolved.slot
+            return
+        if re.fullmatch(r"[\w.]+", rhs) and rhs in ctx.syms:
             ctx.syms[lhs] = ctx.syms[rhs]
 
 
@@ -606,6 +656,16 @@ def _emit_if(
                 if cons is not None:
                     _walk_stmt(ctx, cons, source)
                 return
+
+    # Native-obfuscator-style lazy cache init: `if (DAT_xxx == 0)` blocks
+    # wrapping `cclasses[N]`/`cfields[N]`/`cmethods[N]` setup. The body
+    # is mutex_lock + double-check + NewWeakGlobalRef / GetFieldID +
+    # mutex_unlock + exception_check, plus nested goto/label noise. None
+    # of it is part of the user's JVM code, so skip the whole if outright
+    # — we lose the symbol-table side effects (no way to bind cfields[N]
+    # to a name in this pass), but the rest of the body stays clean.
+    if ctx.options.skip_native_exception_guards and _looks_like_cache_init(cond_text, cons_text):
+        return
 
     # cond+goto-target → IF*
     target: str | None = None
@@ -677,6 +737,38 @@ _JUMP_OPS = {
     "IF_ICMPGT", "IF_ICMPGE", "IF_ACMPEQ", "IF_ACMPNE",
     "IFNULL", "IFNONNULL",
 }
+
+
+# Tokens used by native-obfuscator's lazy cache-init blocks. When *any* of
+# these appear in an `if` cond/body shape that also references a global
+# `DAT_<hex>` or `cclasses[N]`/`cfields[N]`/`cmethods[N]` slot, the if is
+# treated as boilerplate and its control-flow opcodes are dropped (the
+# JNI calls inside are still walked for symbol-table side effects).
+_CACHE_INIT_BODY_TOKENS = (
+    "IsSameObject",
+    "NewWeakGlobalRef",
+    "find_class_wo_static",
+    "FindClass",
+    "GetFieldID",
+    "GetMethodID",
+    "GetStaticFieldID",
+    "GetStaticMethodID",
+    "PSRWLOCK",                # mutex lock/unlock helper arg type
+    "AcquireSRWLockExclusive", # raw Windows lock primitives Ghidra recognises
+    "ReleaseSRWLockExclusive",
+)
+
+_CACHE_SLOT_RE = re.compile(
+    r"\bDAT_[0-9a-fA-F]+\b|\b(?:cclasses|cfields|cmethods|cstrings)\s*\["
+)
+
+
+def _looks_like_cache_init(cond: str, body: str) -> bool:
+    """Heuristic: does this if-block look like native-obfuscator's lazy
+    cclasses/cfields/cmethods init?"""
+    if not _CACHE_SLOT_RE.search(cond) and not _CACHE_SLOT_RE.search(body):
+        return False
+    return any(tok in body for tok in _CACHE_INIT_BODY_TOKENS)
 
 
 def _drop_dangling_jumps(ctx: _Ctx) -> None:
