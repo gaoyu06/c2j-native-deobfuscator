@@ -51,6 +51,14 @@ class ClassRebuilderCmd : Callable<Int> {
     )
     var inlineTraceMarkers: Boolean = false
 
+    @Option(
+        names = ["--allow-unverified-classes"],
+        description = ["When ASM frame computation rejects the lifted bytecode for a class, fall back to writing the methods with COMPUTE_MAXS only (no StackMapTable). The class becomes non-loadable but stays decompilable — preserves the lifted opcodes for inspection instead of stubbing them out. Default: true."],
+        arity = "1",
+        defaultValue = "true",
+    )
+    var allowUnverifiedClasses: Boolean = true
+
     override fun call(): Int {
         val loaderCfg = detectLoaderConfig()
         val recovered = RecoveredIndex.loadDir(recoveredDir)
@@ -59,11 +67,13 @@ class ClassRebuilderCmd : Callable<Int> {
             loaderCfg, recovered,
             annotateRuntimeValues = annotateRuntimeValues,
             inlineTraceMarkers = inlineTraceMarkers,
+            allowUnverifiedClasses = allowUnverifiedClasses,
         )
         val stats = rebuilder.rebuild(input, output)
         System.err.println(
             "Wrote ${output} | classes=${stats.classes} replaced=${stats.replaced} " +
-                "leftAsStub=${stats.leftAsStub} loaderStripped=${stats.loaderStripped} " +
+                "leftAsStub=${stats.leftAsStub} unverifiedClasses=${stats.unverifiedClasses} " +
+                "unverifiedMethods=${stats.unverifiedMethods} loaderStripped=${stats.loaderStripped} " +
                 "nativeLibsStripped=${stats.nativeLibsStripped}"
         )
         return 0
@@ -136,6 +146,8 @@ data class RebuildStats(
     var classes: Int = 0,
     var replaced: Int = 0,
     var leftAsStub: Int = 0,
+    var unverifiedClasses: Int = 0,
+    var unverifiedMethods: Int = 0,
     var loaderStripped: Int = 0,
     var nativeLibsStripped: Int = 0,
 )
@@ -145,6 +157,7 @@ class ClassRebuilder(
     private val recovered: RecoveredIndex,
     private val annotateRuntimeValues: Boolean = true,
     private val inlineTraceMarkers: Boolean = false,
+    private val allowUnverifiedClasses: Boolean = true,
 ) {
     private val loaderClass: String? get() = loaderCfg.loaderClass
     private val nativeDir: String? get() = loaderCfg.nativeDir
@@ -297,34 +310,75 @@ class ClassRebuilder(
         // For replaced methods we MUST recompute frames; for clinit-only
         // changes COMPUTE_MAXS is enough (frames within clinit are still
         // valid since we only stripped a contiguous suffix of pushes).
-        val flags = if (methodReplaced)
+        val framesFlags = if (methodReplaced)
             ClassWriter.COMPUTE_MAXS or ClassWriter.COMPUTE_FRAMES
         else
             ClassWriter.COMPUTE_MAXS
 
-        fun makeWriter(): ClassWriter = object : ClassWriter(flags) {
+        fun makeWriter(flags: Int): ClassWriter = object : ClassWriter(flags) {
             override fun getCommonSuperClass(type1: String, type2: String): String =
                 try { super.getCommonSuperClass(type1, type2) }
                 catch (_: Throwable) { "java/lang/Object" }
         }
 
-        // Attempt the class write. If ASM rejects (typically stack-imbalance
-        // somewhere in our lifted bodies), fall back: stub EVERY replaced
-        // method at once and retry. This guarantees forward progress; the
-        // user loses the lifted bodies on this specific class but the rest
-        // of the jar is unaffected.
+        // Tier 1: verifying jar — try COMPUTE_FRAMES. If the lifted opcodes
+        // type-check cleanly the resulting class loads in any JVM.
         try {
-            val writer = makeWriter()
+            val writer = makeWriter(framesFlags)
             cn.accept(writer)
             return writer.toByteArray()
-        } catch (_: Throwable) {
+        } catch (t1: Throwable) {
             if (replacedMethods.isEmpty()) throw IllegalStateException("class write failed but no methods replaced — bug")
+
+            // Tier 2: best-effort decompilable jar — emit with COMPUTE_MAXS
+            // only. No StackMapTable means the JVM rejects the class at load
+            // time, but javap / CFR / IntelliJ still see the full lifted
+            // opcode stream. Each replaced method gets a leading
+            // `j2c/Trace.UNVERIFIED_<name>()V` marker so a decompiler view
+            // surfaces "this body is best-effort" without us pulling tricks
+            // on the bytecode itself.
+            if (allowUnverifiedClasses) {
+                try {
+                    for (mm in replacedMethods) prependUnverifiedMarker(mm)
+                    val writer = makeWriter(ClassWriter.COMPUTE_MAXS)
+                    cn.accept(writer)
+                    stats.unverifiedClasses++
+                    stats.unverifiedMethods += replacedMethods.size
+                    System.err.println(
+                        "Class ${cn.name}: lifted bodies failed frame verification (${t1.javaClass.simpleName}) — " +
+                            "writing ${replacedMethods.size} method(s) as non-loadable but decompilable."
+                    )
+                    return writer.toByteArray()
+                } catch (_: Throwable) {
+                    // fall through to tier 3
+                }
+            }
+
+            // Tier 3: full stub fallback — we couldn't even write the class
+            // structurally. Reset bodies + retry with COMPUTE_FRAMES so the
+            // rest of the jar still ships.
             for (mm in replacedMethods) replaceWithDefaultReturn(mm)
-            System.err.println("Class ${cn.name}: lifted bodies caused ASM stack imbalance — re-stubbing ${replacedMethods.size} method(s).")
-            val writer = makeWriter()
+            System.err.println("Class ${cn.name}: ASM rejected even the unverified write — re-stubbing ${replacedMethods.size} method(s).")
+            val writer = makeWriter(framesFlags)
             cn.accept(writer)
             return writer.toByteArray()
         }
+    }
+
+    /** Insert a leading `INVOKESTATIC j2c/Trace.UNVERIFIED_<name>:()V` at the
+     *  top of `m`'s body so a reader of the recovered jar can tell at a
+     *  glance which methods were emitted on the best-effort, non-verifying
+     *  path. Has zero stack effect, so it never disturbs the lifted body. */
+    private fun prependUnverifiedMarker(m: MethodNode) {
+        val insns = m.instructions ?: return
+        val safeTok = m.name.replace(Regex("[.;\\[/<>]"), "_")
+        val marker = MethodInsnNode(
+            Opcodes.INVOKESTATIC, "j2c/Trace",
+            "UNVERIFIED_$safeTok", "()V", false
+        )
+        markerKindsUsed += "UNVERIFIED_$safeTok"
+        val first = insns.first
+        if (first != null) insns.insertBefore(first, marker) else insns.add(marker)
     }
 
     private fun isAlreadyStub(m: MethodNode): Boolean {
