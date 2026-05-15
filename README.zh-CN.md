@@ -22,29 +22,39 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 
 ## 效果展示
 
-> 占位项；图片放在 [`screenshots/showcase/`](screenshots/showcase/) 下。
+基于 `e2e-test/snake/` 真实端到端 fixture 自动生成 —— 每张图都是用 HTML + Prism.js 渲染实际还原产物、再 Chrome headless 截下来的，没有任何手工编辑。
+> （此前的"占位项"已替换为下方实际截图。）
 > 完整目录见 [`screenshots/README.md`](screenshots/README.md)。
 
-**反编译器视图（IntelliJ / CFR）**
+**静态路径 — Snake.java 完整对比**
 
-| 还原前 | 还原后 |
-|---|---|
-| ![](screenshots/showcase/decompiler-before.png) | ![](screenshots/showcase/decompiler-after.png) |
-| native 方法体为空，loader 类仍在 | 方法体已重建，loader 类被剥离 |
+![](screenshots/showcase/snake-static-overview.png)
 
-**`javap -c -p` 单方法对比**
+原始源码 vs Vineflower 解出来的静态路径产物。capstone 抽到的 cache-table 把每个 cclasses/cfields/cmethods slot 都对回 `(owner, name, desc)`；lifter 把 JNI `param_2` 预绑到 JVM 局部槽 0，receiver 全部正确显示为 `this`。
 
-| 还原前 | 还原后 |
-|---|---|
-| ![](screenshots/showcase/javap-before.png) | ![](screenshots/showcase/javap-after.png) |
-| 仅有 `native` 修饰符，没有 Code 属性 | 真实的 Code 属性 + opcode 序列 |
+**动态路径 — Snake.java 完整对比**
 
-**端到端运行 & Ghidra pseudo-C**
+![](screenshots/showcase/snake-dynamic-overview.png)
 
-| 恢复流水线 | Ghidra pseudo-C |
-|---|---|
-| ![](screenshots/showcase/pipeline.png) | ![](screenshots/showcase/ghidra-pseudoc.png) |
-| 动态路径的逐阶段输出 | 静态路径抬升器的真实输入 |
+同样输入，走 JVMTI agent：被混淆的 native 代码每一次 JNI 调用都被记录下来再抬升回 JVM 字节码。被实际执行到的分支，输出和 javac 字节码几乎一致。
+
+**静态路径迭代过程**
+
+![](screenshots/showcase/snake-static-progression.png)
+
+同一输入，静态路径三个阶段：stub 兜底 → tier 2 unverified 写入 → cache-table + receiver 绑定。每一步多救回一层语义信息。
+
+**JVMTI 动态路径的中间产物**
+
+![](screenshots/showcase/dynamic-intermediates.png)
+
+动态路径如何把运行时的 JNI 调用流转成 JVM 字节码：agent 写的 `trace.jsonl`（每条 JNI 调用一条 JSON）、抬升后的 `recovered/*.json`、以及把它们串起来的流水线。
+
+**同输入两条路径：Board.java**
+
+![](screenshots/showcase/board-static-vs-dynamic.png)
+
+静态路径离线快但覆盖率受限于每种混淆器的模式识别；动态路径要求目标能跑起来，但对运行时实际触达的分支几乎能产出 javac 等价的字节码。
 
 ---
 

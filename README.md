@@ -135,29 +135,52 @@ Both paths target the same input but trade off coverage versus accuracy:
 
 ## Screenshots
 
-Images live under [`screenshots/showcase/`](screenshots/showcase/). Full
-catalogue in [`screenshots/README.md`](screenshots/README.md).
+Auto-generated from the actual snake end-to-end fixture in
+`e2e-test/snake/`. Side-by-side syntax-highlighted comparisons of
+original source vs Vineflower-decompiled recovery output for both
+paths. Full catalogue in [`screenshots/README.md`](screenshots/README.md).
 
-**Decompiler view (IntelliJ / CFR)**
+**Static path — Snake.java end-to-end**
 
-| Before | After |
-|---|---|
-| ![](screenshots/showcase/decompiler-before.png) | ![](screenshots/showcase/decompiler-after.png) |
-| Native stubs + loader class still present | Bodies reconstructed, loader stripped |
+![](screenshots/showcase/snake-static-overview.png)
 
-**`javap -c -p` — single method**
+Original snake source vs Vineflower-decompiled static-path output.
+Capstone-based cache-table extraction binds every cclasses/cfields/
+cmethods slot back to `(owner, name, desc)`, then the lifter
+pre-binds JNI `param_2` to JVM local 0 so receivers render as `this`.
 
-| Before | After |
-|---|---|
-| ![](screenshots/showcase/javap-before.png) | ![](screenshots/showcase/javap-after.png) |
-| `native` flag only, no Code attribute | Real Code attribute + opcode stream |
+**Dynamic path — Snake.java end-to-end**
 
-**End-to-end pipeline & Ghidra pseudo-C**
+![](screenshots/showcase/snake-dynamic-overview.png)
 
-| Recovery pipeline | Ghidra pseudo-C |
-|---|---|
-| ![](screenshots/showcase/pipeline.png) | ![](screenshots/showcase/ghidra-pseudoc.png) |
-| Per-stage output from the dynamic path | The lifter's actual input on the static path |
+Same input via the JVMTI agent: every JNI call the obfuscated native
+code makes gets logged and lifted back to JVM bytecode. Bodies match
+javac output for the branches actually executed.
+
+**Static-path progression**
+
+![](screenshots/showcase/snake-static-progression.png)
+
+Three stages of the static path on the same input — stub fallback,
+tier-2 unverified write, and the final state with cache-table + receiver
+binding. Each iteration adds another layer of semantic recovery.
+
+**JVMTI dynamic-path intermediates**
+
+![](screenshots/showcase/dynamic-intermediates.png)
+
+How the dynamic path turns a runtime JNI-call stream into JVM bytecode:
+the agent's `trace.jsonl` records, the per-method `recovered/*.json`
+lifted bytecode artifact, and the connecting pipeline.
+
+**Two paths, same input: Board.java**
+
+![](screenshots/showcase/board-static-vs-dynamic.png)
+
+The static path is faster and works offline but coverage depends on
+per-obfuscator pattern matching. The dynamic path requires running the
+target but produces near-pristine bytecode for any code path that
+actually executes during the trace.
 
 ---
 

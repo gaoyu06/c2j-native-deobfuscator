@@ -1,48 +1,49 @@
 # Screenshots
 
-Side-by-side comparisons between the **obfuscated input** and the
-**recovered output**.
+## Auto-generated showcase images (`showcase/`)
+
+Side-by-side decompiler comparisons rendered from the actual pipeline
+output on the `snake` end-to-end fixture (`e2e-test/snake/`). Generated
+via HTML + Prism.js + Chrome headless from the real recovered jars —
+not hand-edited.
+
+| File | Subject |
+|---|---|
+| `snake-static-overview.png`     | snake's original `Snake.java` vs Vineflower-decompiled output from the static path |
+| `snake-dynamic-overview.png`    | snake's original `Snake.java` vs Vineflower-decompiled output from the dynamic path |
+| `snake-static-progression.png`  | three stages of static recovery: stub fallback → tier-2 unverified → cache-table + receiver bind |
+| `dynamic-intermediates.png`     | the JVMTI dynamic path's intermediate files: `trace.jsonl` JNI-call records + the lifted `recovered/*.json` + pipeline diagram |
+| `board-static-vs-dynamic.png`   | same input (Board.java), the two paths side by side; coverage tradeoff visible |
+| `decompiler-before.png`         | original IntelliJ screenshot of an obfuscated Kiritan class (`Dp`) before any recovery — all method bodies are `native` |
 
 ## Layout
 
 ```
 screenshots/
-├── showcase/                   images embedded in the top-level README
-│   ├── decompiler-before.png   IntelliJ/CFR view, obfuscated jar
-│   ├── decompiler-after.png    IntelliJ/CFR view, recovered jar
-│   ├── javap-before.png        `javap -c -p` of one representative method (native)
-│   ├── javap-after.png         `javap -c -p` of the same method (recovered)
-│   ├── pipeline.png            terminal screenshot of `j2c-dumper recover`
-│   └── ghidra-pseudoc.png      Ghidra decompiler view of one `fnAddr`
-│
-└── <fixture-name>/             per-fixture deep-dive (optional)
-    ├── notes.md                short description of the fixture
-    ├── classlist/              `javap -p` of the class list
-    │   ├── before.png
-    │   └── after.png
-    ├── method-body/            `javap -c -p` of one representative method
-    │   ├── before.png
-    │   └── after.png
-    └── decompiler/             CFR / Procyon / IntelliJ decompiler output
-        ├── before.png
-        └── after.png
+└── showcase/
+    ├── snake-static-overview.png
+    ├── snake-dynamic-overview.png
+    ├── snake-static-progression.png
+    ├── dynamic-intermediates.png
+    ├── board-static-vs-dynamic.png
+    └── decompiler-before.png        ← real IntelliJ shot (obfuscated input)
 ```
 
-## Naming convention
+## Regenerating
 
-- `before.*` — the obfuscated jar (native method stubs, encoded string
-  tables, generated `*ClInit` loader classes still present).
-- `after.*` — the recovered jar emitted by `class-rebuilder` (real
-  bytecode bodies, loader classes stripped).
+The showcase PNGs come from a generator script that reads the
+recovered jars + intermediate files and renders Chrome-headless
+screenshots of syntax-highlighted HTML pages. To regenerate after a
+pipeline change:
 
-For dynamic-path fixtures the `after.*` shot should be annotated with
-the `--run-cmd` used to produce the trace, since coverage depends on
-which branches the target executed.
+1. Re-run the snake pipeline (`e2e-test/snake/`) end-to-end through
+   both static and dynamic paths, producing `snake-static-v*.jar`
+   and `snake-dynamic-v*.jar`.
+2. Decompile both jars with Vineflower into `vf-stc/` / `vf-dyn/`.
+3. Run the generator (script lives in the temp workdir during a
+   demo session, not in the repo — see `dynamic-intermediates.png`
+   for the pipeline shape).
+4. Copy the PNGs back into `screenshots/showcase/`.
 
-## Fixture catalogue
-
-| Fixture | Path | Source obfuscator | Notes |
-|---|---|---|---|
-| _(none yet)_ | — | — | — |
-
-Add a row per fixture as deep-dive screenshots land.
+For a new fixture, add a subdirectory `screenshots/<fixture-name>/`
+with the same structure.
