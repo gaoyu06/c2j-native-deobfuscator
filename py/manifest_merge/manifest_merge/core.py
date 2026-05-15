@@ -25,8 +25,11 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
             "lib": (binary or {}).get("input", {}).get("libPath"),
         },
         "loaderClass": classes.get("loaderClass"),
+        "loaderRegisterMethod": classes.get("loaderRegisterMethod"),
+        "loaderRegisterDesc": classes.get("loaderRegisterDesc"),
         "nativeDir": classes.get("nativeDir"),
         "stringPool": ((binary or {}).get("stringPool") or {}).get("strings") or [],
+        "stringPoolEntries": ((binary or {}).get("stringPool") or {}).get("entries") or [],
         "classes": [],
         "hiddenClasses": (binary or {}).get("hiddenClasses") or [],
     }
@@ -49,6 +52,42 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
             continue
         for m in entry.get("methods", []):
             fn_index[(cls, m["name"], m["desc"])] = m
+
+    # ALSO bind by position: when binary-introspect found a RegisterNatives
+    # call site with N fnAddrs, and a jar-parser class has N obfuscated
+    # native methods, assume the binary's fn list matches the class's
+    # declaration order (native-obfuscator emits __ngen_methods[] in source
+    # declaration order). This is the primary signal when the binary has
+    # no `Java_<class>_<method>` exports — common with j2cc-style obfuscators.
+    register_sites: list[dict[str, Any]] = [
+        e for e in (binary or {}).get("nativeRegistry") or []
+        if "fnAddrs" in e
+    ]
+    # Pre-compute (class -> ordered native methods) for jar-parser data.
+    class_natives: list[tuple[str, list[dict[str, Any]]]] = []
+    for cls in classes.get("classes", []):
+        nats = [m for m in cls.get("methods", []) if m.get("isObfuscatedNative")]
+        if nats:
+            class_natives.append((cls["name"], nats))
+    # Match each call site to the first class with a matching native count.
+    # Each class can only be bound once.
+    used_classes: set[str] = set()
+    for site in register_sites:
+        addrs = site.get("fnAddrs") or []
+        n = len(addrs)
+        if n == 0:
+            continue
+        for cname, nats in class_natives:
+            if cname in used_classes or len(nats) != n:
+                continue
+            used_classes.add(cname)
+            for nat, addr in zip(nats, addrs):
+                fn_index[(cname, nat["name"], nat["desc"])] = {
+                    "fnAddr": addr,
+                    "fnSymbol": f"__j2c_native_{cname.replace('/', '_')}_{nat['name']}",
+                }
+            site["boundTo"] = cname
+            break
 
     lookups_by_class: dict[str, dict[str, Any]] = {}
     for entry in (binary or {}).get("perClassLookups") or []:

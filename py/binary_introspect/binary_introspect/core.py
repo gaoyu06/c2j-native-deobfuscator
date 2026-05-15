@@ -12,6 +12,8 @@ from typing import Any
 
 import lief
 
+from .jni_tables import attribute_tables_to_classes, find_jni_method_tables
+
 CLASS_MAGIC = b"\xca\xfe\xba\xbe"
 
 # Heuristic: a string is "interesting" (likely in the j2c string pool) if it's
@@ -29,6 +31,7 @@ class BinaryReport:
     string_pool: list[str] = field(default_factory=list)
     string_pool_total_bytes: int = 0
     string_pool_base: str | None = None
+    string_pool_entries: list[dict[str, Any]] = field(default_factory=list)
     hidden_classes: list[dict[str, Any]] = field(default_factory=list)
     exported_functions: list[dict[str, Any]] = field(default_factory=list)
     native_registry: list[dict[str, Any]] = field(default_factory=list)
@@ -47,6 +50,7 @@ class BinaryReport:
                 "base": self.string_pool_base,
                 "totalBytes": self.string_pool_total_bytes,
                 "strings": self.string_pool,
+                "entries": self.string_pool_entries,
             },
             "exportedFunctions": self.exported_functions,
             "nativeRegistry": self.native_registry,
@@ -114,18 +118,23 @@ _POOL_SECTIONS = [".data", ".rdata", ".rodata", "__data", "__DATA,__data",
                   "__DATA,__const", "__const"]
 
 
-def extract_string_pool(b: lief.Binary) -> tuple[list[str], int, str | None]:
+def extract_string_pool(b: lief.Binary) -> tuple[list[str], int, str | None, list[dict[str, Any]]]:
     """Walk all plausible string-bearing sections and pull every
     null-terminated ASCII/UTF-8 run.
 
-    Returns a deduplicated, order-preserving list of strings, the byte size
-    of the largest contributing section (best estimate of pool size), and the
-    base VA of that section.
+    Returns:
+      - deduplicated, order-preserving list of strings,
+      - size (count) of the largest contributing section,
+      - base VA of that section (string-pool base),
+      - per-string offset list `[{offset, value}, ...]` from the largest
+        contributing section, where `offset` is the byte offset from the
+        section's base (matches `string_pool + N` references in disasm).
     """
     seen: set[str] = set()
     strings: list[str] = []
     best_size = 0
     best_base = None
+    best_entries: list[dict[str, Any]] = []
     for name in _POOL_SECTIONS:
         sec = section_by_name(b, [name])
         if sec is None:
@@ -133,8 +142,8 @@ def extract_string_pool(b: lief.Binary) -> tuple[list[str], int, str | None]:
         raw = read_section_bytes(sec)
         i = 0
         n = len(raw)
-        section_size = 0
         section_added = 0
+        section_entries: list[dict[str, Any]] = []
         while i < n:
             if raw[i] == 0:
                 i += 1
@@ -149,17 +158,17 @@ def extract_string_pool(b: lief.Binary) -> tuple[list[str], int, str | None]:
                 except UnicodeDecodeError:
                     s = None
                 if s is not None and all(0x20 <= ord(c) < 0x7f for c in s):
+                    section_entries.append({"offset": i, "value": s})
                     if s not in seen:
                         seen.add(s)
                         strings.append(s)
                         section_added += 1
-            section_size = j - i
             i = j + 1
         if section_added > best_size:
             best_size = section_added
             best_base = hex(b.imagebase + sec.virtual_address) if hasattr(b, "imagebase") else None
-    # totalBytes = approximate size of largest contributing section, OR sum
-    return strings, best_size, best_base
+            best_entries = section_entries
+    return strings, best_size, best_base, best_entries
 
 
 _CP_TAG_LEN = {
@@ -306,18 +315,37 @@ def detect_native_obfuscator_classes(strings: list[str]) -> list[str]:
     return sorted(set(out))
 
 
-def introspect(path: Path) -> BinaryReport:
+def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
     b = lief.parse(str(path))
     if b is None:
         raise IOError(f"LIEF could not parse {path}")
     fmt, arch = detect_format(b)
-    strings, pool_bytes, pool_base = extract_string_pool(b)
+    strings, pool_bytes, pool_base, pool_entries = extract_string_pool(b)
     hidden = extract_hidden_classes(b)
     exports = extract_exported_functions(b)
-    # The function table cannot be recovered without disassembly; we still
-    # emit a placeholder list of plausibly-registered classes so manifest-merge
-    # can warn the user if jar-parser found classes the binary doesn't mention.
     classes_in_pool = detect_native_obfuscator_classes(strings)
+    # Profile selection: explicit name wins, else auto-detect.
+    from .profile import detect_profile, get_profile
+    profile = get_profile(profile_name) if profile_name else detect_profile(b)
+    # Scan for runtime-RegisterNatives call sites. Each call site holds a
+    # list of fnPtrs (one per method registered). String pointers are
+    # typically built as `string_pool + offset` at runtime so we can't
+    # extract names statically — manifest-merge will bind by matching
+    # per-call fn-count to jar-parser's per-class ACC_NATIVE method count.
+    jni_tables = find_jni_method_tables(b, profile=profile)
+    jni_tables = attribute_tables_to_classes(jni_tables, strings)
+    # Flatten: one record per RegisterNatives call site, plus one per fnPtr
+    # so downstream consumers can iterate either way.
+    flat_methods: list[dict[str, Any]] = []
+    for t in jni_tables:
+        flat_methods.append({
+            "registerNativesCallSite": t["callSite"],
+            "nMethods": t.get("nMethods"),
+            "fnAddrs": t["fnAddrs"],
+        })
+    native_registry: list[dict[str, Any]] = [
+        {"classNameCandidate": name} for name in classes_in_pool
+    ] + flat_methods
     return BinaryReport(
         schema_version=1,
         input_path=str(path),
@@ -327,9 +355,10 @@ def introspect(path: Path) -> BinaryReport:
         string_pool=strings,
         string_pool_total_bytes=pool_bytes,
         string_pool_base=pool_base,
+        string_pool_entries=pool_entries,
         hidden_classes=hidden,
         exported_functions=exports,
-        native_registry=[{"classNameCandidate": name} for name in classes_in_pool],
+        native_registry=native_registry,
         per_class_lookups=[],
     )
 
