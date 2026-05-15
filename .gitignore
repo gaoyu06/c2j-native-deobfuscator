@@ -25,3 +25,13 @@ Thumbs.db
 
 # Local intermediate
 e2e-test/
+$tmp/
+tmp/
+*.tmp
+
+# Kotlin compiler cache
+.kotlin/
+
+# Output artefacts (binary blobs, generated jars)
+通用性测试例子/recovered/
+通用性测试例子/*.jar
