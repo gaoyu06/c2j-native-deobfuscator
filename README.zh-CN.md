@@ -56,6 +56,18 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 
 静态路径离线快但覆盖率受限于每种混淆器的模式识别；动态路径要求目标能跑起来，但对运行时实际触达的分支几乎能产出 javac 等价的字节码。
 
+**动态路径手动还原**
+
+![](screenshots/showcase/manual-restoration-dynamic.png)
+
+熟手 10-15 分钟过一遍能做到的事：删 SSA 槽位 `Object varN = null;` 声明、inline 单用临时变量、把 trace 烧进去的具体常量换回符号表达式、补回 trace 没走到的分支。完整流程见 [`docs/manual-restoration.md`](docs/manual-restoration.md)。
+
+**静态路径手动还原**
+
+![](screenshots/showcase/manual-restoration-static.png)
+
+需要更多人工推理，但中间产物保证不靠猜：`recovered/*.json` 记录了 lifter 抽到的 opcode 序列，`manifest.json.cacheTable` 把每个 `?.?` 都对回真实的 `(owner, name, desc)` —— 即便反编译器没把它们渲染出来。
+
 ---
 
 ## 技术栈

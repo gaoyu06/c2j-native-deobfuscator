@@ -14,6 +14,8 @@ not hand-edited.
 | `snake-static-progression.png`  | three stages of static recovery: stub fallback → tier-2 unverified → cache-table + receiver bind |
 | `dynamic-intermediates.png`     | the JVMTI dynamic path's intermediate files: `trace.jsonl` JNI-call records + the lifted `recovered/*.json` + pipeline diagram |
 | `board-static-vs-dynamic.png`   | same input (Board.java), the two paths side by side; coverage tradeoff visible |
+| `manual-restoration-dynamic.png` | 3-pane: dynamic auto-output → hand-cleaned → original. Workflow doc: [`docs/manual-restoration.md`](../docs/manual-restoration.md) |
+| `manual-restoration-static.png`  | 3-pane: static auto-output → hand-completed (using `recovered/*.json` + `manifest.cacheTable`) → original |
 | `decompiler-before.png`         | original IntelliJ screenshot of an obfuscated Kiritan class (`Dp`) before any recovery — all method bodies are `native` |
 
 ## Layout

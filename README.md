@@ -182,6 +182,26 @@ per-obfuscator pattern matching. The dynamic path requires running the
 target but produces near-pristine bytecode for any code path that
 actually executes during the trace.
 
+**Manual restoration · dynamic path**
+
+![](screenshots/showcase/manual-restoration-dynamic.png)
+
+What a 10–15 minute hand pass over the dynamic auto-output looks like:
+drop the SSA-slot `Object varN = null;` declarations, inline single-use
+temporaries, replace trace-baked constants with the symbolic form, and
+restore the branches the trace never executed. Workflow:
+[`docs/manual-restoration.md`](docs/manual-restoration.md).
+
+**Manual restoration · static path**
+
+![](screenshots/showcase/manual-restoration-static.png)
+
+Heavier human inference, but the intermediate artifacts keep it
+grounded: `recovered/*.json` records the opcode sequence the lifter
+extracted, and `manifest.json.cacheTable` resolves every `?.?` to a
+real `(owner, name, desc)` triple — even when the decompiler couldn't
+render them.
+
 ---
 
 ## Quick start
