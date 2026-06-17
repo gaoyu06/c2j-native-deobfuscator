@@ -7,16 +7,28 @@
 及其衍生工具（如 j2cc）—— 凡是把 JVM 字节码翻成 C++、再通过 JNI 从打包进
 JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 
-提供两条互补的恢复路径：
+提供三条互补的恢复路径：
 
 | 路径 | 输入 | 思路 |
 |---|---|---|
 | **动态** | 混淆后的 JAR + 一条可运行的命令 | 加载 JVMTI agent，观察 JNI 调用流，把它重新拼回 JVM 字节码 |
 | **静态** | 混淆后的 JAR + Ghidra | 在 native blob 里定位 JNI method table，逐函数反编译，把 pseudo-C 抬升回 JVM 字节码 |
+| **模拟** | 混淆后的 blob（不需运行、不需 Ghidra） | 用 CPU 模拟器 + mock JNI 直接跑 native 代码：恢复方法表、dump 解密后的常量、把方法当纯函数来调用 |
 
-任一路径都会输出一个干净的 `out.jar`：原先的 native 方法现在拥有真实的字节码方法体，loader / native blob 资源条目被剥离。
+动态/静态路径会输出一个干净的 `out.jar`：原先的 native 方法现在拥有真实的字节码方法体，loader / native blob 资源条目被剥离。模拟路径则负责挖出另外两条路看不到的"纯 C 秘密"（被内联的比较、`<clinit>` 字符串表），并给你一个可执行的 oracle。
 
 协议：**GPLv3**。
+
+---
+
+## ⭐ 最佳用法：用编码智能体来驱动
+
+**本项目的最佳用法是用您喜爱的编码智能体，加载随仓库附带的 skill
+（[`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md)）来完成工作。**
+
+本项目提供的是对所有类似工具（凡是"把 Java 转译成 C/C++ 再通过 JNI 回调"的混淆器家族）的**通杀思路 + 工具**，但这不可避免地需要对具体情况做出一定适配（读反编译、补每个方法依赖的状态、扩展 harness、加 profile）。如今的 AI 已经可以很好地胜任这一工作。
+
+所以，**请不要尝试手动单纯地执行现成的脚本**。在没有手工修复的情况下，本项目并不能达到惊艳的效果。把 skill 和目标交给智能体，让它把工具适配到具体的二进制上。
 
 ---
 
@@ -119,6 +131,26 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
   vs 共享 dispatch）、异常文案正则、if-guard 跳过规则等都来自一个
   `Profile`，由二进制扫描出来的探测器选定。
 
+### 模拟路径
+
+- **整 blob 模拟**（`py/native_emulate/`，`unicorn`）。把 native blob（PE 或
+  ELF）映射进 CPU 模拟器，在一套 **mock JNI 环境**（伪造的
+  `JNIEnv`/`JavaVM`，其 vtable 槽位回陷进 Python）下直接执行被混淆的函数。
+  因为它是真"跑"代码，所以能看到 JNI tracing 看不到的东西：被内联的比较
+  （那个从不调用 `String.equals` 的校验）、解密后的 `<clinit>` 字符串表，
+  以及藏在控制流平坦化 / MBA 后面的逻辑（模拟器只管跑字节，不去结构化它）。
+- **`recover`** — 模拟注册函数（或读 `Java_*` 导出 / `JNI_OnLoad`）并捕获
+  `RegisterNatives`，列出每个 native 方法的 `(name, sig, fnPtr)`。对
+  native-obfuscator 全自动；j2cc 需要 regc 地址（来自 `binary.json`）。
+- **`strings`** — 模拟一个方法并 dump 出它解密后的字符串常量（字母表、
+  密文、提示语）——也就是另外两条路只能留成下标访问的那张字符串表。
+- **`call`** — oracle：把恢复出的 native 方法当纯函数调用，喂输入、抓输出。
+  把"读一万行平坦化 MBA"变成"输入→输出"地探测。
+- **JNI ABI 由 JVM 规范钉死**（`GetArrayLength`=vtable index 171，
+  `RegisterNatives`=215，`ExceptionCheck`=228…），所以同一套引擎对整个家族
+  通用。后端：x86-64 PE/Win64 与 ELF/System-V。详见
+  [`docs/emulation-recovery.md`](docs/emulation-recovery.md)。
+
 ### 共用部分
 
 - **JSON 管线**。每个阶段的输入和输出都是 `schemas/` 下带版本号的 JSON
@@ -133,13 +165,13 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 
 两条路径输入相同，但在覆盖率和准确性上取舍不同：
 
-| | 动态 | 静态 |
-|---|---|---|
-| **适合的场景** | 二进制被加壳 / 虚拟机保护 / 反调试 —— JVMTI agent 工作在 Java 侧，native 层的保护不影响它的可见性。 | 二进制未经额外保护（例如直接 native-obfuscator + zig c++ 输出），Ghidra 能直接反编译每个 `fnAddr`。 |
-| **要求** | 一条可执行的命令（`java -jar ...`），并且能跑到目标类。 | 安装了 Ghidra 11.x。 |
-| **覆盖率** | 只覆盖实际被执行到的分支；从未被调用的方法完全采集不到。 | 通过 `RegisterNatives` 注册的所有方法，无论运行时是否被触发。 |
-| **准确性** | 高 —— 每条 opcode 都对应 JVM 实际观察到的 JNI 调用。 | best-effort —— 抬升器靠模式匹配，无法保持栈平衡时退化为 stub。 |
-| **耗时** | 受目标本身执行时长 + agent 开销限制。 | 受 Ghidra 自动分析限制（1 MB 量级的 blob 通常需要数分钟）。 |
+| | 动态 | 静态 | 模拟 |
+|---|---|---|---|
+| **适合的场景** | 二进制被加壳 / 虚拟机保护 / 反调试 —— JVMTI agent 工作在 Java 侧，native 层的保护不影响它的可见性。 | 二进制未经额外保护（例如直接 native-obfuscator + zig c++ 输出），Ghidra 能直接反编译每个 `fnAddr`。 | 逻辑被改写成纯 C（比较 / 加密 / 字符串表），或者 jar 跑不起来**且** Ghidra 结构化不了，或者你需要解密后的常量。 |
+| **要求** | 一条可执行的命令（`java -jar ...`），并且能跑到目标类。 | 安装了 Ghidra 11.x。 | 只要 blob + `pip install unicorn`。不需要 JVM，不需要 Ghidra。 |
+| **覆盖率** | 只覆盖实际被执行到的分支；从未被调用的方法完全采集不到。 | 通过 `RegisterNatives` 注册的所有方法，无论运行时是否被触发。 | 方法表 + 解密常量总能拿到；单个方法的行为通过 oracle 探测。 |
+| **准确性** | 高 —— 每条 opcode 都对应 JVM 实际观察到的 JNI 调用。 | best-effort —— 抬升器靠模式匹配，无法保持栈平衡时退化为 stub。 | 精确（它执行真实代码），但算法要你从 oracle 的输入/输出去逆 —— 它**不会**自动产出字节码。 |
+| **耗时** | 受目标本身执行时长 + agent 开销限制。 | 受 Ghidra 自动分析限制（1 MB 量级的 blob 通常需要数分钟）。 | 快 —— 无 Ghidra、无活 JVM。 |
 
 ---
 
@@ -180,6 +212,9 @@ cd py && uv sync --all-packages
 
 # Native agent（仅动态路径需要）
 cd native && JDK_HOME="$JAVA_HOME" bash build.sh
+
+# 模拟路径
+cd py && .venv/Scripts/python -m pip install unicorn   # 或用你的 venv 的 pip
 ```
 
 ### 动态恢复（首选，前提是目标在你环境里能跑）
@@ -219,6 +254,23 @@ python -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered
 python -m j2c_dumper_cli.main rebuild --input in.jar --recovered recovered/ \
     --manifest manifest.json -o out.jar
 ```
+
+### 模拟恢复（无需 JVM、无需 Ghidra —— 针对纯 C 改写的逻辑 / 解密常量）
+
+```bash
+# 列出 native 方法（入口自动发现）
+python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+
+# dump 某个函数解密后的字符串常量（字母表、密文、提示语）
+python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+
+# 把 native 方法当纯函数调用（oracle）
+python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+    --arg-bytes "input" --static "v=@alphabet.txt"
+```
+
+完整步骤见 [`docs/emulation-recovery.md`](docs/emulation-recovery.md)；命令参考
+与实测矩阵见 [`py/native_emulate/README.md`](py/native_emulate/README.md)。
 
 ### 分阶段执行
 
@@ -272,7 +324,9 @@ python -m ast_matcher.cli --list-flags
 │   ├── ast_matcher/            pseudo-C → JVM 字节码
 │   │   └── lifter/             driver + 各 feature 子模块
 │   ├── j2c_dumper_cli/         顶层 CLI 编排器
+│   ├── native_emulate/         模拟路径：j2c_emu.py（Unicorn + mock JNI）
 │   └── snippet_importer/       （可选）native-obfuscator cppsnippets 导入器
+├── .claude/skills/             j2c-deobfuscate skill（智能体使用手册）
 ├── docs/                       ARCHITECTURE.md、ROADMAP.md、profile 指南 …
 ├── schemas/                    每种 artifact 的 JSON Schema
 └── tests/                      端到端 fixture 与管线测试
@@ -283,9 +337,14 @@ python -m ast_matcher.cli --list-flags
 ## 文档
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — 模块边界、管线、artifact schema、扩展点
+- [emulation-recovery.md](docs/emulation-recovery.md) — 模拟路径使用指南
+  （命令参考见 [`py/native_emulate/README.md`](py/native_emulate/README.md)）
+- [manual-restoration.md](docs/manual-restoration.md) — 手工清理恢复产物
 - [ROADMAP.md](docs/ROADMAP.md) — 已知限制和计划工作
 - [adding-obfuscator-profile.md](docs/adding-obfuscator-profile.md) — 如何注册新混淆器变体
 - [static-reverse-approach.md](docs/static-reverse-approach.md) — 基于 Ghidra 的静态路径设计笔记
+- [`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md) —
+  智能体使用手册（加载到你的编码智能体里）
 
 ---
 

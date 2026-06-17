@@ -8,17 +8,38 @@ and its derivatives (e.g. j2cc) — anything that transpiles JVM bytecode
 to C++ then re-invokes Java through the JNI from a packaged
 `.dll` / `.so`.
 
-Two complementary recovery paths:
+Three complementary recovery paths:
 
 | Path | Input | Approach |
 |---|---|---|
 | **Dynamic** | obfuscated jar + a runnable command | Attach a JVMTI agent, observe the JNI call stream, lift it back to JVM bytecode |
 | **Static** | obfuscated jar + Ghidra | Locate the JNI method tables in the native blob, decompile each function, lift pseudo-C to JVM bytecode |
+| **Emulation** | obfuscated blob (no run, no Ghidra) | Run the native code under a CPU emulator + mock JNI; recover the method table, dump decrypted constants, and call methods as pure-function oracles |
 
-Either path emits a clean `out.jar` whose native methods now have
-real bytecode bodies and whose loader / native-blob entries are stripped.
+The dynamic/static paths emit a clean `out.jar` whose native methods now have
+real bytecode bodies and whose loader / native-blob entries are stripped. The
+emulation path recovers the C-only secrets the other two can't see (inlined
+comparisons, the `<clinit>` string tables) and gives you an executable oracle.
 
 License: **GPLv3**.
+
+---
+
+## ⭐ Recommended workflow: drive it with a coding agent
+
+**The best way to use this project is to load the bundled skill
+([`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md))
+into your favourite coding agent and let it do the work.**
+
+This project gives you a **universal approach + tooling** for the whole
+"transpile Java → C/C++ and call back via JNI" obfuscator family — but a
+universal approach unavoidably needs some adaptation to each specific target
+(reading a decompile, supplying per-method state, extending a harness, adding a
+profile). Today's AI agents handle exactly this kind of adaptation well.
+
+So **don't expect to just run the ready-made scripts by hand.** Without that
+human/agent fix-up step, the results will be partial — not impressive. Hand the
+agent the skill and the target, and let it adapt the tools to the binary.
 
 ---
 
@@ -77,6 +98,32 @@ License: **GPLv3**.
   skip rules all come from a :class:`Profile` selected by scanning the
   binary against built-in detectors.
 
+### Emulation path
+
+- **Whole-blob emulation** (`py/native_emulate/`, `unicorn`). Maps the
+  native blob (PE or ELF) into a CPU emulator and runs the obfuscated
+  functions directly, under a **mock JNI environment** — a fake
+  `JNIEnv`/`JavaVM` whose vtable slots trap back into Python. Because it
+  *executes* the C, it observes what JNI tracing cannot: inlined
+  comparisons (the check that never calls `String.equals`), the decrypted
+  `<clinit>` string tables, and logic hidden behind control-flow
+  flattening / MBA (the emulator runs the bytes; it doesn't try to
+  structure them).
+- **`recover`** — emulates the registrar (or reads `Java_*` exports /
+  `JNI_OnLoad`) and captures `RegisterNatives` to list every native
+  method `(name, sig, fnPtr)`. Fully automatic for native-obfuscator;
+  j2cc needs the regc address (from `binary.json`).
+- **`strings`** — emulates a method and dumps its decrypted string
+  constants (alphabets, secrets, messages) — the string table the other
+  two paths leave as indexed accesses.
+- **`call`** — oracle: invoke a recovered native method as a pure
+  function, feed inputs, capture outputs. Turns "read 10k lines of
+  flattened MBA" into input→output probing.
+- **JVM-fixed JNI ABI** is the foundation (`GetArrayLength` = vtable
+  index 171, `RegisterNatives` = 215, `ExceptionCheck` = 228, …), so the
+  same engine generalizes across the family. Backends: x86-64 PE/Win64
+  and ELF/System-V. See [`docs/emulation-recovery.md`](docs/emulation-recovery.md).
+
 ### Shared
 
 - **JSON pipeline**. Every stage's input + output is a versioned JSON
@@ -89,15 +136,15 @@ License: **GPLv3**.
 
 ## When to use which path
 
-Both paths target the same input but trade off coverage versus accuracy:
+All three target the same input but trade off coverage versus accuracy:
 
-| | Dynamic | Static |
-|---|---|---|
-| **Best fit** | Binary is packed / VM-protected / has anti-debug — the JVMTI agent sits at the Java side of the wall so the native protection layer doesn't matter. | Binary is unprotected (e.g. straight native-obfuscator + zig c++ output). Ghidra can decompile each `fnAddr` directly. |
-| **Requires** | A runnable command line (`java -jar ...`) that exercises the obfuscated classes. | Ghidra 11.x installed. |
-| **Coverage** | Only branches you actually run. Methods never invoked are missed entirely. | Every method registered through `RegisterNatives`, regardless of whether it's ever called. |
-| **Accuracy** | High — every emitted opcode corresponds to a real JNI call the JVM observed. | Best-effort — the lifter does pattern matching on decompiled C and falls back to stubs when stack-balance can't be maintained. |
-| **Speed** | Bounded by how long the target takes to exercise its code paths + agent overhead. | Bounded by Ghidra's auto-analysis (minutes for ~1 MB blobs). |
+| | Dynamic | Static | Emulation |
+|---|---|---|---|
+| **Best fit** | Binary is packed / VM-protected / has anti-debug — the JVMTI agent sits at the Java side of the wall so the native protection layer doesn't matter. | Binary is unprotected (e.g. straight native-obfuscator + zig c++ output). Ghidra can decompile each `fnAddr` directly. | Logic is rewritten to pure C (comparisons / crypto / string tables), or the jar won't run **and** Ghidra can't structure the code, or you need the decrypted constants. |
+| **Requires** | A runnable command line (`java -jar ...`) that exercises the obfuscated classes. | Ghidra 11.x installed. | Just the blob + `pip install unicorn`. No JVM, no Ghidra. |
+| **Coverage** | Only branches you actually run. | Every method registered through `RegisterNatives`. | Method list + decrypted constants always; per-method behaviour via the oracle. |
+| **Accuracy** | High — every opcode maps to an observed JNI call. | Best-effort — pattern matching on decompiled C, stubs on stack imbalance. | Exact (it executes the real code), but you reverse the algorithm from oracle I/O — it does **not** auto-emit bytecode. |
+| **Speed** | Target run time + agent overhead. | Ghidra auto-analysis (minutes for ~1 MB blobs). | Fast — no Ghidra, no live JVM. |
 
 ---
 
@@ -217,6 +264,9 @@ cd py && uv sync --all-packages
 
 # Native agent (only needed for the dynamic path)
 cd native && JDK_HOME="$JAVA_HOME" bash build.sh
+
+# Emulation path
+cd py && .venv/Scripts/python -m pip install unicorn   # or your venv's pip
 ```
 
 ### Dynamic recovery (preferred when the jar runs in your environment)
@@ -256,6 +306,23 @@ python -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered
 python -m j2c_dumper_cli.main rebuild --input in.jar --recovered recovered/ \
     --manifest manifest.json -o out.jar
 ```
+
+### Emulation recovery (no JVM, no Ghidra — for C-rewritten logic / decrypted constants)
+
+```bash
+# list native methods (entry points auto-discovered)
+python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+
+# dump a function's decrypted string constants (alphabet, secret, messages)
+python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+
+# call a native method as a pure function (oracle)
+python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+    --arg-bytes "input" --static "v=@alphabet.txt"
+```
+
+Full walkthrough: [`docs/emulation-recovery.md`](docs/emulation-recovery.md);
+command reference + verified matrix: [`py/native_emulate/README.md`](py/native_emulate/README.md).
 
 ### Stage-by-stage
 
@@ -310,7 +377,9 @@ python -m ast_matcher.cli --list-flags
 │   ├── ast_matcher/            pseudo-C → JVM bytecode
 │   │   └── lifter/             driver + per-feature submodules
 │   ├── j2c_dumper_cli/         top-level CLI orchestrator
+│   ├── native_emulate/         emulation path: j2c_emu.py (Unicorn + mock JNI)
 │   └── snippet_importer/       (optional) native-obfuscator cppsnippets ingestor
+├── .claude/skills/             j2c-deobfuscate skill (agent playbook)
 ├── docs/                       ARCHITECTURE.md, ROADMAP.md, profile guide, …
 ├── schemas/                    JSON Schema for every artifact
 └── tests/                      e2e fixtures and pipeline tests
@@ -322,11 +391,16 @@ python -m ast_matcher.cli --list-flags
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — module boundaries, pipeline,
   artifact schemas, extension points
+- [emulation-recovery.md](docs/emulation-recovery.md) — emulation path how-to
+  (+ command reference in [`py/native_emulate/README.md`](py/native_emulate/README.md))
+- [manual-restoration.md](docs/manual-restoration.md) — hand-cleaning recovered output
 - [ROADMAP.md](docs/ROADMAP.md) — known limitations and planned work
 - [adding-obfuscator-profile.md](docs/adding-obfuscator-profile.md) — how
   to register a new obfuscator variant
 - [static-reverse-approach.md](docs/static-reverse-approach.md) — design
   notes for the Ghidra-based path
+- [`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md) —
+  the agent playbook (load this into your coding agent)
 
 ---
 
