@@ -34,7 +34,7 @@ function Die($msg)  { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
 # Preconditions
 # ------------------------------------------------------------------
 if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
-    Die "java not found. Install a JDK 21+ (Temurin/Adoptium) and set JAVA_HOME, then re-run."
+    Die "java not found. Install a JDK 17+ (Temurin/Adoptium) and set JAVA_HOME, then re-run."
 }
 
 # ------------------------------------------------------------------
@@ -75,8 +75,11 @@ if (Get-Command uv -ErrorAction SilentlyContinue) {
 # ------------------------------------------------------------------
 # 3. Native JVMTI agent (dynamic path)
 # ------------------------------------------------------------------
+$nativeReady = $false
+$nativeNote = "the dynamic path was not set up"
 if ($SkipNative) {
     Warn "Skipping native agent build (-SkipNative). The dynamic path needs it."
+    $nativeNote = "native agent skipped (-SkipNative); the dynamic path is unavailable"
 } else {
     $jdkHome = if ($env:JDK_HOME) { $env:JDK_HOME } elseif ($env:JAVA_HOME) { $env:JAVA_HOME } else { "" }
     if (-not $jdkHome) {
@@ -84,32 +87,60 @@ if ($SkipNative) {
         $jdkHome = Split-Path -Parent (Split-Path -Parent $javaCmd)
     }
     $libDir = Join-Path $Root "native/build/lib"
-    $haveLib = (Test-Path (Join-Path $libDir "j2c_agent.dll")) -or `
-               (Test-Path (Join-Path $libDir "j2c_agent.so"))  -or `
-               (Test-Path (Join-Path $libDir "j2c_agent.dylib"))
+    # On Windows only j2c_agent.dll is loadable; a leftover .so/.dylib is a
+    # wrong-platform artifact and must not count as "already built".
+    $agent = Join-Path $libDir "j2c_agent.dll"
+    # Rebuild when the DLL is missing, empty, or older than any input.
+    $needsBuild = $true
+    if ((Test-Path $agent) -and ((Get-Item $agent).Length -gt 0)) {
+        $agentTime = (Get-Item $agent).LastWriteTimeUtc
+        $inputs = @()
+        $inputs += Get-ChildItem (Join-Path $Root "native/src") -File -ErrorAction SilentlyContinue
+        $inputs += Get-ChildItem (Join-Path $Root "native/include") -File -Recurse -ErrorAction SilentlyContinue
+        $buildScript = Join-Path $Root "native/build.sh"
+        if (Test-Path $buildScript) { $inputs += Get-Item $buildScript }
+        $newer = $inputs | Where-Object { $_.LastWriteTimeUtc -gt $agentTime }
+        if (-not $newer) { $needsBuild = $false }
+    }
     $hasZig = (Get-Command zig -ErrorAction SilentlyContinue) -or $env:ZIG
-    if ($haveLib -and -not $Force) {
-        Info "Native agent already built ($libDir); pass -Force to rebuild."
+    # The build is driven by native/build.sh, so a POSIX-style shell is required.
+    # Git Bash (from Git for Windows) runs it as a Windows toolchain and produces
+    # the Windows DLL. WSL runs it as Linux: it selects a Linux target and emits a
+    # .so, not the Windows .dll the JVM here loads, so it is NOT equivalent.
+    $hasBash = Get-Command bash -ErrorAction SilentlyContinue
+    if ((-not $needsBuild) -and (-not $Force)) {
+        Info "Native agent up to date ($agent); pass -Force to rebuild."
+        $nativeReady = $true
     } elseif (-not (Test-Path (Join-Path $jdkHome "include"))) {
         Warn "No JDK headers under '$jdkHome/include'; skipping native agent."
         Warn "Install a full JDK (not just a JRE), set JAVA_HOME, then re-run."
+        $nativeNote = "native agent skipped (no JDK headers); the dynamic path is unavailable"
     } elseif (-not $hasZig) {
         Warn "zig not found; skipping native agent (needed only for the dynamic path)."
         Warn "Install zig 0.16.x or set ZIG, then re-run. Emulation path needs no native build."
+        $nativeNote = "native agent skipped (zig not found); the dynamic path is unavailable"
+    } elseif (-not $hasBash) {
+        Warn "Git Bash not found; the native DLL build needs it (it runs native/build.sh)."
+        Warn "Install Git for Windows (provides Git Bash) so 'bash' is on PATH, then re-run."
+        Warn "Do NOT use WSL for this: WSL builds a Linux .so, not the Windows .dll the JVM here loads."
+        $nativeNote = "native agent skipped (Git Bash not found); the dynamic path is unavailable"
     } else {
         Info "Building native JVMTI agent (JDK_HOME=$jdkHome)"
-        if (-not (Get-Command bash -ErrorAction SilentlyContinue)) {
-            Warn "bash not found; run native/build.sh under Git Bash / WSL to build the agent."
-        } else {
-            Push-Location (Join-Path $Root "native")
-            try {
-                $env:JDK_HOME = $jdkHome
-                if (-not $env:ZIG) { $env:ZIG = "zig" }
-                bash build.sh
-                if ($LASTEXITCODE -ne 0) { Die "Native agent build failed. See the output above." }
-            } finally { Pop-Location }
-        }
+        Push-Location (Join-Path $Root "native")
+        try {
+            $env:JDK_HOME = $jdkHome
+            if (-not $env:ZIG) { $env:ZIG = "zig" }
+            bash build.sh
+            if ($LASTEXITCODE -ne 0) { Die "Native agent build failed. See the output above." }
+            $nativeReady = $true
+        } finally { Pop-Location }
     }
 }
 
-Info "Setup finished. Verify with: python -m j2c_dumper_cli doctor"
+if ($nativeReady) {
+    Info "Setup finished (default dynamic path ready). Verify with: python -m j2c_dumper_cli doctor"
+} else {
+    Warn "Setup finished, but $nativeNote."
+    Warn "Use the emulation fallback, or install the missing piece and re-run."
+    Info "Verify with: python -m j2c_dumper_cli doctor"
+}
