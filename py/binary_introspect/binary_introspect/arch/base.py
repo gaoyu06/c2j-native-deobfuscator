@@ -111,6 +111,28 @@ class Abi:
         operand = ins.operands[0]
         return operand.reg if operand.type == x86_const.X86_OP_REG else None
 
+    def register_move(self, ins: Any) -> tuple[int, int] | None:
+        """If ``ins`` copies one register straight into another
+        (``mov dst, src``), return ``(dst_reg, src_reg)``; otherwise
+        ``None``.
+
+        This lets the split-call detector follow a ``JNIEnv`` vtable slot
+        pointer through a veneer register before the indirect branch. GCC's
+        AArch64 tail-call sequence, for instance, loads the slot into a
+        general register and then ``mov x16, <reg>`` / ``br x16`` through the
+        IP0 intra-procedure-call scratch register. The register-operand kind
+        id is ``1`` in both capstone's ``x86`` and ``arm64`` namespaces, so
+        the default recognises the plain register-to-register move on either
+        architecture; loads (``mov reg, [mem]``) and immediates are excluded
+        because their source operand is not a register.
+        """
+        if ins.mnemonic != "mov" or len(ins.operands) != 2:
+            return None
+        dst, src = ins.operands
+        if dst.type != 1 or src.type != 1:
+            return None
+        return dst.reg, src.reg
+
     def decode_pc_relative_lea(self, ins: Any) -> int | None:
         """If ``ins`` is a "load effective address of a constant"
         (e.g. ``lea reg, [rip + disp32]`` on x86_64), return the

@@ -288,6 +288,14 @@ def _find_register_natives_calls(
                 register, displacement = loaded
                 loaded_slots[register] = (displacement, ins.address + ins.size)
                 continue
+            move = abi.register_move(ins)
+            if move is not None:
+                dst_reg, src_reg = move
+                if src_reg in loaded_slots:
+                    loaded_slots[dst_reg] = loaded_slots[src_reg]
+                else:
+                    loaded_slots.pop(dst_reg, None)
+                continue
             branch_register = abi.indirect_branch_register(ins)
             if branch_register is None:
                 continue
