@@ -1,9 +1,17 @@
 # nativex86 plugin ABI
 
-Version **0.1** — experimental, unstable, defined by
+Version **0.2** — experimental, unstable, defined by
 [`native-x86/include/nativex86/plugin.h`](../native-x86/include/nativex86/plugin.h).
 That header is normative; this document explains it and states the rules
 a header cannot express.
+
+Delta from 0.1 (a minor bump, backward compatible under the negotiation
+rules below): a generic `request_watch` callback appended to `nx86_host`,
+a `nx86_watch_request` record with its `NX86_MATCH_*` / `NX86_WATCH_*`
+constants, and a `phase` field on `nx86_event_call_site` (reusing the
+0.1 `reserved` tail word, so the struct size is unchanged and a 0.1
+record reads as `NX86_CALL_PHASE_NONE`). None of it introduces any
+Java / JNI / TLS vocabulary: a watched name is an opaque string.
 
 Scope and non-goals of the module that uses this ABI:
 [native-x86-module.md](native-x86-module.md).
@@ -37,8 +45,8 @@ therefore restricted to what is stable across toolchains:
 
 ```c
 #define NX86_ABI_VERSION_MAJOR 0u
-#define NX86_ABI_VERSION_MINOR 1u
-#define NX86_ABI_VERSION  NX86_MAKE_VERSION(0u, 1u)   /* 0x00000001 */
+#define NX86_ABI_VERSION_MINOR 2u
+#define NX86_ABI_VERSION  NX86_MAKE_VERSION(0u, 2u)   /* 0x00000002 */
 
 #define NX86_VERSION_MAJOR(v) ((uint32_t)(v) >> 16)
 #define NX86_VERSION_MINOR(v) ((uint32_t)(v) & 0xFFFFu)
@@ -170,9 +178,16 @@ ordinal, 0 when unknown).
 ### `NX86_EVENT_CALL_SITE` (5)
 
 `nx86_event_call_site` — `module_name`, `target_name` (may be empty),
-`site_address` (the call instruction), `target_address` (0 when
-unresolved), `module_base`, `site_kind` (`NX86_CALL_SITE_DIRECT` /
-`INDIRECT` / `THUNK` / `UNKNOWN`).
+`site_address` (the call instruction, or the caller-side return address
+for a live entry/return), `target_address` (0 when unresolved),
+`module_base`, `site_kind` (`NX86_CALL_SITE_DIRECT` / `INDIRECT` /
+`THUNK` / `UNKNOWN`), and `phase` (ABI 0.2): `NX86_CALL_PHASE_NONE` (0)
+for a structural record recovered from an image, `NX86_CALL_PHASE_ENTER`
+(1) when control reached the callee, `NX86_CALL_PHASE_RETURN` (2) when it
+returned. `phase` occupies the word that was `reserved` in 0.1, so the
+record size is unchanged and a 0.1 producer's zero reads as `NONE`. A
+phase is one bit of control-flow position; it never carries a return
+value, an argument, or a buffer.
 
 ### What events may not carry
 
@@ -201,6 +216,8 @@ typedef struct nx86_host {
     nx86_status (*unregister_observer)(void *host_ctx, uint32_t token);
     nx86_status (*emit)(void *host_ctx, const nx86_event_header *event);
     void        (*log)(void *host_ctx, uint32_t level, const char *message);
+    nx86_status (*request_watch)(void *host_ctx,          /* ABI 0.2 */
+                                 const nx86_watch_request *req);
 } nx86_host;
 ```
 
@@ -223,6 +240,40 @@ typedef struct nx86_host {
   `NX86_ERR_INVALID_ARG` above that; any host must document its own cap.
 - **`log`** — free-form diagnostics with a NUL-terminated message. Not
   an event: it never reaches observers.
+- **`request_watch`** (ABI 0.2) — register interest in an exported
+  function by exact name or prefix. When the host later observes a
+  module whose exports match, it reports a `symbol` and/or `call-site`
+  record per the request's flags. The host copies what it needs and
+  returns; the caller keeps ownership of the request and its name.
+  Intended to be called from `start`. A host with no observation source
+  may accept the request and never match it; a host that honours no
+  watches at all returns `NX86_ERR_UNSUPPORTED`. Absent on a pre-0.2
+  host — a plugin checks `NX86_HAS_FIELD(host->struct_size, nx86_host,
+  request_watch)` before calling and stays passive if it is missing.
+
+### Watch requests (ABI 0.2)
+
+```c
+#define NX86_MATCH_EXACT     1u  /* whole name equals `name`  */
+#define NX86_MATCH_PREFIX    2u  /* name begins with `name`    */
+#define NX86_WATCH_SYMBOL    0x1u /* report a symbol when it resolves     */
+#define NX86_WATCH_CALL_SITE 0x2u /* report call-site enter/return, live  */
+
+typedef struct nx86_watch_request {
+    uint32_t struct_size;
+    uint32_t match_kind; /* NX86_MATCH_*  */
+    nx86_str name;       /* symbol name or prefix; borrowed for the call */
+    uint32_t flags;      /* NX86_WATCH_* bitmask */
+    uint32_t reserved;   /* must be 0 */
+} nx86_watch_request;
+```
+
+The host treats `name` as an opaque string. `"SSL_write"`, `"Java_"` and
+`"RegisterNatives"` are ordinary export names to it, with no TLS, Java or
+JNI meaning; that meaning belongs to the plugin that asked. A watch only
+selects which structural records the host reports — it never widens what
+a record may carry, and there is no watch that asks for argument values,
+buffer contents or return data.
 
 ### Observer callback
 
@@ -367,6 +418,9 @@ For a host:
 - [ ] Copy plugin-emitted records before dispatch; never mutate the
       caller's buffer.
 - [ ] Document the maximum size accepted by `emit`.
+- [ ] If it honours `request_watch`, treat the watched `name` as an
+      opaque string and never read argument or return data on its behalf;
+      otherwise return `NX86_ERR_UNSUPPORTED`.
 
 For a plugin:
 
@@ -376,4 +430,7 @@ For a plugin:
       and store the bytes written into `struct_size`.
 - [ ] Check `struct_size` before casting an event to a concrete type.
 - [ ] Copy any borrowed text you keep past the callback.
+- [ ] Before calling `request_watch`, confirm the host carries it with
+      `NX86_HAS_FIELD(host->struct_size, nx86_host, request_watch)`; stay
+      passive on an older host.
 - [ ] Unregister in `stop` and release state in `shutdown`.

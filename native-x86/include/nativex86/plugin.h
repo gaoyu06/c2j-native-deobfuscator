@@ -27,7 +27,7 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 
 #define NX86_ABI_VERSION_MAJOR 0u
-#define NX86_ABI_VERSION_MINOR 1u
+#define NX86_ABI_VERSION_MINOR 2u
 
 #define NX86_MAKE_VERSION(major, minor) \
     ((uint32_t)(((uint32_t)(major) << 16) | ((uint32_t)(minor) & 0xFFFFu)))
@@ -124,6 +124,17 @@ typedef struct nx86_str {
 #define NX86_CALL_SITE_INDIRECT 2u  /* call [reg], call [rip+disp] */
 #define NX86_CALL_SITE_THUNK    3u  /* import thunk / PLT entry */
 
+/*
+ * When a call site was observed at runtime, this says at which point it
+ * was seen. Added in ABI 0.2; the `phase` field of nx86_event_call_site
+ * is zero (NONE) for a purely structural record recovered from an image
+ * rather than a live process. A phase never carries a return value, an
+ * argument, or any buffer: it is one bit of control-flow position.
+ */
+#define NX86_CALL_PHASE_NONE   0u  /* structural record; not observed live */
+#define NX86_CALL_PHASE_ENTER  1u  /* control reached the callee's entry */
+#define NX86_CALL_PHASE_RETURN 2u  /* control returned to the caller */
+
 /* ------------------------------------------------------------------ */
 /* Events                                                              */
 /* ------------------------------------------------------------------ */
@@ -201,8 +212,46 @@ typedef struct nx86_event_call_site {
     uint64_t          target_address; /* 0 when unresolved */
     uint64_t          module_base;
     uint32_t          site_kind;      /* NX86_CALL_SITE_* */
-    uint32_t          reserved;
+    uint32_t          phase;          /* NX86_CALL_PHASE_* (ABI 0.2+) */
 } nx86_event_call_site;
+
+/* ------------------------------------------------------------------ */
+/* Watch requests (ABI 0.2+)                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * How a watch name is matched against an observed export.
+ */
+#define NX86_MATCH_EXACT  1u  /* whole symbol name equals `name` */
+#define NX86_MATCH_PREFIX 2u  /* symbol name begins with `name`  */
+
+/*
+ * What the host should report for a matched export. Bits may be OR'd.
+ */
+#define NX86_WATCH_SYMBOL    0x1u /* emit a symbol event when it resolves */
+#define NX86_WATCH_CALL_SITE 0x2u /* emit call-site events on live entry/return */
+
+/*
+ * A plugin's declared interest in an exported function, by name.
+ *
+ * The host treats `name` as an opaque string: "SSL_write", "Java_" and
+ * "RegisterNatives" are ordinary exported-symbol names to it, with no
+ * TLS, Java or JNI meaning attached. Any such meaning is the plugin's,
+ * derived on its own side of this boundary. `name` is borrowed for the
+ * duration of the request_watch call; the host copies what it keeps.
+ *
+ * A watch never asks for, and the host never provides, argument values,
+ * return values or buffer contents. It selects which structural records
+ * (symbol, call-site) the host reports; it does not widen what a record
+ * may carry.
+ */
+typedef struct nx86_watch_request {
+    uint32_t struct_size;
+    uint32_t match_kind; /* NX86_MATCH_* */
+    nx86_str name;       /* symbol name or prefix */
+    uint32_t flags;      /* NX86_WATCH_* bitmask */
+    uint32_t reserved;   /* must be 0 in ABI 0.2 */
+} nx86_watch_request;
 
 /* ------------------------------------------------------------------ */
 /* Host interface                                                      */
@@ -246,6 +295,19 @@ typedef struct nx86_host {
     void (NX86_CALL *log)(void *host_ctx,
                           uint32_t level,
                           const char *message);
+
+    /* Register interest in an exported symbol by exact name or prefix
+     * (ABI 0.2+). When the host later observes a module whose exports
+     * match, it reports a symbol and/or call-site record per
+     * `req->flags`. The host copies what it needs and returns; the
+     * caller keeps ownership of `req` and its `name`. Intended to be
+     * called from a plugin's `start`; a host with no observation source
+     * may accept the request and simply never match it. Returns
+     * NX86_ERR_INVALID_ARG for a null or malformed request,
+     * NX86_ERR_NO_MEMORY when a fixed watch table is full, and
+     * NX86_ERR_UNSUPPORTED when the host honours no watches at all. */
+    nx86_status (NX86_CALL *request_watch)(void *host_ctx,
+                                           const nx86_watch_request *req);
 } nx86_host;
 
 /* ------------------------------------------------------------------ */
