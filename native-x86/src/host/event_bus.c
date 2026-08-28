@@ -125,6 +125,18 @@ nx86_status nx86_bus_republish(nx86_event_bus *bus,
         event->struct_size > (uint32_t)NX86_HOST_MAX_EVENT_SIZE) {
         return NX86_ERR_INVALID_ARG;
     }
+    /* A note is host/status text only. Reject one whose text field is too
+     * large to be a status string: note.text is not a channel for moving
+     * buffer contents past the metadata-only record model. The check is a
+     * single length comparison and only applies to notes big enough to
+     * carry the field. */
+    if (event->kind == NX86_EVENT_NOTE &&
+        event->struct_size >= (uint32_t)sizeof(nx86_event_note)) {
+        const nx86_event_note *note = (const nx86_event_note *)event;
+        if (note->text.len > NX86_NOTE_TEXT_MAX) {
+            return NX86_ERR_INVALID_ARG;
+        }
+    }
     if (bus->accepting == 0u) {
         /* Reject before copying so shutdown-time emits reach no observer. */
         return NX86_ERR_LIFECYCLE;

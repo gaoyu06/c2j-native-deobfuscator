@@ -165,12 +165,19 @@ typedef struct nx86_event_header {
     uint32_t        thread_id;     /* observed thread, 0 if not tracked */
 } nx86_event_header;
 
+/*
+ * A short, human-readable diagnostic or status message. `text` is
+ * host/status text only: a note is not a data channel and must never be
+ * used to smuggle argument bytes, buffer contents, keys or any other
+ * program data past the metadata-only record model. A host may reject a
+ * note whose `text` is too long to be a status string.
+ */
 typedef struct nx86_event_note {
     nx86_event_header header;
     uint32_t          level;       /* NX86_LOG_* */
     uint32_t          reserved;
     nx86_str          source;      /* emitting component id */
-    nx86_str          text;
+    nx86_str          text;        /* status text only, not a data channel */
 } nx86_event_note;
 
 typedef struct nx86_event_module_load {

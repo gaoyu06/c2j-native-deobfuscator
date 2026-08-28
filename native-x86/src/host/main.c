@@ -25,6 +25,8 @@
 #include "observe.h"
 #include "platform.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -349,7 +351,8 @@ static void usage(const char *argv0)
     printf("metadata-only records for the exports the plugins watch.\n");
     printf("\n");
     printf("Options:\n");
-    printf("  --pid N                observe process N (must be the same user)\n");
+    printf("  --pid N                observe process N (a positive integer,\n");
+    printf("                         owned by the same user)\n");
     printf("  --i-own-this-process   required to attach; you assert you own N\n");
     printf("                         and are authorized to inspect it\n");
     printf("  --no-live              read-only pass only (no breakpoints)\n");
@@ -360,6 +363,37 @@ static void usage(const char *argv0)
     printf("Records describe program structure only: module bases, symbol\n");
     printf("names and addresses, and control-flow edges. No argument bytes,\n");
     printf("buffer contents, keys or return values are read or reported.\n");
+}
+
+/* Parse a --pid argument as a strict, positive process id. The whole
+ * argument must be a base-10 integer with no leading sign, no trailing
+ * text, and a value in [1, INT_MAX]. Returns 0 and writes *out on
+ * success, -1 otherwise. "0", "-1", "12x" and "" all fail: a live pid is
+ * always a positive integer, and an unparseable --pid must be an error,
+ * never a silent fall-through to the synthetic (no-target) mode. */
+static int parse_positive_pid(const char *s, long *out)
+{
+    char *end = NULL;
+    long value;
+
+    if (s == NULL || s[0] == '\0') {
+        return -1;
+    }
+    /* Reject a leading sign or space outright so "-1" and "+7" never pass;
+     * strtol would otherwise accept them. */
+    if (s[0] < '1' || s[0] > '9') {
+        return -1;
+    }
+    errno = 0;
+    value = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') {
+        return -1;
+    }
+    if (value <= 0 || value > (long)INT_MAX) {
+        return -1;
+    }
+    *out = value;
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -373,7 +407,8 @@ int main(int argc, char **argv)
     uint32_t sink_token = 0u;
     nx86_status status;
     int i;
-    long pid = -1;
+    long pid = 0;
+    int pid_set = 0;
     int own_confirmed = 0;
     int no_live = 0;
     uint32_t max_events = 16u;
@@ -386,7 +421,13 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 0;
         } else if (strcmp(a, "--pid") == 0 && i + 1 < argc) {
-            pid = strtol(argv[++i], NULL, 10);
+            if (parse_positive_pid(argv[++i], &pid) != 0) {
+                fprintf(stderr,
+                        "host: --pid must be a positive integer (got '%s')\n",
+                        argv[i]);
+                return 2;
+            }
+            pid_set = 1;
         } else if (strcmp(a, "--i-own-this-process") == 0) {
             own_confirmed = 1;
         } else if (strcmp(a, "--no-live") == 0) {
@@ -436,7 +477,7 @@ int main(int argc, char **argv)
     }
 
     /* Gate attachment before loading anything if the CLI is inconsistent. */
-    if (pid >= 0) {
+    if (pid_set) {
         uint32_t owner_uid = 0u;
         int owned;
         if (!own_confirmed) {
@@ -487,7 +528,7 @@ int main(int argc, char **argv)
         plugins[i].started = 1;
     }
 
-    if (pid >= 0) {
+    if (pid_set) {
         nx86_observe_config cfg;
         memset(&cfg, 0, sizeof(cfg));
         cfg.pid = (uint32_t)pid;
@@ -500,8 +541,14 @@ int main(int argc, char **argv)
         status = nx86_observe_run(&state.bus, &cfg, state.watches,
                                   state.n_watches, host_log_level);
         if (status != NX86_OK) {
+            /* A non-OK status means the live pass could not complete
+             * cleanly: attach or inspection failed, or a breakpoint or the
+             * attachment may still be active. Never report success in that
+             * case — fail the command so the exit code is non-zero and the
+             * closing line reads "shutdown with errors". */
             fprintf(stderr, "host: observation ended with status %d\n",
                     (int)status);
+            rc = 1;
         }
     } else {
         publish_sample_records(&state);

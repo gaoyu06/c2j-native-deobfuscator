@@ -197,6 +197,148 @@ fi
 cleanup_fixture
 trap - EXIT
 
+echo "-- 4. attach-refusal fallback (must run the read-only pass, exit 0)"
+# Force the attach step to behave as refused so this runs the same way
+# regardless of whether ptrace is permitted in this environment.
+PIDFILE4="$(mktemp)"
+FXPID4=""
+cleanup_fixture4() {
+    [ -n "$FXPID4" ] && kill -9 "$FXPID4" >/dev/null 2>&1 || true
+    rm -f "$PIDFILE4" >/dev/null 2>&1 || true
+}
+trap cleanup_fixture4 EXIT
+LD_LIBRARY_PATH="$FIXTURE_LIBDIR:${LD_LIBRARY_PATH:-}" "$FIXTURE_BIN" "$PIDFILE4" &
+FXPID4=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$PIDFILE4" ] && break
+    sleep 0.2
+done
+TARGET_PID4="$(cat "$PIDFILE4" 2>/dev/null || true)"
+if [ -z "$TARGET_PID4" ]; then
+    echo "FAIL: fixture process (refusal test) did not report a pid"
+    FAILED=1
+else
+    set +e
+    REFUSE_OBS="$(NX86_TEST_INJECT=attach-refused "$HOST_BIN" \
+        --pid "$TARGET_PID4" --i-own-this-process \
+        "$OPENSSL_LIB" "$JNI_LIB" 2>&1)"
+    REFUSE_RC=$?
+    set -e
+    echo "$REFUSE_OBS"
+    # Refusal must not fail the command when the documented fallback runs.
+    if [ "$REFUSE_RC" != "0" ]; then
+        echo "FAIL: attach-refusal fallback exited non-zero ($REFUSE_RC)"
+        FAILED=1
+    fi
+    # The honest fallback message and the read-only records must appear.
+    if ! grep -qiE 'attach was refused' <<<"$REFUSE_OBS"; then
+        echo "FAIL: attach-refusal did not report the refusal honestly"
+        FAILED=1
+    fi
+    if ! grep -qF "read-only" <<<"$REFUSE_OBS"; then
+        echo "FAIL: attach-refusal did not name the read-only fallback"
+        FAILED=1
+    fi
+    for expected in \
+        "kind=module-load" \
+        "symbol=SSL_write" \
+        "Java_com_example_Demo_ping"
+    do
+        if ! grep -qF "$expected" <<<"$REFUSE_OBS"; then
+            echo "FAIL: read-only fallback missing: $expected"
+            FAILED=1
+        fi
+    done
+    # A read-only pass places no breakpoints, so no live phases appear.
+    if grep -qF "phase=enter" <<<"$REFUSE_OBS"; then
+        echo "FAIL: read-only fallback should not report live entry phases"
+        FAILED=1
+    fi
+    # Fallback did real work, so the run is a clean success.
+    if ! grep -qF "host: shutdown ok" <<<"$REFUSE_OBS"; then
+        echo "FAIL: attach-refusal fallback did not shut down cleanly"
+        FAILED=1
+    fi
+fi
+cleanup_fixture4
+trap - EXIT
+
+echo "-- 5. strict --pid parsing (a bad --pid must error, never fall back)"
+for bad in "-1" "0" "12x" "abc" ""; do
+    set +e
+    BAD_OUT="$("$HOST_BIN" --pid "$bad" --i-own-this-process "$HELLO_LIB" 2>&1)"
+    BAD_RC=$?
+    set -e
+    if [ "$BAD_RC" = "0" ]; then
+        echo "FAIL: --pid '$bad' was accepted (exit 0) instead of rejected"
+        echo "$BAD_OUT"
+        FAILED=1
+    fi
+    # A rejected --pid must NOT silently run the synthetic (no-target) mode.
+    if grep -qF "host: shutdown ok" <<<"$BAD_OUT"; then
+        echo "FAIL: --pid '$bad' fell through to synthetic mode"
+        FAILED=1
+    fi
+done
+# A well-formed --pid must still be accepted (parse layer only).
+set +e
+GOOD_OUT="$("$HOST_BIN" --pid 999999 --i-own-this-process "$HELLO_LIB" 2>&1)"
+GOOD_RC=$?
+set -e
+if grep -qF "must be a positive integer" <<<"$GOOD_OUT"; then
+    echo "FAIL: a valid --pid was rejected by the parser"
+    FAILED=1
+fi
+echo "PASS: bad --pid values are rejected; a valid one parses"
+
+echo "-- 6. detach failure must fail the command (never report success)"
+# Only meaningful where the live path actually attaches; skip honestly
+# otherwise. Forces the final detach to be treated as failed.
+PIDFILE6="$(mktemp)"
+FXPID6=""
+cleanup_fixture6() {
+    [ -n "$FXPID6" ] && kill -9 "$FXPID6" >/dev/null 2>&1 || true
+    rm -f "$PIDFILE6" >/dev/null 2>&1 || true
+}
+trap cleanup_fixture6 EXIT
+LD_LIBRARY_PATH="$FIXTURE_LIBDIR:${LD_LIBRARY_PATH:-}" "$FIXTURE_BIN" "$PIDFILE6" &
+FXPID6=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$PIDFILE6" ] && break
+    sleep 0.2
+done
+TARGET_PID6="$(cat "$PIDFILE6" 2>/dev/null || true)"
+if [ -z "$TARGET_PID6" ]; then
+    echo "FAIL: fixture process (detach test) did not report a pid"
+    FAILED=1
+else
+    set +e
+    DETACH_OBS="$(NX86_TEST_INJECT=detach-fail "$HOST_BIN" \
+        --pid "$TARGET_PID6" --i-own-this-process \
+        --max-events 4 --max-seconds 10 \
+        "$OPENSSL_LIB" "$JNI_LIB" 2>&1)"
+    DETACH_RC=$?
+    set -e
+    echo "$DETACH_OBS"
+    if grep -qF "phase=enter" <<<"$DETACH_OBS"; then
+        # Live path ran and reached detach: the injected failure must fail
+        # the command and must not print a clean "shutdown ok".
+        if [ "$DETACH_RC" = "0" ]; then
+            echo "FAIL: detach failure did not fail the command (exit 0)"
+            FAILED=1
+        fi
+        if grep -qF "host: shutdown ok" <<<"$DETACH_OBS"; then
+            echo "FAIL: detach failure still reported 'shutdown ok'"
+            FAILED=1
+        fi
+        echo "PASS: detach failure fails the command"
+    else
+        echo "NOTE: live path did not attach here; detach-failure check skipped."
+    fi
+fi
+cleanup_fixture6
+trap - EXIT
+
 if [ "$FAILED" != "0" ]; then
     echo "SMOKE TEST: FAIL"
     exit 1

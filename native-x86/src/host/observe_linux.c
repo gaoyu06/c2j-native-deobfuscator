@@ -18,11 +18,16 @@
  *
  * The only target memory this file ever reads is instruction words (to
  * place/restore breakpoints) and the return address at the top of the
- * stack. It never reads argument registers, buffers, return values or
- * keys, and it never modifies program logic: a breakpoint is inserted,
- * observed, and removed, leaving the executed code byte-for-byte as it
- * was. There is no vocabulary here for TLS, Java or JNI: watched names
- * are opaque strings.
+ * stack. From the register file it reads exactly two registers, one word
+ * at a time via PTRACE_PEEKUSER: the instruction pointer (RIP, to learn
+ * which breakpoint was hit) and the stack pointer (RSP, to locate the
+ * return address). It never reads the argument registers (rdi, rsi, rdx,
+ * rcx, r8, r9), the return-value register (rax) or any other register,
+ * and it never copies the whole register file into host memory. It never
+ * reads buffers, return values or keys, and it never modifies program
+ * logic: a breakpoint is inserted, observed, and removed, leaving the
+ * executed code byte-for-byte as it was. There is no vocabulary here for
+ * TLS, Java or JNI: watched names are opaque strings.
  */
 #if defined(__linux__)
 
@@ -585,6 +590,48 @@ static int poke_word(pid_t pid, unsigned long addr, long value)
     return (int)ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)value);
 }
 
+/* Offsets, within the ptrace USER area, of the only two registers this
+ * engine ever reads: the instruction pointer and the stack pointer.
+ * Reading them one word at a time with PTRACE_PEEKUSER keeps the argument
+ * registers (rdi/rsi/rdx/rcx/r8/r9) and the return-value register (rax)
+ * out of the host's address space entirely — the whole register file is
+ * never fetched. */
+#define NX86_OFF_RIP offsetof(struct user_regs_struct, rip)
+#define NX86_OFF_RSP offsetof(struct user_regs_struct, rsp)
+
+/* Read one register word from the USER area at `off`. Sets errno to 0
+ * before the call so the caller can distinguish a genuine -1 value from a
+ * failed read. */
+static long peek_user(pid_t pid, size_t off)
+{
+    errno = 0;
+    return ptrace(PTRACE_PEEKUSER, pid, (void *)off, (void *)0);
+}
+
+/* Write one register word to the USER area at `off`. Used only to rewind
+ * RIP over a restored breakpoint; no other register is ever written. */
+static int poke_user(pid_t pid, size_t off, unsigned long value)
+{
+    return (int)ptrace(PTRACE_POKEUSER, pid, (void *)off, (void *)value);
+}
+
+/*
+ * Test-only fault injection. The smoke test sets NX86_TEST_INJECT to a
+ * comma/space-separated list of fault names so it can exercise the
+ * refusal and cleanup-failure paths deterministically, without needing a
+ * sandbox that actually blocks ptrace. When the variable is unset (every
+ * production run) this always returns 0 and changes nothing.
+ *
+ *   attach-refused  - behave as if PTRACE_ATTACH was refused
+ *   detach-fail     - skip the final detach so the attachment is treated
+ *                     as possibly still active (must fail the command)
+ */
+static int test_inject(const char *what)
+{
+    const char *v = getenv("NX86_TEST_INJECT");
+    return (v != NULL && strstr(v, what) != NULL);
+}
+
 /* Insert INT3, saving the original low byte into *saved. */
 static int bp_insert(pid_t pid, unsigned long addr, unsigned char *saved)
 {
@@ -673,6 +720,61 @@ static int find_return_bp(const return_bp *rbs, int n, uint64_t addr)
     return -1;
 }
 
+/*
+ * Remove every breakpoint we placed and detach, restoring the target's
+ * code byte-for-byte. Returns 0 when the target is provably clean
+ * afterwards (every restore and the detach succeeded, or failed only
+ * because the target had already exited), and non-zero when a breakpoint
+ * byte or the ptrace attachment may still be active — a condition the
+ * caller must surface as a command failure rather than report as success.
+ *
+ * A ptrace op that fails with ESRCH means the tracee is already gone, so
+ * nothing it once held can still be active; that is treated as clean.
+ */
+static int remove_breakpoints_and_detach(pid_t pid,
+                                         breakpoint *bps, int n_bps,
+                                         return_bp *rbs, int n_rbs)
+{
+    int leaked = 0;
+    int i;
+
+    for (i = 0; i < n_bps; ++i) {
+        if (!bps[i].armed) {
+            continue;
+        }
+        if (bp_restore(pid, (unsigned long)bps[i].address, bps[i].saved) != 0 &&
+            errno != ESRCH) {
+            leaked = 1;
+        } else {
+            bps[i].armed = 0;
+        }
+    }
+    for (i = 0; i < n_rbs; ++i) {
+        if (!rbs[i].active) {
+            continue;
+        }
+        if (bp_restore(pid, (unsigned long)rbs[i].address, rbs[i].saved) != 0 &&
+            errno != ESRCH) {
+            leaked = 1;
+        } else {
+            rbs[i].active = 0;
+        }
+    }
+    /* Test seam: pretend the detach failed so the caller must fail the
+     * command. Skipping the real detach leaves the tracee stopped and
+     * traced, which is exactly the "attachment may still be active" state
+     * this path must never hide; the kernel releases it when the host
+     * exits. */
+    if (test_inject("detach-fail")) {
+        return 1;
+    }
+    if (ptrace(PTRACE_DETACH, pid, (void *)0, (void *)0) != 0 &&
+        errno != ESRCH) {
+        leaked = 1;
+    }
+    return leaked;
+}
+
 static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                            const nx86_watch_entry *watches, uint32_t n_watches,
                            void (*log_fn)(uint32_t, const char *))
@@ -683,6 +785,7 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
     int n_bps = 0, n_rbs = 0, i;
     int st;
     int target_alive = 1;
+    nx86_status run_status = NX86_OK;
     uint32_t call_events = 0;
     struct sigaction sa, old_sa;
 
@@ -694,17 +797,31 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
         return NX86_ERR_NO_MEMORY;
     }
 
-    if (ptrace(PTRACE_ATTACH, pid, (void *)0, (void *)0) != 0) {
-        emit_note(bus, cfg->pid, NX86_LOG_ERROR,
-                  "ptrace attach was refused; live observation unavailable");
+    if (test_inject("attach-refused") ||
+        ptrace(PTRACE_ATTACH, pid, (void *)0, (void *)0) != 0) {
+        int refused_errno = test_inject("attach-refused") ? EPERM : errno;
+        nx86_status fb;
+        emit_note(bus, cfg->pid, NX86_LOG_WARN,
+                  "ptrace attach was refused; falling back to the read-only "
+                  "module/symbol pass (no breakpoints)");
         if (log_fn != NULL) {
-            log_fn(NX86_LOG_ERROR, strerror(errno));
+            log_fn(NX86_LOG_WARN, strerror(refused_errno));
         }
         free(bps);
         free(rbs);
-        return NX86_ERR_UNSUPPORTED;
+        /* Documented fallback: no ptrace, no breakpoints, no attachment —
+         * enumerate modules and resolve watched exports from disk instead
+         * of pretending the target was empty. */
+        fb = (scan_all_modules(bus, cfg->pid, watches, n_watches,
+                               NULL, NULL, 0, log_fn) == 0)
+                 ? NX86_OK
+                 : NX86_ERR_UNSUPPORTED;
+        return fb;
     }
     if (waitpid(pid, &st, 0) < 0) {
+        /* Attached but never saw the initial stop. Detach best-effort and
+         * fail: the attachment may still be active. */
+        (void)ptrace(PTRACE_DETACH, pid, (void *)0, (void *)0);
         free(bps);
         free(rbs);
         return NX86_ERR_INTERNAL;
@@ -723,13 +840,14 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
     }
 
     if (n_bps == 0) {
+        int leaked;
         emit_note(bus, cfg->pid, NX86_LOG_INFO,
                   "no watched export resolved in the target; "
                   "detaching after the module/symbol pass");
-        (void)ptrace(PTRACE_DETACH, pid, (void *)0, (void *)0);
+        leaked = remove_breakpoints_and_detach(pid, bps, 0, rbs, 0);
         free(bps);
         free(rbs);
-        return NX86_OK;
+        return leaked ? NX86_ERR_INTERNAL : NX86_OK;
     }
 
     g_alarm_fired = 0;
@@ -751,6 +869,11 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                 /* Safety budget elapsed: stop the tracee so we can detach. */
                 kill(pid, SIGSTOP);
                 if (waitpid(pid, &st, 0) < 0) {
+                    if (errno == ESRCH) {
+                        target_alive = 0;
+                    } else {
+                        run_status = NX86_ERR_INTERNAL;
+                    }
                     break;
                 }
                 emit_note(bus, cfg->pid, NX86_LOG_INFO,
@@ -759,6 +882,11 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
             }
             if (errno == EINTR) {
                 continue;
+            }
+            if (errno != ESRCH) {
+                run_status = NX86_ERR_INTERNAL;
+            } else {
+                target_alive = 0;
             }
             break;
         }
@@ -779,30 +907,52 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
         }
 
         {
-            struct user_regs_struct regs;
+            unsigned long rip;
+            unsigned long rsp;
             uint64_t hit_addr;
             int ei, ri;
-            if (ptrace(PTRACE_GETREGS, pid, (void *)0, &regs) != 0) {
+            /* Read only RIP — one register word — to learn which
+             * breakpoint was hit. The argument and return-value registers
+             * are never fetched. */
+            rip = (unsigned long)peek_user(pid, NX86_OFF_RIP);
+            if (errno != 0) {
+                if (errno == ESRCH) {
+                    target_alive = 0;
+                } else {
+                    run_status = NX86_ERR_INTERNAL;
+                }
                 break;
             }
-            hit_addr = (uint64_t)regs.rip - 1u;
+            hit_addr = (uint64_t)rip - 1u;
 
             ei = find_entry_bp(bps, n_bps, hit_addr);
             if (ei >= 0) {
-                /* We read ONLY the return address off the stack — a code
-                 * address. Argument registers (rdi/rsi/...) are never
-                 * read. */
-                uint64_t ret_addr = (uint64_t)peek_word(pid,
-                                        (unsigned long)regs.rsp);
+                /* Read only RSP (one more register word), then read ONLY
+                 * the return address it points at — a code address.
+                 * Argument registers (rdi/rsi/...) are never read. */
+                uint64_t ret_addr;
+                int ret_ok;
                 uint32_t tid = (uint32_t)pid;
+                rsp = (unsigned long)peek_user(pid, NX86_OFF_RSP);
+                if (errno != 0) {
+                    if (errno == ESRCH) {
+                        target_alive = 0;
+                    } else {
+                        run_status = NX86_ERR_INTERNAL;
+                    }
+                    break;
+                }
+                ret_addr = (uint64_t)peek_word(pid, rsp);
+                ret_ok = (errno == 0);
                 emit_call_site(bus, cfg->pid, tid, bps[ei].module,
                                bps[ei].name, ret_addr, bps[ei].address,
                                bps[ei].module_base, NX86_CALL_SITE_THUNK,
                                NX86_CALL_PHASE_ENTER);
                 ++call_events;
 
-                regs.rip = (unsigned long long)hit_addr;
-                (void)ptrace(PTRACE_SETREGS, pid, (void *)0, &regs);
+                /* Rewind RIP over the restored breakpoint byte: one
+                 * register word written, nothing else. */
+                (void)poke_user(pid, NX86_OFF_RIP, (unsigned long)hit_addr);
 
                 {
                     int gone = bp_step_over(pid, (unsigned long)hit_addr,
@@ -814,7 +964,7 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                 }
 
                 /* Arm a one-shot return breakpoint if not already present. */
-                if (ret_addr != 0u && errno == 0 &&
+                if (ret_addr != 0u && ret_ok &&
                     find_return_bp(rbs, n_rbs, ret_addr) < 0 &&
                     n_rbs < NX86_MAX_RETURNS) {
                     unsigned char saved;
@@ -849,8 +999,8 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                                NX86_CALL_SITE_THUNK, NX86_CALL_PHASE_RETURN);
                 ++call_events;
 
-                regs.rip = (unsigned long long)hit_addr;
-                (void)ptrace(PTRACE_SETREGS, pid, (void *)0, &regs);
+                /* Rewind RIP over the restored breakpoint byte. */
+                (void)poke_user(pid, NX86_OFF_RIP, (unsigned long)hit_addr);
                 {
                     int gone = bp_step_off(pid, (unsigned long)hit_addr,
                                            rbs[ri].saved);
@@ -873,21 +1023,18 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
         }
     }
 
-    /* Remove every breakpoint we placed, restoring the code byte-for-byte. */
+    /* Remove every breakpoint we placed and detach, restoring the code
+     * byte-for-byte. When the target is already gone there is nothing left
+     * active, so this only runs while it is alive. A restore or detach that
+     * fails (leaving a breakpoint byte or the attachment possibly active)
+     * turns the whole run into a failure — success is never reported while
+     * anything we installed may still be in place. */
     if (target_alive) {
-        for (i = 0; i < n_bps; ++i) {
-            if (bps[i].armed) {
-                (void)bp_restore(pid, (unsigned long)bps[i].address,
-                                 bps[i].saved);
+        if (remove_breakpoints_and_detach(pid, bps, n_bps, rbs, n_rbs) != 0) {
+            if (run_status == NX86_OK) {
+                run_status = NX86_ERR_INTERNAL;
             }
         }
-        for (i = 0; i < n_rbs; ++i) {
-            if (rbs[i].active) {
-                (void)bp_restore(pid, (unsigned long)rbs[i].address,
-                                 rbs[i].saved);
-            }
-        }
-        (void)ptrace(PTRACE_DETACH, pid, (void *)0, (void *)0);
         if (g_alarm_fired) {
             (void)kill(pid, SIGCONT);
         }
@@ -898,17 +1045,21 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
     }
     sigaction(SIGALRM, &old_sa, NULL);
 
-    {
+    if (run_status == NX86_OK) {
         char msg[128];
         (void)snprintf(msg, sizeof(msg),
                        "live pass complete: %u call-site record(s)",
                        (unsigned)call_events);
         emit_note(bus, cfg->pid, NX86_LOG_INFO, msg);
+    } else {
+        emit_note(bus, cfg->pid, NX86_LOG_ERROR,
+                  "live pass did not complete cleanly; a breakpoint or the "
+                  "attachment may not have been removed");
     }
 
     free(bps);
     free(rbs);
-    return NX86_OK;
+    return run_status;
 }
 
 #endif /* NX86_LIVE_OK */
