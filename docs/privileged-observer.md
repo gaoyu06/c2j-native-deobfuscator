@@ -1,86 +1,90 @@
-# Optional observer contract
+# Optional privileged-observer userspace module
 
-This contract is optional and **off by default**. It is not required for
-JAR recovery. This project provides **no kernel binary and no kernel source**,
-whether signed or unsigned, and has no kernel build target.
+This advanced module is optional and **off by default**. It is a userspace
+plugin host for JNI-native transpiled JAR recovery; it is not a kernel feature
+and is not required for JVMTI, process inspection, or library instrumentation.
 
-Use this path only after user-mode tools have demonstrated a real visibility
-gap. If an operator later needs higher-privilege visibility, the operator must
-provide and maintain their own component, enable the operating system's
-official test-signing or debug configuration themselves, and test-sign that
-component under their own policy. This repository neither changes that policy
-nor supplies a component to load.
+This repository ships **no kernel image and no kernel source**. If an operator
+needs a higher-privilege backend, they must enable their operating system's
+debug or test-signing configuration themselves and build and maintain that
+backend out of tree. This repository does not include that backend or automate
+those operating-system settings.
 
-Official platform documentation:
+## Build and run the Linux backend
 
-- Microsoft:
-  [The TESTSIGNING boot configuration option](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/the-testsigning-boot-configuration-option)
-- Linux kernel:
-  [Kernel module signing facility](https://docs.kernel.org/admin-guide/module-signing.html)
-  and
-  [Kernel lockdown](https://docs.kernel.org/admin-guide/LSM/lockdown.html)
+The shipped backend reads `/proc/<pid>/maps`. It only reports module path and
+mapped address metadata.
 
-These links describe the supported platform mechanisms. This project does not
-reproduce or automate their configuration steps.
-
-## JSON-lines record contract
-
-An operator-provided component may write one UTF-8 JSON object per line. The
-only supported record is a module inventory entry:
-
-```json
-{"kind":"module-load","process_id":4242,"module_name":"libexample.so","base_address":4194304,"image_size":135168}
+```sh
+make -C privileged-observer
+python3 privileged-observer/observer.py \
+  --pid "$$" \
+  --i-enable-privileged-observer \
+  --i-own-this-process
 ```
 
-Every field is required:
+Both confirmation flags are mandatory. The host refuses to load a plugin
+without `--i-enable-privileged-observer`, and it refuses a live PID without
+`--i-own-this-process`. It also verifies that `/proc/<pid>` belongs to the
+current effective user; the Linux plugin independently verifies ownership
+before reading the map. Every refusal exits non-zero.
 
-| Field | Type | Meaning |
-|---|---|---|
-| `kind` | string | Always `module-load`. |
-| `process_id` | integer | Positive operating-system process identifier. |
-| `module_name` | string | Module file name, without file contents. |
-| `base_address` | integer | Non-negative load base address. |
-| `image_size` | integer | Positive mapped image span in bytes. |
+Use `--plugin PATH` to select another compatible userspace plugin. Selecting a
+plugin does not bypass either confirmation or the same-user check.
 
-Addresses and sizes are JSON integers, not hexadecimal strings. Additional
-fields are not part of this contract. In particular, records have no
-`content`, `payload`, raw-byte, argument, return-value, or memory-value field.
+## Versioned plugin ABI
 
-This is the JSON-lines representation of the existing user-mode
-`module-load` event kind documented in `docs/plugin-abi.md`. Its fields map to
-the ABI's module-load event as follows:
+`privileged-observer/include/privileged_observer_plugin.h` defines ABI version
+1. A shared-library plugin exports:
 
-| JSON-lines | User-mode module-load event |
+```c
+const struct po_plugin_v1 *po_plugin_query(uint32_t host_abi_version);
+```
+
+The host requests exactly the ABI version it understands and rejects a null,
+mismatched, or undersized descriptor. Plugins declare a capability bitmask.
+The shipped `linux-proc-maps` plugin declares only `maps-read`; the v1 callback
+can emit only a path, base address, and end address.
+
+The ABI contains no process-memory read operation and no channel for keys,
+buffers, payloads, or TLS interception. A future on-disk ELF symbol provider
+can use a separately versioned metadata capability; v1 does not read or emit
+symbols.
+
+## JSON-lines module records
+
+The host normalizes map entries into one UTF-8 JSON object per line:
+
+```json
+{"base_address":4194304,"end_address":4329472,"image_size":135168,"kind":"module-load","module_name":"libexample.so","path":"/usr/lib/libexample.so","process_id":4242}
+```
+
+All fields are required. Addresses and sizes are JSON integers.
+
+| Field | Meaning |
 |---|---|
-| `process_id` | `process_id` |
-| `module_name` | `name` |
-| `base_address` | `base_address` |
-| `image_size` | `image_size` |
+| `kind` | Always `module-load`. |
+| `process_id` | Positive operating-system process identifier. |
+| `module_name` | Final component of the mapped module path. |
+| `path` | Mapped module path reported by the operating system. |
+| `base_address` | Start of the normalized module address range. |
+| `end_address` | Exclusive end of the normalized module address range. |
+| `image_size` | `end_address - base_address`. |
 
-The contract does not add an event kind or grant a consumer any additional
-operation. Consumers should validate every line independently and reject
-unknown kinds or malformed values.
+These are module/map names and addresses only. There are no content,
+argument-value, return-value, or raw-memory fields.
 
-## Userspace contract smoke test
+## Relationship to native-x86
 
-`privileged-observer/mock_observer.py` is a Linux userspace mock, not a
-privileged component. Given `--pid` and the explicit
-`--i-own-this-process` confirmation, it reads `/proc/<pid>/maps`, verifies
-that `/proc/<pid>` is owned by the current effective user, and emits the
-records above. It refuses targets owned by any other user.
-
-The mock exists only to exercise parsing and consumer compatibility. It does
-not enable test-signing or debug configuration and does not increase process
-visibility.
+This module owns the optional privileged-observer contract. The
+[native-x86 work in #7](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/7)
+is user-mode observation. The two may represent compatible `module-load`
+metadata, but this module does not replace native-x86 or make it
+higher-privilege.
 
 ## Non-goals
 
-- No concealment or obscuring of any component or activity.
-- No observation of a third-party process that the operator does not own.
-- No process modification, code loading, or control-flow changes.
-- No content or payload collection.
-- No signature-policy workarounds or automated security-policy changes.
-
-Do not enable or build an operator-owned higher-privilege component merely as
-a precaution. First demonstrate that the supported user-mode tools cannot
-produce the required module inventory.
+- Observing a process that the operator does not own.
+- Modifying a process or changing its control flow.
+- Collecting process memory, content, or transport data.
+- Changing operating-system security policy.
