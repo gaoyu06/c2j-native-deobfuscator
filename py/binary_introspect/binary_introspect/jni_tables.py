@@ -246,15 +246,30 @@ def _find_register_natives_calls(
     exec_rngs: list[tuple[int, int, bytes]],
     register_natives_index: int,
 ) -> list[int]:
-    """Disassemble every executable section and collect VAs of every
-    indirect vtable call at offset ``register_natives_index * ptr_size``.
-    """
+    """Collect direct and split indirect branches through the JNI slot."""
     target_offset = register_natives_index * abi.pointer_size
     sites: list[int] = []
     for start_va, _end_va, raw in exec_rngs:
+        loaded_slots: dict[int, tuple[int, int]] = {}
         for ins in cs.disasm(raw, start_va):
             off = abi.is_indirect_vtable_call(ins)
             if off is not None and off == target_offset:
+                sites.append(ins.address)
+                continue
+            loaded = abi.vtable_slot_load(ins)
+            if loaded is not None:
+                register, displacement = loaded
+                loaded_slots[register] = (displacement, ins.address + ins.size)
+                continue
+            branch_register = abi.indirect_branch_register(ins)
+            if branch_register is None:
+                continue
+            slot = loaded_slots.get(branch_register)
+            if (
+                slot is not None
+                and slot[0] == target_offset
+                and ins.address - slot[1] <= 0x20
+            ):
                 sites.append(ins.address)
     return sites
 

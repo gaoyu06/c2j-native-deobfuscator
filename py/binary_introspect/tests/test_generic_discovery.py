@@ -76,6 +76,18 @@ def test_indirect_call_detection_uses_operands_not_rendered_text() -> None:
     assert AMD64_WINDOWS.is_indirect_vtable_call(proxy) == 215 * 8
 
 
+def test_split_vtable_load_and_tail_jump_is_discovered() -> None:
+    code = (
+        b"\x48\x8b\x80\xb8\x06\x00\x00"  # mov rax, [rax + 215 * 8]
+        b"\xff\xe0"                      # jmp rax
+    )
+    ranges = [(0x1000, 0x1000 + len(code), code)]
+    sites = _find_register_natives_calls(
+        AMD64_SYSV.disassembler(), AMD64_SYSV, ranges, 215
+    )
+    assert sites == [0x1007]
+
+
 def test_profile_selection_falls_back_to_conservative_generic() -> None:
     binary = SimpleNamespace(format=object(), sections=[])
     profile = detect_profile(binary)

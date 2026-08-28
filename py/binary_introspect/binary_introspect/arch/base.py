@@ -72,7 +72,7 @@ class Abi:
         """
         from capstone import x86_const
 
-        if ins.mnemonic != "call":
+        if ins.mnemonic not in ("call", "jmp"):
             return None
         if len(ins.operands) != 1:
             return None
@@ -80,6 +80,36 @@ class Abi:
         if operand.type != x86_const.X86_OP_MEM or operand.mem.base == 0:
             return None
         return operand.mem.disp
+
+    def vtable_slot_load(self, ins: Any) -> tuple[int, int] | None:
+        """Return ``(destination_register, displacement)`` for a vtable load.
+
+        Optimizing compilers may split ``call [table + slot]`` into
+        ``mov tmp, [table + slot]`` followed by ``call tmp`` or tail ``jmp
+        tmp``. PC-relative loads are excluded because they address globals,
+        not a function slot through ``JNIEnv``.
+        """
+        from capstone import x86_const
+
+        if ins.mnemonic != "mov" or len(ins.operands) != 2:
+            return None
+        dst, src = ins.operands
+        if (
+            dst.type != x86_const.X86_OP_REG
+            or src.type != x86_const.X86_OP_MEM
+            or src.mem.base in (0, self.pc_register)
+        ):
+            return None
+        return dst.reg, src.mem.disp
+
+    def indirect_branch_register(self, ins: Any) -> int | None:
+        """Return the register used by an indirect call or tail jump."""
+        from capstone import x86_const
+
+        if ins.mnemonic not in ("call", "jmp") or len(ins.operands) != 1:
+            return None
+        operand = ins.operands[0]
+        return operand.reg if operand.type == x86_const.X86_OP_REG else None
 
     def decode_pc_relative_lea(self, ins: Any) -> int | None:
         """If ``ins`` is a "load effective address of a constant"
