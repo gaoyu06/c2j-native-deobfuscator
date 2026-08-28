@@ -64,9 +64,9 @@ window.
 Empty, missing-artifact, and "folder has no artifacts" states are all
 handled and point at the first command to run.
 
-The **Attach** button in the toolbar is disabled and labelled "not
-available yet". Live process attach is not implemented; capture a trace
-with the CLI instead.
+The viewer never runs a recovery step. Capturing a trace, reading the
+native library, and rebuilding all happen through the CLI; the Pipeline
+tab shows the exact command for the next step.
 
 ## Visual style (keep it this way)
 

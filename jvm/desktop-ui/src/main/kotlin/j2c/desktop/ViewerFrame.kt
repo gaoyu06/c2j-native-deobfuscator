@@ -99,10 +99,6 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
 
         val open = JButton("Open session…").apply { addActionListener { chooseDirectory() } }
         val reload = JButton("Reload").apply { addActionListener { reload() } }
-        val attach = JButton("Attach — not available yet").apply {
-            isEnabled = false
-            toolTipText = "Live process attach is not implemented yet. Use the CLI to capture a trace."
-        }
 
         val right = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.X_AXIS)
@@ -111,8 +107,6 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
             add(open)
             add(Box.createHorizontalStrut(6))
             add(reload)
-            add(Box.createHorizontalStrut(6))
-            add(attach)
         }
 
         bar.add(left, BorderLayout.CENTER)
@@ -146,7 +140,10 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
 
     private fun buildSessionCard(): JComponent {
         val split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, buildMethodPanel(), buildDetailPanel())
-        split.resizeWeight = 0.6
+        // Share resize evenly. The initial divider follows the two panels'
+        // preferred widths (below), so it lands in the same place in every
+        // state instead of jumping when the content changes.
+        split.resizeWeight = 0.5
         split.border = null
         split.background = Theme.BG
         return split
@@ -170,8 +167,9 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
             }
         }
         // class | method | descriptor(flex) | native addr | status
-        val widths = intArrayOf(175, 95, 150, 105, 92)
+        val widths = intArrayOf(150, 85, 128, 100, 78)
         for (i in widths.indices) methodTable.columnModel.getColumn(i).preferredWidth = widths[i]
+        Ui.leftAlignHeader(methodTable)
 
         filterField.putClientProperty("JTextField.placeholderText", "filter…")
         filterField.font = Theme.monoSmall
@@ -198,8 +196,9 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         p.add(Ui.scroll(methodTable), BorderLayout.CENTER)
         // Fixed preferred width keeps the divider stable no matter which
         // detail tab is showing (long recovered listings would otherwise
-        // pull the split over on first layout).
-        p.preferredSize = Dimension(660, 640)
+        // pull the split over on first layout). The columns above sum to a
+        // little under this, so nothing is clipped.
+        p.preferredSize = Dimension(548, 640)
         return p
     }
 
@@ -229,13 +228,14 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         traceTable.columnModel.getColumn(1).preferredWidth = 70
         traceTable.columnModel.getColumn(2).preferredWidth = 90
         traceTable.columnModel.getColumn(3).preferredWidth = 360
+        Ui.leftAlignHeader(traceTable)
 
         tabs.font = Theme.sansSmall
         tabs.addTab("Detail", Ui.scroll(detailArea))
         tabs.addTab("Pipeline", buildPipelinePanel())
         tabs.addTab("Artifact JSON", Ui.scroll(jsonArea))
         tabs.addTab("Trace", Ui.scroll(traceTable))
-        tabs.preferredSize = Dimension(440, 640)
+        tabs.preferredSize = Dimension(556, 640)
         return tabs
     }
 
@@ -256,7 +256,9 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
             background = Theme.RAISED
             foreground = Theme.ACCENT
             lineWrap = true
-            wrapStyleWord = false
+            // Wrap at spaces so a long command breaks between arguments
+            // instead of chopping a path or flag in half.
+            wrapStyleWord = true
             border = BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(Theme.LINE),
                 BorderFactory.createEmptyBorder(8, 10, 8, 10),

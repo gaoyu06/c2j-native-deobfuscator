@@ -61,7 +61,7 @@ class MethodCellRenderer(private val model: MethodTableModel) : DefaultTableCell
             column == 3 -> Theme.DIM
             else -> Theme.TEXT
         }
-        horizontalAlignment = if (column == 3 || column == 4) SwingConstants.LEFT else SwingConstants.LEFT
+        horizontalAlignment = SwingConstants.LEFT
         return c
     }
 }
@@ -112,6 +112,23 @@ object Ui {
         border = BorderFactory.createLineBorder(Theme.LINE)
         viewport.background = Theme.BG
         background = Theme.BG
+    }
+
+    /**
+     * Left-align a table's column headers so they sit over the (left-aligned)
+     * data instead of floating centred. Keeps the look-and-feel's own header
+     * painting; only nudges the text and pads it to match the cell inset.
+     */
+    fun leftAlignHeader(table: JTable) {
+        val base = table.tableHeader.defaultRenderer
+        table.tableHeader.defaultRenderer = javax.swing.table.TableCellRenderer { t, value, selected, focused, row, col ->
+            val c = base.getTableCellRendererComponent(t, value, selected, focused, row, col)
+            (c as? JLabel)?.apply {
+                horizontalAlignment = SwingConstants.LEFT
+                border = BorderFactory.createEmptyBorder(0, 8, 0, 8)
+            }
+            c
+        }
     }
 
     fun dimText(text: String, color: Color = Theme.DIM): JLabel = JLabel(text).apply {

@@ -56,13 +56,15 @@ fun main(args: Array<String>) {
     shot("01-empty") { /* opens with no session */ }
 
     shot("02-no-artifacts") { f ->
-        val dir = Files.createTempDirectory("j2c-empty-shot")
+        // Fixed path (not createTempDirectory) so the header line is stable
+        // and the committed screenshot doesn't churn on every re-render.
+        val dir = freshDir("j2c-viewer-shot-empty")
         f.openDirectory(dir)
     }
 
     shot("03-missing-artifacts") { f ->
         // Only classes.json present: pipeline shows what's missing + next step.
-        val dir = Files.createTempDirectory("j2c-partial-shot")
+        val dir = freshDir("j2c-viewer-shot-partial")
         Files.copy(sample.resolve("classes.json"), dir.resolve("classes.json"))
         f.openDirectory(dir)
     }
@@ -86,6 +88,19 @@ fun main(args: Array<String>) {
     println("done -> ${outDir.toAbsolutePath()}")
     // Swing keeps AWT threads alive; exit explicitly.
     System.exit(0)
+}
+
+/**
+ * A stable, empty temp directory with a fixed name. Recreated each run so
+ * the screenshots that show its path stay byte-for-byte reproducible.
+ */
+private fun freshDir(name: String): Path {
+    val dir = Path.of(System.getProperty("java.io.tmpdir"), name)
+    if (Files.exists(dir)) {
+        Files.walk(dir).sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) }
+    }
+    Files.createDirectories(dir)
+    return dir
 }
 
 /**
