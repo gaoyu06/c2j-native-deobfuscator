@@ -172,3 +172,114 @@ ok"), and confirms a well-formed value still parses.
 - `bash native-x86/smoke-test.sh --no-cmake` — pass (direct build).
 - `gcc` and `clang`, `-std=c99 -Wall -Wextra -Wpedantic -Werror` — the
   changed sources compile without diagnostics.
+
+---
+
+## Re-review of `594d21f` — remaining must-fix items
+
+An independent re-review of head `594d21f` confirmed the four findings
+above are closed and did not regress (attach refusal runs the read-only
+`/proc/PID/maps` + on-disk ELF fallback and reports it honestly; no
+`GETREGS`, only RIP/RSP via `PEEKUSER`/`POKEUSER`; the 512-byte
+plugin-note cap is present; strict `--pid` rejects `-1`, `0`, `12x`,
+`abc`, and empty with exit 2; plugins stay name/address-only with no real
+cryptography in the fixture and no Java/JNI types in the ABI). It then
+found four further leftovers, all fixed on this branch.
+
+### R1. Live cleanup was still incomplete on some error exits
+
+**Finding.** In `run_live()`:
+
+- A non-`ESRCH` `PTRACE_CONT` failure set `target_alive = 0`, which
+  *skipped* the restore+detach cleanup even though breakpoints had already
+  been inserted — leaving an `INT3` in the target while the run still
+  reported success.
+- The RIP rewind (`PTRACE_POKEUSER`) before each step was discarded with
+  `(void)`. A failed rewind leaves execution one byte past the `INT3`.
+- `bp_step_over()` / `bp_step_off()` returning `-1` (a failed restore,
+  single-step, or re-arm) was ignored; only the "target exited" return
+  (`1`) was handled. A breakpoint byte could be left in place, or the
+  attachment altered, with the run still reported as clean.
+
+**Fix.** Every one of those failures now stops the loop and falls through
+to `remove_breakpoints_and_detach()` with `run_status` set to
+`NX86_ERR_INTERNAL`, so the closing note reads "live pass did not complete
+cleanly …" and `main.c` exits non-zero ("shutdown with errors"). A ptrace
+op that fails with `ESRCH` (the tracee is gone) is still treated as clean.
+For the return path, a failed step leaves the one-shot return breakpoint
+marked active so the cleanup helper restores it rather than skipping it.
+
+**Evidence.** Smoke-test section 8 injects a step-over failure on the live
+path; the run emits one `phase=enter`, then the "did not complete cleanly"
+note, `observation ended with status -6`, and `shutdown with errors`, and
+never prints `shutdown ok`. The clean live run (section 3) still returns
+`NX86_OK` and `shutdown ok`.
+
+### R2. Module-scan failure was ignored in the live pass
+
+**Finding.** `run_live()` called `scan_all_modules()` with `(void)`, so a
+failure to read `/proc/PID/maps` (or an allocation failure) while attached
+was ignored and the pass continued as if it had succeeded.
+
+**Fix.** A scan failure in the live pass now emits an error note, detaches
+cleanly through the helper, and returns `NX86_ERR_INTERNAL`. The
+read-only fallback (`--no-live` and the attach-refusal path) already
+checked the same return value and surfaces `NX86_ERR_UNSUPPORTED` on
+failure, so no code path silently ignores a scan failure.
+
+### R3. Safety bounds must parse strictly, like `--pid`
+
+**Finding.** `--max-events` and `--max-seconds` went through
+`strtoul(arg, NULL, 10)` with no validation: `--max-seconds abc` yielded
+`0` and *disabled* the timeout, and `--max-events -1` wrapped to a huge
+value read as effectively unlimited. Garbage silently became "unlimited".
+
+**Fix.** Added `parse_nonneg_u32()`, which requires the whole argument to
+be base-10 digits with no leading sign, no trailing text, and no overflow
+of `uint32_t`. A malformed value prints an error and exits `2`; an
+explicit `0` keeps its documented meaning (no event / no time budget).
+
+**Evidence.** Smoke-test section 7 rejects `abc`, `-1`, `5x`, and empty
+for both options (each exits non-zero and never prints `shutdown ok`), and
+confirms valid values (including `0`) still parse and run to a clean
+shutdown.
+
+### R4. Docs overstated the content guarantee and used non-neutral wording
+
+**Finding.** The docs claimed content capture is impossible "by
+construction of the plugin ABI" while `note.text` exists as a 512-byte
+free-text field — a host/status channel that *could* hold ~512 bytes.
+`docs/native-x86-module.md` also used the non-neutral phrase "attack that
+residue".
+
+**Fix.** `docs/native-x86-module.md`, `docs/plugin-abi.md`, and
+`docs/plugins/crypto-libraries.md` now state the actual rule: no event
+field is defined to carry a payload; the one free-text field, a note's
+`text`, is host/status text only; plugins and the host must not place
+keys, buffers, or payloads in it; and the host enforces a fixed
+`NX86_NOTE_TEXT_MAX` (512-byte) length cap — policy plus a bound, not a
+structural impossibility. The "attack" wording is replaced with neutral
+phrasing ("make sense of that residue"). `docs/privileged-observer.md` is
+left untouched.
+
+### Re-review boundary notes
+
+- Still metadata-only: module/symbol/call-site names and addresses only.
+  No keys, buffers, payloads, interception, or kernel/driver source was
+  added, and the public ABI grew no Java/JNI types.
+- The `NX86_TEST_INJECT` seam now matches fault names by exact token
+  rather than substring and gains a `step-over-fail` fault for R1's test.
+  It remains read from an environment variable, inert unless set, and
+  injects nothing into production runs.
+
+### Re-review verification
+
+- `bash native-x86/smoke-test.sh` — pass (exit 0), CMake build. Sections
+  1–8 all pass: 1 synthetic, 2 ABI checks, 3 live observation
+  (`PASS(live)`), 4 attach-refusal fallback, 5 strict `--pid`, 6
+  detach-failure, 7 malformed safety bounds, 8 live step failure.
+- `bash native-x86/smoke-test.sh --no-cmake` — pass (exit 0), direct
+  build; same sections 1–8.
+- `gcc` (13.3.0) and `clang` (18.1.3), `-std=c99 -Wall -Wextra -Wpedantic
+  -Werror` — the changed `observe_linux.c` and `main.c`, and a full host
+  link, compile without diagnostics.
