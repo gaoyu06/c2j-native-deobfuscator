@@ -419,3 +419,185 @@ untouched.
   -Werror` — the changed `observe_linux.c`, the new
   `tests/fixtures/fixture_target_mt.c`, and a full host link compile
   without diagnostics.
+
+---
+
+## Re-review of `3913a89` — remaining must-fix items
+
+A third independent re-review of head `3913a89` confirmed the twelve items
+above stayed closed and did not regress, then found four further
+must-fixes in the live path and one doc over-claim. All are fixed on this
+branch.
+
+### T1. Return-site `bp_insert()` failures were still ignored
+
+**Finding.** When an entry breakpoint fired, the engine read the caller's
+return address and armed a one-shot **return** breakpoint there. That
+`bp_insert()` was checked only for success (`== 0`): any failure — a
+non-`ESRCH` ptrace error — was silently dropped. So an entry could be
+observed and the run still report a clean live pass with the return site
+un-armed, exactly the defect that entry arming (item S2) had already been
+required to fix.
+
+**Fix.** The return-arming block now treats an insert failure the same way
+entry arming does. A non-`ESRCH` failure emits an honest note ("could not
+arm a return-site breakpoint; restoring and detaching without completing
+the live pass"), sets `run_status = NX86_ERR_INTERNAL`, and breaks out so
+control falls through to `remove_breakpoints_and_detach()`; the entry
+breakpoints already placed are restored and the attachment released, and
+`main.c` exits non-zero with "shutdown with errors". An `ESRCH` failure
+(the tracee is gone) ends the pass cleanly, since nothing it held can still
+be active.
+
+**Evidence.** Smoke-test section 12 injects a return-site arming failure
+(`NX86_TEST_INJECT=return-insert-fail`, exact-token, inert unless set)
+after an entry has been observed: the run emits one `phase=enter`, then the
+"could not arm a return-site breakpoint" note, "did not complete cleanly",
+`observation ended with status -6`, and `shutdown with errors`, with no
+`phase=return` and no `shutdown ok`. This is a dedicated section, not
+piggy-backed on the entry-arming section (10). The clean live run (section
+3) still returns `NX86_OK` and `shutdown ok`.
+
+### T2. Entry and return breakpoints could alias the same address
+
+**Finding.** An entry breakpoint and a one-shot return breakpoint can land
+on the same address (a watched export whose caller-side return address is
+another watched entry, or a self-returning site). Two failures followed:
+
+- Arming the return breakpoint peeked the instruction word that the entry
+  breakpoint had **already** patched to `0xcc` and saved that `0xcc` as the
+  "original" byte.
+- Cleanup restored the entry breakpoints first (writing back the true
+  original byte) and then restored the return breakpoints — writing the
+  saved `0xcc` back over the same address, leaving an `INT3` in the target
+  while still reporting the run as clean.
+
+**Fix (unique-address restore + placement guard).**
+
+- The engine no longer places a return breakpoint on an address an entry
+  breakpoint already patches: the return-arming condition now also checks
+  `find_entry_bp(...) < 0`, so no second byte is written and no captured
+  `0xcc` is ever saved as an original. The entry breakpoint already covers
+  that address, and `find_entry_bp` wins when it is hit.
+- Cleanup now restores each **unique** patched address exactly once. A pure
+  helper, `plan_restores()`, collects the set of unique addresses to
+  restore from the armed entry and active return tables (an entry's saved
+  byte wins on a shared address); `remove_breakpoints_and_detach()`
+  restores that set and detaches. Restoring an address twice — the path
+  that could write back a stale `0xcc` — can no longer happen.
+
+**Evidence.** `plan_restores()` is a pure function of the breakpoint
+tables, so it is checked directly without ptrace. A new white-box unit
+test, `tests/observe_unit.c`, compiles the engine source to reach the
+static helpers and asserts: an entry and a return breakpoint at the same
+address yield a single restore site; the entry's true original byte wins
+over a return record that saved `0xcc`; distinct addresses and their bytes
+are preserved; un-armed entries and inactive returns are excluded; and
+`find_entry_bp()` (the placement guard) matches an armed entry address so a
+return breakpoint is skipped. Smoke-test section 14 runs it
+(`observe-unit: PASS`), and it is wired into CMake as the `observe_unit`
+test. Because the fixture's watched exports return into `main` (not into
+another watched entry), the alias never arises in the live sections, so the
+unit check is the practical proof, as the finding anticipated.
+
+### T3. Unexpected stops were swallowed or treated as success
+
+**Finding.** Two paths did not honour the preview policy of never
+swallowing or forging an unexpected signal:
+
+- A `SIGTRAP` at an address the engine had **not** patched (a trap it did
+  not set) was resumed with `PTRACE_CONT` and signal `0`. The comment
+  claimed the signal was "handed back", but signal `0` *suppresses* it, and
+  the run continued and could report a clean success.
+- The single-step helpers (`bp_step_over()`, `bp_step_off()`) only checked
+  for target exit after `PTRACE_SINGLESTEP` + `waitpid`; a stop for
+  anything other than the expected `SIGTRAP` was treated as a successful
+  step.
+
+**Fix (fail honestly, not a signal-faithful debugger).**
+
+- An unexpected `SIGTRAP` (one not matching a placed entry or return
+  breakpoint) now emits an honest note ("unexpected stop (SIGTRAP not from
+  a placed breakpoint); …"), sets `run_status = NX86_ERR_INTERNAL`, and
+  breaks to `remove_breakpoints_and_detach()`. It is neither suppressed nor
+  re-forged.
+- Both single-step helpers now require the post-step stop to be `SIGTRAP`.
+  Any other stop returns a non-`ESRCH` failure, so the caller restores,
+  detaches, and fails the run rather than assuming a clean step. Genuine
+  non-`SIGTRAP` signals seen *outside* a single step are still forwarded
+  unchanged (delivery is not altered); this fix is only about not
+  mislabelling an unexpected stop as success.
+
+**Evidence.** Smoke-test section 13 exercises both facets deterministically
+once a real record has been emitted, via two exact-token injects (inert
+unless set): `unexpected-trap` (the next breakpoint stop is treated as a
+trap the engine did not place) and `step-trap-lost` (a single step appears
+to stop for something other than `SIGTRAP`). Each emits one `phase=enter`,
+then "did not complete cleanly", `observation ended with status -6`, and
+`shutdown with errors`, and never prints `shutdown ok`; the
+`unexpected-trap` case also prints the "unexpected stop" note. The clean
+live run (section 3) is unaffected.
+
+### T4. Header still overstated the note cap as a side-channel defence
+
+**Finding.** `native-x86/src/host/event_bus.h` (the `NX86_NOTE_TEXT_MAX`
+comment) still said the host rejects an over-long note "so `note.text`
+cannot be used as a side channel to smuggle a payload". That repeats the
+over-claim the docs had already corrected: the cap bounds only the length,
+and a plugin can still place up to 512 bytes of arbitrary text.
+
+**Fix.** The header comment now states the actual rule, matching
+`docs/native-x86-module.md`, `docs/plugin-abi.md`, and
+`docs/plugins/crypto-libraries.md`: the cap bounds only the *length* of
+`note.text`; it does not make the field safe by construction; what keeps it
+from becoming a payload channel is policy (host/status text only; no keys,
+buffers or payloads; the host never parses it as data), not the cap. A
+tree-wide grep for the over-claim wordings ("cannot be used as a side
+channel", "by construction") — excluding `docs/privileged-observer.md` —
+confirms no remaining over-claim: the surviving "by construction" hits are
+all explicit *negations* ("not made safe by construction", "does not make
+it safe by construction", "rather than relying on it being impossible by
+construction"), and the one unrelated match in `ghidra/` is about JSON
+validity, not content safety.
+
+### Third re-review boundary notes
+
+- Still metadata-only: module/symbol/call-site names and addresses only. No
+  keys, buffers, payloads, interception, or kernel/driver source was added,
+  and the public ABI grew no Java/JNI types. The multithread policy is
+  unchanged (refuse + read-only fallback); no thread-group tracer was
+  added. No TLS interception or content capture was added.
+- Unexpected stops fail cleanly after restore+detach; the engine did not
+  grow into a general debugger.
+- The `NX86_TEST_INJECT` seam gains `return-insert-fail`, `step-trap-lost`,
+  and `unexpected-trap`, matched by exact token and inert unless the
+  environment variable is set; they inject nothing into production runs.
+- `docs/privileged-observer.md` is untouched.
+
+### Unique-address restore invariant (item T2)
+
+For the record, the invariant the cleanup now guarantees:
+
+> Every address the live pass patches with an `INT3` is restored to its
+> original (non-`INT3`) byte exactly once. The original byte is captured
+> once, when the address is first patched; a return breakpoint is never
+> placed on an address an entry breakpoint already patched, so a saved byte
+> is never a captured `0xcc`; and `plan_restores()` de-duplicates addresses
+> so no address is written back twice.
+
+### Third re-review verification
+
+- `bash native-x86/smoke-test.sh` — pass (exit 0), CMake build. Sections
+  1–14 all pass: 1 synthetic, 2 ABI checks, 3 live observation
+  (`PASS(live)`), 4 attach-refusal fallback, 5 strict `--pid`, 6
+  detach-failure, 7 malformed safety bounds, 8 live step failure, 9 live
+  `PTRACE_CONT` failure, 10 breakpoint-arming failure, 11 multithreaded
+  refusal + read-only fallback, 12 return-site arming failure, 13
+  unexpected stops (`unexpected-trap` and `step-trap-lost`), 14
+  unique-address restore invariant (`observe-unit: PASS`).
+- `bash native-x86/smoke-test.sh --no-cmake` — pass (exit 0), direct build;
+  same sections 1–14.
+- `gcc` (13.3.0) and `clang` (18.1.3), `-std=c99 -Wall -Wextra -Wpedantic
+  -Werror` — the changed `observe_linux.c`, `event_bus.h`/`event_bus.c`,
+  `main.c`, the new `tests/observe_unit.c`, and a full host link compile
+  without diagnostics.
