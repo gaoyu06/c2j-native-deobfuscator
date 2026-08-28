@@ -127,11 +127,33 @@ def test_check_jvm_modules_ok(tmp_path):
 # Native agent probe
 # ------------------------------------------------------------------
 
-def _write_agent(tmp_path, libname, size=doctor._MIN_AGENT_BYTES + 1):
+_ELF_X86_64 = 0x3E
+_ELF_AARCH64 = 0xB7
+
+# e_machine value matching the architecture the agent build supports, so a
+# fixture agent written with it reads as ready on a supported host.
+_ELF_SUPPORTED = _ELF_X86_64
+
+
+def _write_agent(tmp_path, libname, size=doctor._MIN_AGENT_BYTES + 1,
+                 e_machine=_ELF_SUPPORTED):
     libdir = tmp_path / "native" / "build" / "lib"
     libdir.mkdir(parents=True, exist_ok=True)
-    (libdir / libname).write_bytes(b"\x7fELF" + b"\x00" * (size - 4))
+    _write_elf(libdir / libname, e_machine, size)
     return libdir
+
+
+@pytest.fixture
+def x86_host(monkeypatch):
+    """Pin the probes to a Linux x86-64 host, the one the build supports.
+
+    Without this the result would depend on the machine running the tests:
+    ``check_native_agent`` deliberately refuses to call any agent ready on a
+    CPU ``native/build.sh`` cannot build for.
+    """
+    monkeypatch.setattr(doctor.sys, "platform", "linux")
+    monkeypatch.setattr(doctor.os, "name", "posix")
+    monkeypatch.setattr(doctor, "host_machine", lambda machine=None: "x86_64")
 
 
 def test_host_agent_name_per_platform():
@@ -140,22 +162,20 @@ def test_host_agent_name_per_platform():
     assert doctor.host_agent_name("win32") == "j2c_agent.dll"
 
 
-def test_check_native_agent_missing(tmp_path):
+def test_check_native_agent_missing(tmp_path, x86_host):
     c = doctor.check_native_agent(tmp_path)
     assert c.status == doctor.STATUS_MISSING
     assert c.fix
 
 
-def test_check_native_agent_present_host_match(tmp_path):
-    # The host-matching name (as this interpreter sees it) reads as ready.
+def test_check_native_agent_present_host_match(tmp_path, x86_host):
+    # The host-matching name, built for this host's CPU, reads as ready.
     _write_agent(tmp_path, doctor.host_agent_name())
     assert doctor.check_native_agent(tmp_path).status == doctor.STATUS_OK
 
 
-def test_check_native_agent_rejects_wrong_platform(tmp_path, monkeypatch):
-    # Pretend we are on Linux; a leftover Windows DLL must not read as ready.
-    monkeypatch.setattr(doctor.sys, "platform", "linux")
-    monkeypatch.setattr(doctor.os, "name", "posix")
+def test_check_native_agent_rejects_wrong_platform(tmp_path, x86_host):
+    # A leftover Windows DLL on Linux must not read as ready.
     _write_agent(tmp_path, "j2c_agent.dll")
     c = doctor.check_native_agent(tmp_path)
     assert c.status == doctor.STATUS_MISSING
@@ -163,15 +183,25 @@ def test_check_native_agent_rejects_wrong_platform(tmp_path, monkeypatch):
     assert "j2c_agent.dll" in c.detail  # names the wrong-platform leftover
 
 
-def test_check_native_agent_rejects_empty_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(doctor.sys, "platform", "linux")
-    monkeypatch.setattr(doctor.os, "name", "posix")
+def test_check_native_agent_rejects_empty_file(tmp_path, x86_host):
     libdir = tmp_path / "native" / "build" / "lib"
     libdir.mkdir(parents=True)
     (libdir / "j2c_agent.so").write_bytes(b"")  # 0 bytes → not a real library
     c = doctor.check_native_agent(tmp_path)
     assert c.status == doctor.STATUS_MISSING
     assert "empty" in c.detail or "truncated" in c.detail
+
+
+def test_check_native_agent_rejects_unreadable_format(tmp_path, x86_host):
+    # Big enough to pass the size gate, but not a shared library we can
+    # identify — that is not proof the JVM here can load it.
+    libdir = tmp_path / "native" / "build" / "lib"
+    libdir.mkdir(parents=True)
+    (libdir / "j2c_agent.so").write_bytes(b"not-a-library"
+                                          + b"\x00" * doctor._MIN_AGENT_BYTES)
+    c = doctor.check_native_agent(tmp_path)
+    assert c.status == doctor.STATUS_MISSING
+    assert c.fix
 
 
 # ------------------------------------------------------------------
@@ -201,35 +231,69 @@ def _write_elf(path: Path, e_machine: int, size=doctor._MIN_AGENT_BYTES + 1):
 
 def test_agent_arch_reads_elf(tmp_path):
     p = tmp_path / "lib.so"
-    _write_elf(p, 0x3E)  # x86-64
+    _write_elf(p, _ELF_X86_64)
     assert doctor.agent_arch(p) == "x86_64"
-    _write_elf(p, 0xB7)  # aarch64
+    _write_elf(p, _ELF_AARCH64)
     assert doctor.agent_arch(p) == "arm64"
 
 
-def test_check_native_agent_rejects_wrong_arch(tmp_path, monkeypatch):
-    # A host-named agent whose machine code is x86-64 must not read as ready on
-    # an ARM host (native/build.sh only ever emits x86-64).
+@pytest.fixture
+def arm_host(monkeypatch):
+    """Pin the probes to a Linux arm64 host — a CPU the build cannot target."""
     monkeypatch.setattr(doctor.sys, "platform", "linux")
     monkeypatch.setattr(doctor.os, "name", "posix")
     monkeypatch.setattr(doctor, "host_machine", lambda machine=None: "arm64")
+
+
+def test_check_native_agent_rejects_wrong_arch(tmp_path, arm_host):
+    # A host-named agent whose machine code is x86-64 must not read as ready on
+    # an ARM host (native/build.sh only ever emits x86-64).
     libdir = tmp_path / "native" / "build" / "lib"
     libdir.mkdir(parents=True)
-    _write_elf(libdir / "j2c_agent.so", 0x3E)  # built for x86-64
+    _write_elf(libdir / "j2c_agent.so", _ELF_X86_64)
     c = doctor.check_native_agent(tmp_path)
     assert c.status == doctor.STATUS_MISSING
-    assert "x86_64" in c.detail  # names what it was built for
+    assert "x86_64" in c.detail  # names what the build can produce
     assert "arm64" in c.detail   # names this host
 
 
-def test_check_native_agent_ok_when_arch_matches(tmp_path, monkeypatch):
-    monkeypatch.setattr(doctor.sys, "platform", "linux")
-    monkeypatch.setattr(doctor.os, "name", "posix")
-    monkeypatch.setattr(doctor, "host_machine", lambda machine=None: "x86_64")
+def test_check_native_agent_rejects_arm_agent_on_arm_host(tmp_path, arm_host):
+    # An arm64-labelled leftover with the host-matching *name* is still not
+    # proof of a usable agent: native/build.sh cannot produce one for arm64,
+    # so the dynamic path stays not-ready here.
     libdir = tmp_path / "native" / "build" / "lib"
     libdir.mkdir(parents=True)
-    _write_elf(libdir / "j2c_agent.so", 0x3E)
-    assert doctor.check_native_agent(tmp_path).status == doctor.STATUS_OK
+    _write_elf(libdir / "j2c_agent.so", _ELF_AARCH64)
+    c = doctor.check_native_agent(tmp_path)
+    assert c.status == doctor.STATUS_MISSING
+    assert not c.optional
+    assert "arm64" in c.detail
+    assert c.fix
+
+
+def test_build_report_not_ready_on_arm_with_arm_agent(tmp_path, arm_host,
+                                                      monkeypatch):
+    # Everything else in place on an ARM host: required-ready must still be
+    # false, because the default path's agent cannot be built for this CPU.
+    monkeypatch.setenv("JAVA_HOME", "/opt/jdk21")
+    monkeypatch.setattr(doctor, "_java_executable", lambda: "/opt/jdk21/bin/java")
+    monkeypatch.setattr(doctor, "_query_java_version",
+                        lambda exe: 'openjdk version "21.0.10"')
+    monkeypatch.setattr(sys, "version_info", (3, 11, 5))
+    _make_jvm_installs(tmp_path, doctor.REQUIRED_JVM_MODULES)
+    _write_agent(tmp_path, "j2c_agent.so", e_machine=_ELF_AARCH64)
+    report = doctor.build_report(tmp_path)
+    assert not report.healthy
+    assert "Native JVMTI agent" in {c.name for c in report.blocking}
+
+
+def test_check_native_agent_ok_when_arch_matches(tmp_path, x86_host):
+    libdir = tmp_path / "native" / "build" / "lib"
+    libdir.mkdir(parents=True)
+    _write_elf(libdir / "j2c_agent.so", _ELF_X86_64)
+    c = doctor.check_native_agent(tmp_path)
+    assert c.status == doctor.STATUS_OK
+    assert "x86_64" in c.detail
 
 
 # ------------------------------------------------------------------
@@ -291,7 +355,8 @@ def test_build_report_blocking_when_nothing_built(tmp_path, monkeypatch):
     assert all(not c.optional for c in report.blocking)
 
 
-def test_build_report_healthy_when_everything_present(tmp_path, monkeypatch):
+def test_build_report_healthy_when_everything_present(tmp_path, x86_host,
+                                                      monkeypatch):
     monkeypatch.setenv("JAVA_HOME", "/opt/jdk21")
     monkeypatch.setattr(doctor, "_java_executable", lambda: "/opt/jdk21/bin/java")
     monkeypatch.setattr(doctor, "_query_java_version",
@@ -314,7 +379,7 @@ def test_warn_does_not_block():
     assert [c.name for c in r.warnings] == ["Java / JDK 17+"]
 
 
-def test_build_report_warn_stays_healthy(tmp_path, monkeypatch):
+def test_build_report_warn_stays_healthy(tmp_path, x86_host, monkeypatch):
     # Java new enough but JAVA_HOME unset -> WARN, yet the report is healthy
     # because the agent and modules are present.
     monkeypatch.delenv("JAVA_HOME", raising=False)

@@ -285,6 +285,11 @@ _MIN_AGENT_BYTES = 4096
 # leftover, never to accept one.
 _ALL_AGENT_NAMES = ("j2c_agent.so", "j2c_agent.dylib", "j2c_agent.dll")
 
+# CPU architectures this project can actually build an agent for.
+# ``native/build.sh`` passes `-target x86_64-*` for every host OS, so x86-64 is
+# the only architecture whose agent the default (dynamic) path can rely on.
+SUPPORTED_AGENT_MACHINES = ("x86_64",)
+
 
 def host_machine(machine: Optional[str] = None) -> str:
     """Normalise the host CPU architecture to a small, comparable label.
@@ -357,9 +362,36 @@ def agent_arch(path: Path) -> Optional[str]:
 def check_native_agent(root: Path) -> Check:
     libdir = root / "native" / "build" / "lib"
     want = host_agent_name()
+    host = host_machine()
+    supported = "/".join(SUPPORTED_AGENT_MACHINES)
     fix = ("run scripts/setup.sh (needs JAVA_HOME + zig), "
            "or `cd native && JDK_HOME=\"$JAVA_HOME\" bash build.sh`")
     target = libdir / want
+
+    # The default path loads the agent into *this* JVM, so it needs an agent
+    # built for this CPU — and native/build.sh can only build x86-64. On any
+    # other host there is no supported way to produce one, so nothing found in
+    # build/lib proves the dynamic path is usable: an x86-64 artifact cannot be
+    # loaded here, and a same-arch one did not come from this build. Report the
+    # agent as missing rather than guessing, and point at the paths that need
+    # no agent.
+    if host not in SUPPORTED_AGENT_MACHINES:
+        present = [n for n in _ALL_AGENT_NAMES if (libdir / n).exists()]
+        found = ""
+        if present:
+            arch = agent_arch(libdir / present[0])
+            found = (f"; ignoring {', '.join(present)} under {libdir}"
+                     + (f" (built for {arch})" if arch else ""))
+        return Check(
+            name="Native JVMTI agent",
+            status=STATUS_MISSING,
+            detail=f"this host is {host}, but native/build.sh only targets "
+                   f"{supported}, so the dynamic path has no agent it can "
+                   f"load here{found}",
+            fix=f"use the emulation fallback or the static path (neither needs "
+                f"the agent), run the dynamic path on {supported}, or port "
+                f"native/build.sh to {host}",
+        )
 
     if target.exists():
         size = target.stat().st_size
@@ -370,12 +402,19 @@ def check_native_agent(root: Path) -> Check:
                 detail=f"{target} is only {size} bytes; looks empty or truncated",
                 fix="delete it and rebuild: " + fix,
             )
-        # native/build.sh targets x86-64 only. On another host CPU it emits an
-        # artifact with the right *name* but the wrong machine code, which the
-        # JVM here cannot load — so a known architecture mismatch is not ready.
-        host = host_machine()
         built = agent_arch(target)
-        if built is not None and built != host:
+        # An agent whose architecture cannot be read is not a library this JVM
+        # is known to be able to load, so it does not count as ready either.
+        if built is None:
+            return Check(
+                name="Native JVMTI agent",
+                status=STATUS_MISSING,
+                detail=f"cannot read a target architecture from {target}; it is "
+                       "not a recognised ELF/Mach-O/PE shared library, so it "
+                       "may not load here",
+                fix="delete it and rebuild: " + fix,
+            )
+        if built != host:
             return Check(
                 name="Native JVMTI agent",
                 status=STATUS_MISSING,
@@ -387,7 +426,7 @@ def check_native_agent(root: Path) -> Check:
         return Check(
             name="Native JVMTI agent",
             status=STATUS_OK,
-            detail=f"found {target}" + (f" ({built})" if built else ""),
+            detail=f"found {target} ({built})",
         )
 
     # A leftover build for another OS must not read as ready.
@@ -444,7 +483,11 @@ def check_unicorn() -> Check:
             name="unicorn (optional)",
             status=STATUS_OPTIONAL,
             detail="not installed; only needed for the emulation fallback",
-            fix="pip install unicorn (optional)",
+            # Name the interpreter explicitly: unicorn must land in the one the
+            # emulation harness runs under, not in whichever `pip` is on PATH.
+            fix=f"install it for this interpreter — `(cd py && uv pip install "
+                f"unicorn)`, or `{sys.executable} -m pip install unicorn` "
+                f"(optional)",
             optional=True,
         )
     return Check(
