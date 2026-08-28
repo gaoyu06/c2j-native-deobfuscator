@@ -14,7 +14,7 @@ Keep the command-line recovery path as the automation contract. Merge truthful
 documentation and setup work first, then add the generic discovery path only as
 a development draft. Layer the optional desktop work and JVMTI attach preview
 after their dependencies. Treat native-x86 as a preview draft rather than a
-product feature, and merge the privileged-observer documentation mock last.
+product feature, and merge the privileged-observer userspace preview last.
 
 Nothing in the current drafts justifies making generic discovery, live attach,
 native-x86, or privileged observation a default release path.
@@ -29,25 +29,32 @@ review can be skipped.
 |---:|---|---|---|
 | **#2** | Design-theory assessment and PR sequence; documentation only and mergeable as documentation. | **Yes, as docs.** | Owner documentation sign-off only. |
 | **#3** | Genericity audit; documentation only. | **Yes, as docs.** | Owner factual spot-check only. |
-| **#4** | Generic-first discovery. The count-only silent misbind is closed. PE, Mach-O, and stripped-ELF behavior remain unproven. | **Yes, as a draft/development path; not as the default release.** | Yes, before any default promotion and when adding evidence for the unproven formats. |
+| **#4** | Generic-first discovery at `864f1a427c1fa30071733cfe09440cbbe6c6a483`. Committed x86-64 fixtures now cover real PE, Mach-O, stripped ELF without `.symtab`, and exports-only ELF; pytest reports 27 passed. Ambiguous count-only cases still use `bindingGaps`, and `recover` keeps its existing default. | **Yes: ship-as-draft-dev; not as the default release.** | Yes before default promotion. Non-x86-64, section-header-removed ELF, and encrypted or shuffled tables remain unproven. |
 | **#5** | Platform plan selecting Swing + FlatLaf and recording reserved decisions; documentation only. | **Yes, as docs.** | Owner documentation sign-off only. |
 | **#6** | `doctor`, setup scripts, launchers, and getting-started material. JDK 17 is retained. | **Yes, as a draft.** | Normal merge review remains; no JDK migration is implied. |
 | **#7** | Native-x86 process inspection, library instrumentation, and plugin ABI at `8b9231c145e80acbc723fbc893d072398cba143b`, after multiple must-fix rounds. | **Yes, as a preview draft only.** | Yes for later promotion, broader platform support, ABI trust, and transport decisions. The current preview verdict is supported by the completed review rounds and smoke evidence. |
 | **#8** | Optional Swing + FlatLaf artifact viewer. The visual pass is complete. The desktop module uses JDK 21 while the repository baseline remains JDK 17. | **Yes, as an optional desktop draft.** | Yes, principally for the JDK 21 module boundary and normal merge review. |
-| **#9** | Opt-in JVMTI attach. OpenJDK 21 live attach is often bind-only; default recovery remains startup `-agentpath`. | **Yes, as a preview draft only.** | Yes before any capability or default-policy expansion. |
+| **#9** | Opt-in JVMTI attach at `1a8cea87e8882fd48df8c00c5034021e23ccdaf3`. Common attach refusals are classified, there is no stealth or bypass behavior, and default recovery remains startup `-agentpath`. | **Yes: ship-as-preview-draft.** | Two review nits remain: `allowAttachSelf=false` governs self-attach and must not hard-refuse an external CLI, and pre-validation should print reason codes. Review remains required before capability or default-policy expansion. |
 | **#10** | This options and status report; documentation only. | **Yes, as docs.** | Owner accuracy and decision sign-off. |
-| **#11** | Optional privileged-observer contract. It is a documentation mock with Linux userspace maps mock behavior only and no kernel source. | **Yes, as a docs mock only.** | Yes before any implementation work; the default remains no privileged observer. |
+| **#11** | Optional privileged observer at `dc30188118a6579c024978fa9ff52ca154012170`, with a versioned plugin ABI and Linux maps backend. It is default-off userspace code with no kernel files. | **Yes: ship-as-preview-userspace.** | Yes for later promotion and merge-order integration with #7. It is not a kernel feature, and the default remains **no**. |
 | **#12** | Desktop live-attach/listen GUI, based on PR #8’s branch rather than `main`. Visual review is preview-ok. | **Yes, as a preview after #8.** | Yes for integration review after #8 and for the same attach limitations as #9. |
 
 ## Current evidence and boundaries
 
 ### Generic-first discovery (#4)
 
-- The earlier count-only silent misbind is closed.
-- The branch can be used as a draft/development path.
+- The reviewed revision is
+  `864f1a427c1fa30071733cfe09440cbbe6c6a483`.
+- Committed x86-64 fixtures exercise real PE, Mach-O, stripped ELF without
+  `.symtab`, and exports-only ELF images.
+- The independent review run reports `pytest`: 27 passed.
+- Ambiguous count-only matching is represented with `bindingGaps`; it is not
+  silently treated as a complete binding.
+- The branch can ship as a draft/development path.
+- The `recover` default is unchanged.
 - It is not the default release path.
-- PE and Mach-O loading are not yet proven by committed evidence.
-- Stripped-ELF behavior is not yet proven.
+- Non-x86-64 binaries, ELF images with section headers removed, and encrypted
+  or shuffled tables remain unproven.
 
 The consequence is deliberate: developers can continue validating the generic
 path without presenting incomplete platform coverage as a released default.
@@ -98,10 +105,17 @@ remain explicit rather than silently changing the repository baseline.
 
 ### JVMTI attach (#9)
 
+- The reviewed revision is
+  `1a8cea87e8882fd48df8c00c5034021e23ccdaf3`.
 - Attach is opt-in and uses the existing same-user plus explicit confirmation
   policy.
+- Common attach refusals are classified.
+- There is no stealth or bypass behavior.
 - On OpenJDK 21, live attach is often bind-only.
 - Startup `-agentpath` remains the default recovery path.
+- Outstanding review nit: `allowAttachSelf=false` controls JVM self-attach; it
+  should not cause the external CLI to hard-refuse an attach attempt.
+- Outstanding review nit: pre-validation should print its reason codes.
 
 The consequence is that attach can ship as a preview, but the GUI and CLI must
 display the capability actually obtained and must not imply startup-equivalent
@@ -109,11 +123,15 @@ coverage.
 
 ### Optional privileged observer (#11)
 
-- The current scope is a documentation mock.
-- Linux behavior is a userspace maps mock only.
-- There is no kernel source, build target, image, or shipped kernel component.
+- The reviewed revision is
+  `dc30188118a6579c024978fa9ff52ca154012170`.
+- The branch implements a versioned plugin ABI and a Linux maps backend.
+- It is an opt-in userspace preview and remains off by default.
+- There are no kernel files or shipped kernel components; this is not a kernel
+  feature.
+- Its `docs/privileged-observer.md` overlap with #7 remains a merge-order issue.
 
-The consequence is that the contract can be reviewed without creating a kernel
+The consequence is **ship-as-preview-userspace**, without creating a kernel
 maintenance or deployment commitment. The recommended default remains **no**.
 
 ## Human decision table
@@ -129,7 +147,7 @@ the recommendation, and the consequence of adopting it.
 | Attach policy | Any accessible process; same-user plus explicit confirmation; administrator allowlist. | Keep the already implemented **same-user plus confirmation flag** default; permit stricter deployment policy. | Preserves explicit consent and a narrow access boundary; does not remove JVM capability limits. |
 | Native-x86 repository placement | Keep isolated in this repository; split into a separate repository. | Keep it in-repo while enforcing the existing isolation, and revisit only if release cadence or ownership diverges. | Shared review and CI remain simple; strict boundaries preserve a later split option. |
 | Plugin trust and transport | Trusted in-process plugins; isolated plugins with an out-of-process protocol; support both. | Keep the ABI versioned and preview-only, define trust explicitly, and freeze transport only after real plugin evidence exists. | Avoids prematurely freezing unsafe trust or transport assumptions; stable compatibility is deferred. |
-| Privileged observer default | Default component; optional component; no shipped component. | **Default: no.** Keep #11 as a docs mock unless repeated userspace evidence proves a specific unmet need and a separate approval is made. | Avoids kernel support and deployment risk; any future exception requires new evidence and review. |
+| Privileged observer default | Default component; opt-in userspace preview; no shipped component. | **Default: no.** Permit #11 only as an explicitly enabled userspace preview; do not represent it as a kernel feature. | Preserves the versioned ABI and Linux maps evidence without creating kernel support or default deployment risk; promotion still requires separate evidence and review. |
 | Cryptographic library observation | Content capture; metadata-only; metadata by default with content opt-in. | **Metadata-only.** | Preserves useful call, size, status, and correlation evidence without collecting sensitive content. |
 
 ## What is still not true
@@ -137,10 +155,11 @@ the recommendation, and the consequence of adopting it.
 - The generic path is **not** the default release path.
 - Live attach is **not** equivalent to startup instrumentation and is often
   bind-only on OpenJDK 21.
+- Live attach does **not** provide stealth or bypass behavior.
 - The GUI does **not** replace the CLI as the automation or recovery contract.
 - Native-x86 is a **preview draft**, not a product feature.
-- The kernel path is **documentation plus a Linux userspace maps mock**; no
-  kernel implementation is shipped.
+- The privileged observer is an **opt-in userspace preview**, not a kernel
+  feature; it has no kernel files and is not enabled by default.
 - None of PRs #2–#12 is merged; GitHub currently shows every one as an open
   draft.
 
@@ -157,16 +176,20 @@ the recommendation, and the consequence of adopting it.
 
 ## Promotion gates
 
-- #4 needs committed PE, Mach-O, and stripped-ELF evidence before broad platform
-  or default-release claims.
+- #4 now has committed x86-64 PE, Mach-O, stripped-ELF-without-`.symtab`, and
+  exports-only ELF fixtures. Default promotion remains blocked on non-x86-64
+  evidence and more incomplete images, including section-header-removed ELF and
+  encrypted or shuffled tables.
 - #7 needs explicit plugin trust and transport decisions, additional platform
   evidence, and a separate promotion review before it can move beyond preview.
 - #8/#12 must keep their JDK 21 requirement module-local unless the repository
   separately approves a baseline migration.
 - #9/#12 must report actual attach capabilities and retain startup `-agentpath`
-  as the default recovery path.
-- #11 must remain documentation plus userspace mock behavior unless the
-  privileged-observer decision is explicitly changed with supporting evidence.
+  as the default recovery path. #9 should also correct the `allowAttachSelf`
+  pre-check and print pre-validation reason codes.
+- #11 is a userspace preview with a versioned plugin ABI and Linux maps backend.
+  It must remain default-off, and any promotion or kernel scope requires a
+  separate decision backed by new evidence.
 
 This report records current choices and consequences; it does not itself change
 any runtime default.
