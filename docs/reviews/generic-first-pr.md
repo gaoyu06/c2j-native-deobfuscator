@@ -331,3 +331,62 @@ method count. Multiple candidates remain unbound and produce a structured
 `bindingGaps` entry plus a CLI warning. The regression test uses two classes
 with the same native-method count and verifies that neither receives the
 table's address.
+
+---
+
+# Re-review — count-only fix (`0c27425`)
+
+- Branch re-reviewed: `cursor/generic-first-discovery-ca12` @ `0c27425`.
+- Scope: verify only that the unnamed count-only residual is closed and that a
+  unique count-only table still binds. No feature work. GUI/attach/kernel paths
+  untouched.
+- Delivery note: the upstream review-write path is not available from this
+  environment, so this re-review is recorded here per the review instructions.
+
+## Verdict — residual closed
+
+The silent misbind is gone. In `manifest_merge.core.merge`, the positional
+count fallback now collects every unbound class whose native-method count
+equals the table's address count, and:
+
+- **two-or-more candidates** → the table is left unbound (`boundTo` unset, no
+  `fnAddr` assigned to any method) and a structured `bindingGaps` record is
+  appended (`kind: ambiguous-count-only-table`, the method count, the candidate
+  class list, and a human-readable message). The gap path does **not** add any
+  class to `used_classes`, so a later same-count site cannot be silently
+  consumed into a false unique match.
+- **exactly one candidate** → binds as before.
+- **no candidate** → skipped.
+
+## What I proved
+
+- Committed suite passes: `binary_introspect` 9, `manifest_merge` 5,
+  `ast_matcher` 8 = 22 passed (deps installed locally: `lief`, `capstone`,
+  `tree-sitter`/`tree-sitter-c`, `click`, `pytest`). The new
+  `test_ambiguous_unnamed_count_only_table_is_left_unbound_with_gap` is among
+  them.
+- Direct `merge()` probes beyond the committed test:
+  - Two classes with the same native count + one unnamed count-only table →
+    both unbound, one gap listing both classes. **Silent misbind absent.**
+  - Unique count-only table (count differs) → binds correctly.
+  - One class already bound by a named table, then a count-only table whose
+    count collides → the remaining single candidate still binds (unique match
+    preserved).
+  - Three same-count classes + one count-only table → all unbound, gap lists
+    all three; the message carries the table location.
+- CLI surfaces each gap as a `warning:` line on stderr; nothing is bound
+  (`fnAddrResolved=0`).
+- Schema: a manifest carrying `bindingGaps` validates against
+  `schemas/manifest.schema.json`; a no-binary manifest still validates and now
+  always carries an (empty) `bindingGaps` array — additive, back-compatible.
+
+No clear break of the fix was found, so no patch was required on this branch.
+
+## Release posture
+
+This closes the last should-fix that was flagged as "worth closing before a
+default release." However, generic-first should stay **draft-only** for now:
+the PE (`.dll`) and Mach-O loading paths still have no committed fixture or
+test, and section-header-stripped ELF / unsupported arches still yield a silent
+empty registry. The ELF path is proven end-to-end; the other object formats are
+not. Keep it a draft/dev merge until those are exercised.
