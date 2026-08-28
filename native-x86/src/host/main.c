@@ -1,26 +1,43 @@
 /*
- * nativex86 host stub.
+ * nativex86 host.
  *
- * Loads one plugin through the versioned C ABI in
- * include/nativex86/plugin.h, hands it a host interface, replays a fixed
- * script of synthetic records, and shuts the plugin down again.
+ * Loads one or more observation plugins through the versioned C ABI in
+ * include/nativex86/plugin.h, hands each a host interface, and then
+ * either:
  *
- * It deliberately does nothing else. There is no process attachment, no
- * memory reading, no code patching and no instrumentation of any kind:
- * the records below are literals compiled into this file. The point of
- * the stub is to prove the ABI links, loads and dispatches.
+ *   - replays a fixed script of synthetic records (default, no target),
+ *     proving the ABI links, loads and dispatches; or
+ *
+ *   - attaches to a process the invoking user owns (--pid N, with the
+ *     --i-own-this-process confirmation) and reports metadata-only
+ *     records — module loads, resolved symbols, and live call sites for
+ *     the exports the loaded plugins asked to watch.
+ *
+ * The host owns no library-specific knowledge: it does not know what
+ * "SSL_write" or "Java_" mean. Plugins declare those names through
+ * request_watch; the host resolves and observes them as ordinary
+ * exported functions. No argument, buffer, key or return value is ever
+ * read or reported.
  */
 #include "nativex86/plugin.h"
 
 #include "event_bus.h"
+#include "observe.h"
 #include "platform.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#define NX86_HOST_MAX_PLUGINS 8
+#define NX86_HOST_MAX_WATCHES 64
+#define NX86_HOST_EMIT_MAX    NX86_HOST_MAX_EVENT_SIZE
+
 typedef struct host_state {
-    nx86_event_bus bus;
-    uint64_t       sink_seen;
+    nx86_event_bus   bus;
+    uint64_t         sink_seen;
+    nx86_watch_entry watches[NX86_HOST_MAX_WATCHES];
+    uint32_t         n_watches;
 } host_state;
 
 static nx86_str str_lit(const char *s)
@@ -41,6 +58,15 @@ static const char *kind_name(nx86_event_kind kind)
     case NX86_EVENT_SYMBOL:        return "symbol";
     case NX86_EVENT_CALL_SITE:     return "call-site";
     default:                       return "unknown";
+    }
+}
+
+static const char *phase_name(uint32_t phase)
+{
+    switch (phase) {
+    case NX86_CALL_PHASE_ENTER:  return "enter";
+    case NX86_CALL_PHASE_RETURN: return "return";
+    default:                     return "none";
     }
 }
 
@@ -90,29 +116,113 @@ static void NX86_CALL host_log(void *host_ctx,
            message != NULL ? message : "(null)");
 }
 
-/* Console sink so plugin-emitted events are visible in the smoke test. */
+/* Plain logging callback for the observation engine. */
+static void host_log_level(uint32_t level, const char *message)
+{
+    printf("host: [observe %u] %s\n", (unsigned)level,
+           message != NULL ? message : "(null)");
+}
+
+static nx86_status NX86_CALL host_request_watch(void *host_ctx,
+                                                const nx86_watch_request *req)
+{
+    host_state *state = (host_state *)host_ctx;
+    nx86_watch_entry *entry;
+    uint32_t copy_len;
+
+    if (state == NULL || req == NULL) {
+        return NX86_ERR_INVALID_ARG;
+    }
+    if (!NX86_HAS_FIELD(req->struct_size, nx86_watch_request, flags)) {
+        return NX86_ERR_INVALID_ARG;
+    }
+    if (req->match_kind != NX86_MATCH_EXACT &&
+        req->match_kind != NX86_MATCH_PREFIX) {
+        return NX86_ERR_INVALID_ARG;
+    }
+    if (req->name.data == NULL || req->name.len == 0u) {
+        return NX86_ERR_INVALID_ARG;
+    }
+    if (state->n_watches >= NX86_HOST_MAX_WATCHES) {
+        return NX86_ERR_NO_MEMORY;
+    }
+
+    entry = &state->watches[state->n_watches];
+    memset(entry, 0, sizeof(*entry));
+    copy_len = req->name.len;
+    if (copy_len >= (uint32_t)sizeof(entry->name)) {
+        copy_len = (uint32_t)sizeof(entry->name) - 1u;
+    }
+    memcpy(entry->name, req->name.data, copy_len);
+    entry->name[copy_len] = '\0';
+    entry->match_kind = req->match_kind;
+    entry->flags = (req->flags != 0u) ? req->flags : NX86_WATCH_SYMBOL;
+    state->n_watches++;
+    return NX86_OK;
+}
+
+/* Console sink so records are visible in the smoke test and to a user. */
 static void NX86_CALL host_console_sink(void *user_data,
                                         const nx86_event_header *event)
 {
     host_state *state = (host_state *)user_data;
     state->sink_seen++;
-    printf("host: sink saw seq=%llu kind=%s size=%u",
+    printf("host: sink seq=%llu kind=%s pid=%u size=%u",
            (unsigned long long)event->seq, kind_name(event->kind),
-           (unsigned)event->struct_size);
+           (unsigned)event->process_id, (unsigned)event->struct_size);
 
-    if (event->kind == NX86_EVENT_NOTE &&
-        event->struct_size >= (uint32_t)sizeof(nx86_event_note)) {
-        const nx86_event_note *note = (const nx86_event_note *)event;
-        printf(" source=%.*s text=%.*s", (int)note->source.len,
-               note->source.data != NULL ? note->source.data : "",
-               (int)note->text.len,
-               note->text.data != NULL ? note->text.data : "");
+    switch (event->kind) {
+    case NX86_EVENT_NOTE:
+        if (event->struct_size >= (uint32_t)sizeof(nx86_event_note)) {
+            const nx86_event_note *e = (const nx86_event_note *)event;
+            printf(" source=%.*s text=%.*s",
+                   (int)e->source.len, e->source.data ? e->source.data : "",
+                   (int)e->text.len, e->text.data ? e->text.data : "");
+        }
+        break;
+    case NX86_EVENT_MODULE_LOAD:
+        if (event->struct_size >= (uint32_t)sizeof(nx86_event_module_load)) {
+            const nx86_event_module_load *e =
+                (const nx86_event_module_load *)event;
+            printf(" module=%.*s base=0x%llx size=0x%llx",
+                   (int)e->name.len, e->name.data ? e->name.data : "",
+                   (unsigned long long)e->base_address,
+                   (unsigned long long)e->image_size);
+        }
+        break;
+    case NX86_EVENT_SYMBOL:
+        if (event->struct_size >= (uint32_t)sizeof(nx86_event_symbol)) {
+            const nx86_event_symbol *e = (const nx86_event_symbol *)event;
+            printf(" module=%.*s symbol=%.*s addr=0x%llx",
+                   (int)e->module_name.len,
+                   e->module_name.data ? e->module_name.data : "",
+                   (int)e->symbol_name.len,
+                   e->symbol_name.data ? e->symbol_name.data : "",
+                   (unsigned long long)e->address);
+        }
+        break;
+    case NX86_EVENT_CALL_SITE:
+        if (event->struct_size >= (uint32_t)sizeof(nx86_event_call_site)) {
+            const nx86_event_call_site *e =
+                (const nx86_event_call_site *)event;
+            printf(" module=%.*s target=%.*s site=0x%llx target=0x%llx phase=%s",
+                   (int)e->module_name.len,
+                   e->module_name.data ? e->module_name.data : "",
+                   (int)e->target_name.len,
+                   e->target_name.data ? e->target_name.data : "",
+                   (unsigned long long)e->site_address,
+                   (unsigned long long)e->target_address,
+                   phase_name(e->phase));
+        }
+        break;
+    default:
+        break;
     }
     printf("\n");
 }
 
 /* ------------------------------------------------------------------ */
-/* Synthetic record script                                             */
+/* Synthetic record script (used when no target is given)              */
 /* ------------------------------------------------------------------ */
 
 static void publish_sample_records(host_state *state)
@@ -150,35 +260,158 @@ static void publish_sample_records(host_state *state)
     call_site.site_address = module.base_address + 0x1147ULL;
     call_site.target_address = module.base_address + 0x1190ULL;
     call_site.site_kind = NX86_CALL_SITE_DIRECT;
+    call_site.phase = NX86_CALL_PHASE_NONE;
     (void)nx86_bus_publish(&state->bus, &call_site.header);
 }
 
 /* ------------------------------------------------------------------ */
-/* Entry point                                                         */
+/* Plugin loading                                                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct loaded_plugin {
+    void        *library;
+    nx86_plugin  plugin;
+    int          started;
+} loaded_plugin;
+
+static int load_one_plugin(const char *path, const nx86_host *host,
+                           loaded_plugin *out)
+{
+    nx86_plugin_init_fn init_fn;
+    void *symbol;
+    nx86_status status;
+
+    out->library = nx86_plat_open_library(path);
+    if (out->library == NULL) {
+        fprintf(stderr, "host: cannot load plugin '%s': %s\n", path,
+                nx86_plat_last_error());
+        return -1;
+    }
+    symbol = nx86_plat_find_symbol(out->library, NX86_PLUGIN_INIT_SYMBOL);
+    if (symbol == NULL) {
+        fprintf(stderr, "host: plugin '%s' exports no %s: %s\n", path,
+                NX86_PLUGIN_INIT_SYMBOL, nx86_plat_last_error());
+        nx86_plat_close_library(out->library);
+        out->library = NULL;
+        return -1;
+    }
+    memcpy(&init_fn, &symbol, sizeof(init_fn));
+
+    memset(&out->plugin, 0, sizeof(out->plugin));
+    out->plugin.struct_size = (uint32_t)sizeof(out->plugin);
+    status = init_fn(host, &out->plugin);
+    if (status != NX86_OK) {
+        fprintf(stderr, "host: plugin '%s' init failed (%d)\n", path,
+                (int)status);
+        nx86_plat_close_library(out->library);
+        out->library = NULL;
+        return -1;
+    }
+    if (out->plugin.struct_size > (uint32_t)sizeof(out->plugin)) {
+        out->plugin.struct_size = (uint32_t)sizeof(out->plugin);
+    }
+    if (NX86_VERSION_MAJOR(out->plugin.abi_version) != NX86_ABI_VERSION_MAJOR ||
+        !NX86_HAS_FIELD(out->plugin.struct_size, nx86_plugin, shutdown)) {
+        fprintf(stderr, "host: plugin '%s' ABI %u.%u incompatible with %u.%u\n",
+                path,
+                (unsigned)NX86_VERSION_MAJOR(out->plugin.abi_version),
+                (unsigned)NX86_VERSION_MINOR(out->plugin.abi_version),
+                (unsigned)NX86_ABI_VERSION_MAJOR,
+                (unsigned)NX86_ABI_VERSION_MINOR);
+        nx86_plat_close_library(out->library);
+        out->library = NULL;
+        return -1;
+    }
+
+    printf("host: loaded plugin id=%s name=%s abi=%u.%u caps=0x%x\n",
+           out->plugin.id ? out->plugin.id : "(unnamed)",
+           out->plugin.display_name ? out->plugin.display_name : "(unnamed)",
+           (unsigned)NX86_VERSION_MAJOR(out->plugin.abi_version),
+           (unsigned)NX86_VERSION_MINOR(out->plugin.abi_version),
+           (unsigned)out->plugin.capabilities);
+    out->started = 0;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* CLI                                                                 */
 /* ------------------------------------------------------------------ */
 
 static void usage(const char *argv0)
 {
-    printf("usage: %s <plugin-shared-library>\n", argv0);
-    printf("  Loads one nativex86 plugin (ABI %u.%u) and replays a fixed\n",
+    printf("usage: %s [options] <plugin.so> [<plugin.so> ...]\n", argv0);
+    printf("\n");
+    printf("Loads nativex86 observation plugins (ABI %u.%u).\n",
            (unsigned)NX86_ABI_VERSION_MAJOR, (unsigned)NX86_ABI_VERSION_MINOR);
-    printf("  script of synthetic records. No process is inspected.\n");
+    printf("\n");
+    printf("With no target, replays a fixed script of synthetic records.\n");
+    printf("With --pid, attaches to a process you own and reports\n");
+    printf("metadata-only records for the exports the plugins watch.\n");
+    printf("\n");
+    printf("Options:\n");
+    printf("  --pid N                observe process N (must be the same user)\n");
+    printf("  --i-own-this-process   required to attach; you assert you own N\n");
+    printf("                         and are authorized to inspect it\n");
+    printf("  --no-live              read-only pass only (no breakpoints)\n");
+    printf("  --max-events K         stop after K call-site records (default 16)\n");
+    printf("  --max-seconds T        safety time budget (default 20)\n");
+    printf("  --help                 this text\n");
+    printf("\n");
+    printf("Records describe program structure only: module bases, symbol\n");
+    printf("names and addresses, and control-flow edges. No argument bytes,\n");
+    printf("buffer contents, keys or return values are read or reported.\n");
 }
 
 int main(int argc, char **argv)
 {
     host_state state;
     nx86_host host;
-    nx86_plugin plugin;
-    nx86_plugin_init_fn init_fn;
-    void *library;
-    void *symbol;
+    loaded_plugin plugins[NX86_HOST_MAX_PLUGINS];
+    int n_plugins = 0;
+    const char *plugin_paths[NX86_HOST_MAX_PLUGINS];
+    int n_paths = 0;
     uint32_t sink_token = 0u;
     nx86_status status;
+    int i;
+    long pid = -1;
+    int own_confirmed = 0;
+    int no_live = 0;
+    uint32_t max_events = 16u;
+    uint32_t max_seconds = 20u;
+    int rc = 0;
 
-    if (argc != 2 || strcmp(argv[1], "--help") == 0) {
+    for (i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (strcmp(a, "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else if (strcmp(a, "--pid") == 0 && i + 1 < argc) {
+            pid = strtol(argv[++i], NULL, 10);
+        } else if (strcmp(a, "--i-own-this-process") == 0) {
+            own_confirmed = 1;
+        } else if (strcmp(a, "--no-live") == 0) {
+            no_live = 1;
+        } else if (strcmp(a, "--max-events") == 0 && i + 1 < argc) {
+            max_events = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(a, "--max-seconds") == 0 && i + 1 < argc) {
+            max_seconds = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (a[0] == '-') {
+            fprintf(stderr, "host: unknown option '%s'\n", a);
+            usage(argv[0]);
+            return 2;
+        } else {
+            if (n_paths >= NX86_HOST_MAX_PLUGINS) {
+                fprintf(stderr, "host: too many plugins (max %d)\n",
+                        NX86_HOST_MAX_PLUGINS);
+                return 2;
+            }
+            plugin_paths[n_paths++] = a;
+        }
+    }
+
+    if (n_paths == 0) {
         usage(argv[0]);
-        return argc == 2 ? 0 : 2;
+        return 2;
     }
 
     memset(&state, 0, sizeof(state));
@@ -192,6 +425,7 @@ int main(int argc, char **argv)
     host.unregister_observer = host_unregister_observer;
     host.emit = host_emit;
     host.log = host_log;
+    host.request_watch = host_request_watch;
 
     status = nx86_bus_register(&state.bus, NX86_EVENT_MASK_ALL,
                                host_console_sink, &state, &sink_token);
@@ -201,92 +435,102 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    library = nx86_plat_open_library(argv[1]);
-    if (library == NULL) {
-        fprintf(stderr, "host: cannot load plugin '%s': %s\n", argv[1],
-                nx86_plat_last_error());
-        return 1;
+    /* Gate attachment before loading anything if the CLI is inconsistent. */
+    if (pid >= 0) {
+        uint32_t owner_uid = 0u;
+        int owned;
+        if (!own_confirmed) {
+            fprintf(stderr,
+                    "host: attaching to a live process requires "
+                    "--i-own-this-process\n"
+                    "host: (you assert you own PID %ld and are authorized to "
+                    "inspect it)\n", pid);
+            return 2;
+        }
+        owned = nx86_observe_owner_check((uint32_t)pid, &owner_uid);
+        if (owned < 0) {
+            fprintf(stderr, "host: process %ld does not exist or cannot be "
+                    "inspected\n", pid);
+            return 1;
+        }
+        if (owned == 0) {
+            fprintf(stderr,
+                    "host: process %ld is owned by uid %u, not the current "
+                    "user; refusing to attach\n", pid, (unsigned)owner_uid);
+            return 1;
+        }
+        printf("host: target pid=%ld owned by the current user; backend: %s\n",
+               pid, nx86_observe_backend_name());
     }
 
-    symbol = nx86_plat_find_symbol(library, NX86_PLUGIN_INIT_SYMBOL);
-    if (symbol == NULL) {
-        fprintf(stderr, "host: plugin '%s' exports no %s: %s\n", argv[1],
-                NX86_PLUGIN_INIT_SYMBOL, nx86_plat_last_error());
-        nx86_plat_close_library(library);
-        return 1;
+    for (i = 0; i < n_paths; ++i) {
+        if (load_one_plugin(plugin_paths[i], &host, &plugins[n_plugins]) != 0) {
+            rc = 1;
+            goto cleanup;
+        }
+        n_plugins++;
     }
 
-    /* Casting an object pointer to a function pointer is not strictly
-     * conforming C, but it is what every dynamic loader hands back. */
-    memcpy(&init_fn, &symbol, sizeof(init_fn));
-
-    memset(&plugin, 0, sizeof(plugin));
-    /* Tell the plugin how many bytes it may write into our object. */
-    plugin.struct_size = (uint32_t)sizeof(plugin);
-    status = init_fn(&host, &plugin);
-    if (status != NX86_OK) {
-        fprintf(stderr, "host: plugin init failed (%d)\n", (int)status);
-        nx86_plat_close_library(library);
-        return 1;
-    }
-    /* A newer plugin may report a larger struct than this host knows:
-     * keep our own size and ignore any unknown tail. */
-    if (plugin.struct_size > (uint32_t)sizeof(plugin)) {
-        plugin.struct_size = (uint32_t)sizeof(plugin);
-    }
-    /* Reject only a major mismatch or a prefix too small to hold the
-     * fields this host reads (through the callbacks). */
-    if (NX86_VERSION_MAJOR(plugin.abi_version) != NX86_ABI_VERSION_MAJOR ||
-        !NX86_HAS_FIELD(plugin.struct_size, nx86_plugin, shutdown)) {
-        fprintf(stderr, "host: plugin ABI %u.%u is incompatible with %u.%u\n",
-                (unsigned)NX86_VERSION_MAJOR(plugin.abi_version),
-                (unsigned)NX86_VERSION_MINOR(plugin.abi_version),
-                (unsigned)NX86_ABI_VERSION_MAJOR,
-                (unsigned)NX86_ABI_VERSION_MINOR);
-        nx86_plat_close_library(library);
-        return 1;
-    }
-
-    printf("host: loaded plugin id=%s name=%s abi=%u.%u caps=0x%x\n",
-           plugin.id != NULL ? plugin.id : "(unnamed)",
-           plugin.display_name != NULL ? plugin.display_name : "(unnamed)",
-           (unsigned)NX86_VERSION_MAJOR(plugin.abi_version),
-           (unsigned)NX86_VERSION_MINOR(plugin.abi_version),
-           (unsigned)plugin.capabilities);
-
-    /* Open the delivery window: the plugin may emit from start onward. */
     nx86_bus_set_accepting(&state.bus, 1);
 
-    if (plugin.start != NULL) {
-        status = plugin.start(plugin.plugin_ctx);
-        if (status != NX86_OK) {
-            fprintf(stderr, "host: plugin start failed (%d)\n", (int)status);
-            nx86_bus_set_accepting(&state.bus, 0);
-            if (plugin.shutdown != NULL) {
-                plugin.shutdown(plugin.plugin_ctx);
+    for (i = 0; i < n_plugins; ++i) {
+        if (plugins[i].plugin.start != NULL) {
+            status = plugins[i].plugin.start(plugins[i].plugin.plugin_ctx);
+            if (status != NX86_OK) {
+                fprintf(stderr, "host: plugin '%s' start failed (%d)\n",
+                        plugins[i].plugin.id ? plugins[i].plugin.id : "?",
+                        (int)status);
+                rc = 1;
+                goto stop_all;
             }
-            nx86_plat_close_library(library);
-            return 1;
+        }
+        plugins[i].started = 1;
+    }
+
+    if (pid >= 0) {
+        nx86_observe_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.pid = (uint32_t)pid;
+        cfg.allow_live = no_live ? 0 : 1;
+        cfg.max_call_events = max_events;
+        cfg.max_seconds = max_seconds;
+        printf("host: watching %u export name(s); observing pid %ld%s\n",
+               (unsigned)state.n_watches, pid,
+               no_live ? " (read-only pass)" : "");
+        status = nx86_observe_run(&state.bus, &cfg, state.watches,
+                                  state.n_watches, host_log_level);
+        if (status != NX86_OK) {
+            fprintf(stderr, "host: observation ended with status %d\n",
+                    (int)status);
+        }
+    } else {
+        publish_sample_records(&state);
+    }
+
+stop_all:
+    for (i = n_plugins - 1; i >= 0; --i) {
+        if (plugins[i].started && plugins[i].plugin.stop != NULL) {
+            plugins[i].plugin.stop(plugins[i].plugin.plugin_ctx);
+        }
+    }
+    nx86_bus_set_accepting(&state.bus, 0);
+    for (i = n_plugins - 1; i >= 0; --i) {
+        if (plugins[i].plugin.shutdown != NULL) {
+            plugins[i].plugin.shutdown(plugins[i].plugin.plugin_ctx);
         }
     }
 
-    publish_sample_records(&state);
-
-    if (plugin.stop != NULL) {
-        plugin.stop(plugin.plugin_ctx);
+cleanup:
+    for (i = 0; i < n_plugins; ++i) {
+        if (plugins[i].library != NULL) {
+            nx86_plat_close_library(plugins[i].library);
+        }
     }
-    /* Close the window: no event authored after stop reaches an observer,
-     * so an emit from shutdown is rejected. */
-    nx86_bus_set_accepting(&state.bus, 0);
-    if (plugin.shutdown != NULL) {
-        plugin.shutdown(plugin.plugin_ctx);
-    }
-    nx86_plat_close_library(library);
 
     printf("host: published=%llu delivered=%llu sink_seen=%llu\n",
            (unsigned long long)state.bus.published,
            (unsigned long long)state.bus.delivered,
            (unsigned long long)state.sink_seen);
-    printf("host: shutdown ok\n");
-    return 0;
+    printf("host: shutdown %s\n", rc == 0 ? "ok" : "with errors");
+    return rc;
 }
