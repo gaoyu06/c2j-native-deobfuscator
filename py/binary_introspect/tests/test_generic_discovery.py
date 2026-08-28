@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 from types import SimpleNamespace
 
 import lief
@@ -8,6 +9,7 @@ import pytest
 
 from binary_introspect.arch.amd64_sysv import AMD64_SYSV
 from binary_introspect.arch.amd64_windows import AMD64_WINDOWS
+from binary_introspect.core import introspect
 from binary_introspect.jni_tables import (
     _find_register_natives_calls,
     _harvest_call,
@@ -16,8 +18,43 @@ from binary_introspect.jni_tables import (
 from binary_introspect.profile import detect_profile, get_profile
 
 
+FIXTURES = Path(__file__).with_name("fixtures")
+
+
 def _lea(insn: bytes, address: int, target: int) -> bytes:
     return insn + struct.pack("<i", target - (address + len(insn) + 4))
+
+
+def test_introspect_real_elf_resolves_static_jni_table_relocations() -> None:
+    report = introspect(FIXTURES / "libjni_registrar.so")
+
+    assert report.fmt == "ELF"
+    assert report.arch == "x86_64"
+    assert report.analysis == {
+        "profile": "generic",
+        "methodDiscovery": "jni-spec",
+    }
+
+    tables = [
+        entry
+        for entry in report.native_registry
+        if entry.get("source") == "register-natives-static"
+    ]
+    assert tables == [
+        {
+            "source": "register-natives-static",
+            "registerNativesCallSite": "0x103a",
+            "nMethods": 2,
+            "fnAddrs": ["0x1000", "0x1010"],
+            "profile": "generic",
+            "abi": "amd64-sysv",
+            "tableAddress": "0x3ee0",
+            "methods": [
+                {"name": "alpha", "desc": "()V", "fnAddr": "0x1000"},
+                {"name": "beta", "desc": "(I)I", "fnAddr": "0x1010"},
+            ],
+        }
+    ]
 
 
 @pytest.mark.parametrize(
