@@ -9,9 +9,11 @@
 # it never fakes one format from another.
 #
 # Toolchains used, all installable on a Linux host:
-#   ELF    : the host cc/gcc + strip           (always available)
-#   PE     : x86_64-w64-mingw32-gcc            (apt: gcc-mingw-w64-x86-64)
-#   Mach-O : clang + ld64.lld                  (apt: clang lld)
+#   ELF x86-64  : the host cc/gcc + strip          (always available)
+#   ELF aarch64 : aarch64-linux-gnu-gcc            (apt: gcc-aarch64-linux-gnu)
+#                 or `zig cc -target aarch64-linux-gnu`
+#   PE          : x86_64-w64-mingw32-gcc           (apt: gcc-mingw-w64-x86-64)
+#   Mach-O      : clang + ld64.lld                 (apt: clang lld)
 #
 # Reproducibility notes:
 #   - Mach-O is byte-reproducible (LC_UUID disabled via -no_uuid).
@@ -47,6 +49,24 @@ if [ -f libjni_registrar.so ] && command -v strip >/dev/null 2>&1; then
     log "built libjni_registrar.stripped.so"
 else
     skip "no strip or no source .so — keeping committed libjni_registrar.stripped.so"
+fi
+
+echo "[ELF/aarch64] libjni_registrar_aarch64.so (AAPCS64 static table + Java_* export)"
+# Prefer a dedicated cross gcc; fall back to zig if it is the only toolchain
+# present. The aarch64 test cross-checks function pointers against the export
+# addresses instead of hard-coding absolute VAs, so a rebuild that shifts
+# addresses does not break the assertions.
+AARCH64_CC="${AARCH64_CC:-aarch64-linux-gnu-gcc}"
+if command -v "$AARCH64_CC" >/dev/null 2>&1; then
+    "$AARCH64_CC" -O2 -shared -fPIC -nostdlib \
+        -o libjni_registrar_aarch64.so jni_registrar_aarch64.c
+    log "built libjni_registrar_aarch64.so ($AARCH64_CC)"
+elif command -v zig >/dev/null 2>&1; then
+    zig cc -target aarch64-linux-gnu -O2 -shared -fPIC -nostdlib \
+        -o libjni_registrar_aarch64.so jni_registrar_aarch64.c
+    log "built libjni_registrar_aarch64.so (zig cc)"
+else
+    skip "no aarch64 cross cc ($AARCH64_CC) or zig — keeping committed libjni_registrar_aarch64.so"
 fi
 
 echo "[ELF] libjni_exports_only.so (Java_* exports, no table)"

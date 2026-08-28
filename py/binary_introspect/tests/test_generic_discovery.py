@@ -138,6 +138,96 @@ def test_introspect_real_macho_resolves_static_table_and_jni_export() -> None:
     assert [e["fnSymbol"] for e in exports] == ["Java_com_example_Sample_ping"]
 
 
+def _capstone_disassembles_aarch64() -> bool:
+    """True when the host capstone can actually decode AArch64. The ABI can
+    still parse exports via LIEF without this, so table assertions are guarded
+    on it while the export assertion is not."""
+    try:
+        from capstone import CS_ARCH_ARM64, CS_MODE_ARM, Cs
+    except ImportError:
+        return False
+    try:
+        cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    except Exception:
+        return False
+    # ldr x4, [x4, #1720]  (little-endian bytes) — a smoke check that this
+    # capstone build carries the AArch64 backend.
+    return any(cs.disasm(bytes.fromhex("845c43f9"), 0))
+
+
+def test_introspect_real_aarch64_elf_recovers_static_table_and_export() -> None:
+    """AArch64 / AAPCS64 proven end-to-end on a committed ELF .so.
+
+    A non-x86-64 image: ``RegisterNatives`` reaches its slot through the
+    ``x16`` veneer register (``ldr``/``mov x16``/``br x16``) and the method
+    table address is formed with ``adrp``/``add``. When capstone can decode
+    AArch64 the static table is recovered with names/descriptors whose
+    function pointers cross-check the export addresses; when it cannot, the
+    ``Java_*`` export is still parsed via LIEF and no methods are fabricated.
+    """
+    path = FIXTURES / "libjni_registrar_aarch64.so"
+
+    binary = lief.parse(str(path))
+    assert binary.format == lief.Binary.FORMATS.ELF
+    assert int(binary.header.machine_type) == 0xB7  # EM_AARCH64
+
+    report = introspect(path)
+    assert report.fmt == "ELF"
+    assert report.arch == "aarch64"
+    assert report.analysis == {"profile": "generic", "methodDiscovery": "jni-spec"}
+
+    # The specification-defined Java_* export is recovered on every host,
+    # capstone or not — it comes from the LIEF symbol table, not disassembly.
+    exports = _jni_exports(report)
+    assert [e["fnSymbol"] for e in exports] == ["Java_com_example_Sample_ping"]
+    assert exports[0]["fnAddr"] == _export_addr(
+        report, "Java_com_example_Sample_ping"
+    )
+
+    tables = _static_tables(report)
+    if not _capstone_disassembles_aarch64():
+        # Honest fallback: no AArch64 disassembler means no table is claimed,
+        # and crucially no fabricated methods.
+        assert tables == []
+        return
+
+    assert len(tables) == 1, "AArch64 table must not silently yield nothing"
+    table = tables[0]
+    assert table["abi"] == "aarch64-aapcs64"
+    assert table["nMethods"] == 2
+    assert [(m["name"], m["desc"]) for m in table["methods"]] == [
+        ("alpha", "()V"),
+        ("beta", "(I)I"),
+    ]
+    # Function pointers resolve through R_AARCH64_ABS64 relocations on the
+    # zeroed fnPtr slots and cross-check against the exported addresses; a
+    # broken adrp/add fold or relocation read would desync these.
+    assert table["methods"][0]["fnAddr"] == _export_addr(report, "fixture_alpha")
+    assert table["methods"][1]["fnAddr"] == _export_addr(report, "fixture_beta")
+
+
+def test_aarch64_split_call_is_found_through_veneer_register() -> None:
+    """The RegisterNatives dispatch on AArch64 loads the vtable slot into a
+    general register, copies it into the ``x16`` veneer, and tail-``br``s
+    through it. The split-call scanner must follow the ``mov x16, x4`` to
+    still recognise the site — a regression here silently loses every
+    AArch64 table."""
+    from binary_introspect.arch.aarch64 import AARCH64_AAPCS64
+
+    cs = AARCH64_AAPCS64.disassembler()
+    if cs is None or not _capstone_disassembles_aarch64():
+        pytest.skip("host capstone cannot decode AArch64")
+
+    code = bytes.fromhex(
+        "845c43f9"  # 0x00: ldr x4, [x4, #1720]   (215 * 8)
+        "f00304aa"  # 0x04: mov x16, x4
+        "00021fd6"  # 0x08: br  x16
+    )
+    ranges = [(0x1000, 0x1000 + len(code), code)]
+    sites = _find_register_natives_calls(cs, AARCH64_AAPCS64, ranges, 215)
+    assert sites == [0x1008]
+
+
 def test_introspect_stripped_elf_still_recovers_table_via_generic_path() -> None:
     """A symbol-stripped copy of the registrar still yields the registration
     table via the generic path (relocations + section data, not .symtab).
