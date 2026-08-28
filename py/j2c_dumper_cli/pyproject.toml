@@ -2,7 +2,7 @@
 name = "j2c-dumper-cli"
 version = "0.1.0"
 description = "Top-level orchestrator for j2c-dumper"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "typer>=0.15.1",
     "rich>=13.7.0",
