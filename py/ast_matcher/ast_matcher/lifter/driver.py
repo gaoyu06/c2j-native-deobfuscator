@@ -25,7 +25,7 @@ from typing import Any
 import tree_sitter
 import tree_sitter_c
 
-from binary_introspect.profile import Profile, detect_profile, get_profile
+from binary_introspect.profile import Profile, get_profile
 
 from .options import LifterOptions
 from .syms import Sym, SymClass, SymFieldId, SymMethodId, SymObject, SymStringLit
@@ -1031,7 +1031,9 @@ def lift_ghidra_dump(
     profile_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Lift every entry in a ghidra-dump.json into recovered/*.json
-    records. Returns the list of records (caller writes them).
+    records. An explicit profile wins; otherwise use ``analysis.profile``
+    from the supplied manifest/binary report before falling back to
+    conservative ``generic``. Returns the list of records (caller writes them).
     """
     options = options or LifterOptions()
     data = json.loads(ghidra_json_path.read_text(encoding="utf-8"))
@@ -1039,7 +1041,8 @@ def lift_ghidra_dump(
     if manifest_path is not None and manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    profile = get_profile(profile_name) if profile_name else get_profile("generic")
+    artifact_profile = ((manifest or {}).get("analysis") or {}).get("profile")
+    profile = get_profile(profile_name or artifact_profile or "generic")
     pool_entries = (manifest or {}).get("stringPoolEntries") or []
     cache_table = (manifest or {}).get("cacheTable") or {}
 

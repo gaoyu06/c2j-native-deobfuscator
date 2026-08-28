@@ -16,6 +16,13 @@
     "loaderClass": { "type": ["string", "null"] },
     "nativeDir":   { "type": ["string", "null"] },
     "stringPool":  { "type": "array", "items": { "type": "string" } },
+    "analysis": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "methodDiscovery": { "type": "string" }
+      }
+    },
     "classes": {
       "type": "array",
       "items": {

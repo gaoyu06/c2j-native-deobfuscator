@@ -1,7 +1,12 @@
 """Sanity tests for the lifter using hand-crafted pseudo-C snippets that mirror
 what Ghidra would emit for j2c-transpiled functions."""
 
+import json
+
+import pytest
+
 from ast_matcher.core import lift_function
+from ast_matcher.lifter import driver
 
 
 def test_iadd_pattern():
@@ -69,6 +74,59 @@ def test_invokevirtual_pattern():
     invk = next(i for i in insns if i["op"] == "INVOKEVIRTUAL")
     assert invk["owner"] == "java/io/PrintStream"
     assert invk["name"] == "println"
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "analysis", "explicit_profile", "expected_profile"),
+    [
+        ("manifest.json", {"profile": "native_obfuscator"}, None, "native_obfuscator"),
+        ("binary.json", {"profile": "j2cc"}, None, "j2cc"),
+        ("manifest.json", {"profile": "native_obfuscator"}, "generic", "generic"),
+        ("manifest.json", {}, None, "generic"),
+    ],
+)
+def test_ghidra_lifter_selects_profile_from_artifact_analysis(
+    tmp_path,
+    monkeypatch,
+    artifact_name,
+    analysis,
+    explicit_profile,
+    expected_profile,
+):
+    dump_path = tmp_path / "ghidra-dump.json"
+    dump_path.write_text(
+        json.dumps(
+            {
+                "functions": [
+                    {
+                        "owner": "sample/Native",
+                        "methodName": "run",
+                        "methodDesc": "()V",
+                        "code": "void run(void) {}",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact_path = tmp_path / artifact_name
+    artifact_path.write_text(json.dumps({"analysis": analysis}), encoding="utf-8")
+
+    selected_profiles = []
+
+    def fake_lift(*args, **kwargs):
+        selected_profiles.append(kwargs["profile"].name)
+        return {"instructions": [{"op": "RETURN"}], "warnings": []}
+
+    monkeypatch.setattr(driver, "lift_ghidra_function", fake_lift)
+
+    driver.lift_ghidra_dump(
+        dump_path,
+        artifact_path,
+        profile_name=explicit_profile,
+    )
+
+    assert selected_profiles == [expected_profile]
 
 
 if __name__ == "__main__":

@@ -319,6 +319,11 @@ python -m j2c_dumper_cli.main rebuild --input in.jar \
     --manifest static-lite/manifest.json -o out.jar
 ```
 
+`manifest.json` preserves `analysis.profile` from `binary.json`. When the
+`ast_matcher` command omits `--profile`, it uses that recorded profile; an
+explicit `--profile` overrides it, and artifacts without one remain on the
+conservative `generic` profile.
+
 ### Emulation recovery (no JVM, no Ghidra — for C-rewritten logic / decrypted constants)
 
 ```bash

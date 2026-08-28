@@ -128,6 +128,11 @@ python -m j2c_dumper_cli.main static-reverse ghidra-dump.json \
   --manifest manifest.json -o recovered/
 ```
 
+`manifest-merge` carries `analysis.profile` from `binary.json` into
+`manifest.json`. The lifter uses that profile when `--profile` is omitted.
+An explicit profile still wins, and a missing profile falls back to
+conservative `generic`.
+
 Under `generic`, throw-message hints, decompiler-specific vtable rewriting,
 cache-table assumptions, and exception/cache guard skipping remain disabled.
 A matching variant profile may opt into each behavior, and lifter flags can

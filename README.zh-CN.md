@@ -267,6 +267,11 @@ python -m j2c_dumper_cli.main rebuild --input in.jar \
     --manifest static-lite/manifest.json -o out.jar
 ```
 
+`manifest.json` 会保留 `binary.json` 中的 `analysis.profile`。如果
+`ast_matcher` 命令没有传 `--profile`，它会使用这个已记录的 Profile；
+显式传入的 `--profile` 优先，没有记录 Profile 的旧产物仍使用保守的
+`generic`。
+
 ### 模拟恢复（无需 JVM、无需 Ghidra —— 针对纯 C 改写的逻辑 / 解密常量）
 
 ```bash

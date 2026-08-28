@@ -70,3 +70,15 @@ def test_named_register_natives_table_binds_without_count_guessing() -> None:
         "0x401000",
         "0x401020",
     ]
+
+
+def test_merge_preserves_binary_analysis_profile() -> None:
+    manifest = merge(
+        _classes([("alpha", "()V")]),
+        {"analysis": {"profile": "native_obfuscator", "methodDiscovery": "jni-spec"}},
+    )
+
+    assert manifest["analysis"] == {
+        "profile": "native_obfuscator",
+        "methodDiscovery": "jni-spec",
+    }

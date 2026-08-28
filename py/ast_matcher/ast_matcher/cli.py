@@ -33,12 +33,12 @@ _LIFTER_FLAGS = [f.name for f in dataclasses.fields(LifterOptions)]
 @click.option("--manifest", default=None,
               type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="manifest.json from manifest-merge — used for per-class "
-                   "lookup tables + string-pool offsets.")
+                   "lookup tables, string-pool offsets, and analysis.profile. "
+                   "A binary.json may be supplied when only its profile is needed.")
 @click.option("--profile", "profile_name", default=None,
-              help="Obfuscator profile; defaults to the conservative 'generic' "
-                   "profile when omitted (the lifter does not auto-detect from a "
-                   "pseudo-C dump). Pass the variant, e.g. --profile "
-                   "native_obfuscator, to enable its body-lift heuristics.")
+              help="Obfuscator profile; defaults to analysis.profile from the "
+                   "supplied manifest/binary report, then conservative "
+                   "'generic'. Pass an explicit variant to override it.")
 @click.option("--enable", "enables", multiple=True,
               type=click.Choice(_LIFTER_FLAGS),
               help="Force-enable a lifter feature (repeatable).")

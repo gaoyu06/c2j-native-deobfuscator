@@ -65,6 +65,7 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
         "classes": [],
         "hiddenClasses": (binary or {}).get("hiddenClasses") or [],
         "cacheTable": (binary or {}).get("cacheTable") or {},
+        "analysis": (binary or {}).get("analysis") or {},
     }
 
     # Build the candidate-class set from the binary report (Phase 1 hint: which
