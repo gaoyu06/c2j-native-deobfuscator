@@ -26,8 +26,11 @@ Everything else (`uv`, ASM, `capstone`, `lief`, …) is pulled in by the setup
 script. The default recover path imports `capstone`, so it is a required
 dependency of `binary-introspect`, not optional.
 
-> The commands below use `python3` (the interpreter a minimal POSIX system
-> ships and that `scripts/setup.sh` selects). On Windows, use `python`.
+> **Run the CLI through `scripts/j2c`** (`scripts\j2c.ps1` on Windows). Setup
+> installs the Python workspace into `py/.venv` via `uv`, so a bare
+> `python3 -m j2c_dumper_cli` on the *system* interpreter would not find the
+> packages. The launcher runs the interpreter the packages are actually in (the
+> `uv` venv, or the interpreter the `pip` fallback used).
 
 ---
 
@@ -43,13 +46,16 @@ bash scripts/setup.sh            # Linux / macOS
 
 1. builds the JVM modules (`jvm/*/build/install/...`),
 2. syncs the Python workspace (`uv sync`, or `pip install -e` as a fallback),
-3. builds the native JVMTI agent when a JDK **and** `zig` are present — otherwise
-   it prints a clear note and continues (only the dynamic path needs it).
+3. builds the native JVMTI agent when a JDK **and** `zig` are present **and the
+   host is x86-64** — otherwise it prints a clear note and continues (only the
+   dynamic path needs it). `native/build.sh` targets x86-64; on ARM (or any
+   other CPU) setup skips the native agent and does *not* report the dynamic
+   path as ready.
 
 ## 2. Check the toolchain — ~10 s
 
 ```bash
-python3 -m j2c_dumper_cli doctor
+scripts/j2c doctor       # Windows:  scripts\j2c.ps1 doctor
 ```
 
 It prints a table and, for anything missing, the exact next command. Example of
@@ -69,12 +75,13 @@ on it. A `WARN` (for example, Java is new enough but `JAVA_HOME` is unset) is a
 caveat, not a failure, and does not flip the ready bit. The optional tools
 (Ghidra, unicorn, zig) never block. On this host `doctor` only accepts the agent
 name it can actually load (`j2c_agent.so` on Linux, `.dylib` on macOS, `.dll` on
-Windows); a leftover build for another OS is reported as missing.
+Windows); a leftover build for another OS, or one built for a different CPU
+architecture, is reported as missing.
 
 ## 3. Recover — ~1–2 min
 
 ```bash
-python3 -m j2c_dumper_cli recover \
+scripts/j2c recover \
     path/to/obfuscated.jar \
     -o path/to/clean.jar \
     --run-cmd "java -jar path/to/obfuscated.jar"
@@ -117,7 +124,7 @@ needs a human pass — see [`manual-restoration.md`](manual-restoration.md).
 
 **`recover cannot start: required build artifacts are missing`**
 The JVM modules or native agent aren't built. Run `scripts/setup.sh` (or
-`scripts/setup.ps1`) and then `python3 -m j2c_dumper_cli doctor`.
+`scripts/setup.ps1`) and then `scripts/j2c doctor`.
 
 **`doctor` says `Java / JDK 17+  WARN` — JAVA_HOME is not set**
 Java is new enough but `JAVA_HOME` is unset; the native agent build needs it.

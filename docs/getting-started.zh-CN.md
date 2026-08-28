@@ -24,8 +24,10 @@
 其余依赖（`uv`、ASM、`capstone`、`lief`……）都由 setup 脚本自动拉取。默认恢复
 路径会 import `capstone`，因此它是 `binary-introspect` 的必需依赖，并非可选。
 
-> 下面的命令使用 `python3`（最小化 POSIX 系统自带、且 `scripts/setup.sh` 选用的
-> 解释器）。在 Windows 上请改用 `python`。
+> **请通过 `scripts/j2c` 运行 CLI**（Windows 上为 `scripts\j2c.ps1`）。setup 会用
+> `uv` 把 Python 工作区装进 `py/.venv`，所以直接用*系统* `python3 -m j2c_dumper_cli`
+> 是找不到这些包的。该启动器会运行真正装了这些包的解释器（`uv` 的 venv，或 `pip`
+> 兜底所用的解释器）。
 
 ---
 
@@ -41,13 +43,14 @@ bash scripts/setup.sh            # Linux / macOS
 
 1. 构建 JVM 模块（`jvm/*/build/install/...`）；
 2. 同步 Python 工作区（`uv sync`，否则回退到 `pip install -e`）；
-3. 当 JDK **且** `zig` 都存在时构建 native JVMTI agent —— 否则打印清晰提示并
-   继续（只有动态路径需要它）。
+3. 当 JDK **且** `zig` 都存在、**且主机是 x86-64** 时构建 native JVMTI agent ——
+   否则打印清晰提示并继续（只有动态路径需要它）。`native/build.sh` 面向 x86-64；
+   在 ARM（或其他 CPU）上 setup 会跳过 native agent，并且*不会*报告动态路径就绪。
 
 ## 2. 检查工具链 —— 约 10 秒
 
 ```bash
-python3 -m j2c_dumper_cli doctor
+scripts/j2c doctor       # Windows：scripts\j2c.ps1 doctor
 ```
 
 它会打印一张表，并为每个缺失项给出确切的下一步命令。一台尚未就绪的机器示例：
@@ -64,12 +67,13 @@ Not ready. Missing: ... Run scripts/setup.sh (or scripts/setup.ps1) to fix.
 脚本做前置门槛。`WARN`（例如 Java 版本够新但 `JAVA_HOME` 未设）只是提醒，不算失败，
 也不会翻转就绪标志。可选工具（Ghidra、unicorn、zig）永远不会导致阻塞。在本机上
 `doctor` 只接受它真正能加载的 agent 文件名（Linux 上是 `j2c_agent.so`，macOS 上是
-`.dylib`，Windows 上是 `.dll`）；为其他操作系统遗留的构建会被报告为 missing。
+`.dylib`，Windows 上是 `.dll`）；为其他操作系统遗留、或为其他 CPU 架构构建的产物
+都会被报告为 missing。
 
 ## 3. 恢复 —— 约 1–2 分钟
 
 ```bash
-python3 -m j2c_dumper_cli recover \
+scripts/j2c recover \
     path/to/obfuscated.jar \
     -o path/to/clean.jar \
     --run-cmd "java -jar path/to/obfuscated.jar"
@@ -108,7 +112,7 @@ python3 -m j2c_dumper_cli recover \
 
 **`recover cannot start: required build artifacts are missing`**
 JVM 模块或 native agent 没构建。先跑 `scripts/setup.sh`（或 `scripts/setup.ps1`），
-再 `python3 -m j2c_dumper_cli doctor`。
+再 `scripts/j2c doctor`。
 
 **`doctor` 显示 `Java / JDK 17+  WARN` —— JAVA_HOME 未设置**
 Java 版本够新，但 `JAVA_HOME` 没设；native agent 构建需要它。这是提醒，不是阻塞：

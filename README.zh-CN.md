@@ -27,13 +27,14 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 
 ```bash
 git clone <本仓库> && cd c2j-native-deobfuscator
-bash scripts/setup.sh                      # 构建 JVM + Python + native agent
-python3 -m j2c_dumper_cli doctor           # 确认工具链就绪
-python3 -m j2c_dumper_cli recover in.jar -o out.jar --run-cmd "java -jar in.jar"
+bash scripts/setup.sh                      # 构建 JVM + Python（x86-64 上再构建 native agent）
+scripts/j2c doctor                         # 检查版本 + 构建产物
+scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 ```
 
-> POSIX 示例使用 `python3`（最小化系统自带、也是 `scripts/setup.sh` 选用的解释器）。
-> 在 Windows 上请改用 `python`。
+> **请通过 `scripts/j2c` 运行 CLI**（Windows 上为 `scripts\j2c.ps1`）。setup 会用
+> `uv` 把 Python 工作区装进 `py/.venv`，所以直接用*系统* `python3 -m j2c_dumper_cli`
+> 找不到这些包。该启动器会挑选真正装了这些包的解释器。
 
 详见下方的 [Quick start](#quick-start) 以及
 [10 分钟上手指南](docs/getting-started.zh-CN.md)
@@ -229,8 +230,8 @@ Linux 的 `.so`，而不是这里 JVM 加载的 Windows `.dll`。
 ### 1. 安装（一次性构建全部）
 
 ```bash
-# 幂等脚本：构建 JVM 模块、同步 Python 工作区，并在检测到 JDK + zig 时构建
-# native agent。可以放心重复执行。
+# 幂等脚本：构建 JVM 模块、同步 Python 工作区，并在 x86-64 主机上检测到 JDK + zig
+# 时构建 native agent。可以放心重复执行。
 bash scripts/setup.sh            # Linux / macOS
 # Windows（PowerShell）：
 #   pwsh scripts/setup.ps1
@@ -238,12 +239,14 @@ bash scripts/setup.sh            # Linux / macOS
 
 `scripts/setup.sh` 在可用时用 [`uv`](https://docs.astral.sh/uv/) 同步 Python
 工作区，否则回退到 `pip install -e`。native agent 这一步需要 JDK 和 `zig`；
-缺任意一个时会带清晰提示跳过（只有动态路径需要它）。
+缺任意一个时会带清晰提示跳过（只有动态路径需要它）。`native/build.sh` 面向
+x86-64，因此在 ARM（或其他 CPU）上 setup 会跳过 native agent，并且不会报告动态
+路径就绪 —— 那里请改用模拟兜底。
 
 ### 2. 检查工具链
 
 ```bash
-python3 -m j2c_dumper_cli doctor
+scripts/j2c doctor       # Windows：scripts\j2c.ps1 doctor
 ```
 
 `doctor` 会报告 Java/JDK、Python、Python 恢复阶段是否可 import（`capstone` +
@@ -258,7 +261,7 @@ unicorn、zig），并为每个缺失项打印下一步命令。它只校验工�
 观察 JNI 调用流，再抬升回字节码：
 
 ```bash
-python3 -m j2c_dumper_cli recover \
+scripts/j2c recover \
     path/to/obfuscated.jar \
     -o path/to/clean.jar \
     --run-cmd "java -jar path/to/obfuscated.jar"
@@ -277,8 +280,10 @@ python3 -m j2c_dumper_cli recover \
 覆盖实际执行到的路径，因此未观察到的方法可能仍是桩或只有部分方法体；请检查结果，
 难度较大的目标要预期需要人工补全（见上文的"人工过一遍"说明）。
 
-> `python3 -m j2c_dumper_cli ...` 是更友好的入口；
-> `python3 -m j2c_dumper_cli.main ...` 仍然可用。
+> `scripts/j2c ...` 会用 setup 安装这些包的解释器来运行 CLI（`py/.venv` 下的
+> `uv` venv，或 `pip` 兜底所用的解释器）。如果你自己激活了那个环境，等价的
+> `python3 -m j2c_dumper_cli ...`（或 `python3 -m j2c_dumper_cli.main ...`）也能用
+> —— 启动器只是帮你免于挑错解释器。
 
 ### 兜底：模拟恢复（无需运行、无需 Ghidra）
 
@@ -306,7 +311,7 @@ python3 py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
 ### 分阶段执行
 
 每个阶段都有独立的子命令，详见
-`python3 -m j2c_dumper_cli --help`。
+`scripts/j2c --help`。
 
 ---
 
@@ -317,9 +322,9 @@ python3 py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
 
 ```bash
 # 1. 解析 jar + 内省二进制（不需要 --run-cmd）
-python3 -m j2c_dumper_cli parse-jar      in.jar      -o classes.json
-python3 -m j2c_dumper_cli inspect-binary natives.bin -o binary.json
-python3 -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.json
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
 
 # 2. 用 Ghidra Headless 跑 native blob
 <GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
@@ -329,7 +334,7 @@ python3 -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.js
 
 # 3. pseudo-C 抬升到字节码 + 重建 JAR
 python3 -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
-python3 -m j2c_dumper_cli rebuild --input in.jar --recovered recovered/ \
+scripts/j2c rebuild --input in.jar --recovered recovered/ \
     --manifest manifest.json -o out.jar
 ```
 

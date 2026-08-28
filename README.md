@@ -31,13 +31,15 @@ You can run the default recovery path by hand — no coding agent required:
 
 ```bash
 git clone <this repo> && cd c2j-native-deobfuscator
-bash scripts/setup.sh                      # build JVM + Python + native agent
-python3 -m j2c_dumper_cli doctor           # confirm the toolchain is ready
-python3 -m j2c_dumper_cli recover in.jar -o out.jar --run-cmd "java -jar in.jar"
+bash scripts/setup.sh                      # build JVM + Python (+ native agent on x86-64)
+scripts/j2c doctor                         # check versions + build artifacts
+scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 ```
 
-> POSIX examples use `python3` (what a minimal system ships and what
-> `scripts/setup.sh` selects). On Windows use `python`.
+> **Run the CLI through `scripts/j2c`** (`scripts\j2c.ps1` on Windows). Setup
+> installs the Python workspace into `py/.venv` (via `uv`), so a bare
+> `python3 -m j2c_dumper_cli` on the *system* interpreter would not find the
+> packages. The launcher picks the interpreter that actually has them.
 
 See [Quick start](#quick-start) below and the
 [10-minute getting-started guide](docs/getting-started.md)
@@ -278,7 +280,7 @@ New here? Follow the [10-minute getting-started guide](docs/getting-started.md)
 
 ```bash
 # Idempotent: builds the JVM modules, syncs the Python workspace, and builds
-# the native agent when a JDK + zig are present. Safe to re-run.
+# the native agent when a JDK + zig are present on an x86-64 host. Safe to re-run.
 bash scripts/setup.sh            # Linux / macOS
 # Windows (PowerShell):
 #   pwsh scripts/setup.ps1
@@ -287,12 +289,14 @@ bash scripts/setup.sh            # Linux / macOS
 `scripts/setup.sh` uses [`uv`](https://docs.astral.sh/uv/) for the Python
 workspace when available and falls back to `pip install -e` otherwise. The
 native agent step needs a JDK and `zig`; it is skipped with a clear message if
-either is missing (only the dynamic path needs it).
+either is missing (only the dynamic path needs it). `native/build.sh` targets
+x86-64, so on ARM (or any other CPU) setup skips the native agent and does not
+report the dynamic path as ready — use the emulation fallback there.
 
 ### 2. Check your toolchain
 
 ```bash
-python3 -m j2c_dumper_cli doctor
+scripts/j2c doctor       # Windows:  scripts\j2c.ps1 doctor
 ```
 
 `doctor` reports Java/JDK, Python, the importability of the Python recover
@@ -310,7 +314,7 @@ JVMTI agent to a live run, observes the JNI call stream, and lifts it back to
 bytecode:
 
 ```bash
-python3 -m j2c_dumper_cli recover \
+scripts/j2c recover \
     path/to/obfuscated.jar \
     -o path/to/clean.jar \
     --run-cmd "java -jar path/to/obfuscated.jar"
@@ -330,8 +334,11 @@ during the run*. Dynamic tracing only covers executed paths, so unobserved
 methods may keep a stub or a partial body; inspect the result and expect manual
 completion on hard targets (see the human-pass note above).
 
-> `python3 -m j2c_dumper_cli ...` is the friendly entry point;
-> `python3 -m j2c_dumper_cli.main ...` still works too.
+> `scripts/j2c ...` runs the CLI through the interpreter setup installed the
+> packages into (the `uv` venv under `py/.venv`, or the `pip`-fallback
+> interpreter). If you activate that environment yourself, the equivalent
+> `python3 -m j2c_dumper_cli ...` (or `python3 -m j2c_dumper_cli.main ...`) works
+> too — the launcher just saves you from picking the wrong interpreter.
 
 ### Fallback: emulation (no live run, no Ghidra)
 
@@ -359,7 +366,7 @@ command reference + verified matrix: [`py/native_emulate/README.md`](py/native_e
 ### Stage-by-stage
 
 Every stage has its own subcommand; see
-`python3 -m j2c_dumper_cli --help` for the full list.
+`scripts/j2c --help` for the full list.
 
 ---
 
@@ -371,9 +378,9 @@ requires **Ghidra 11.x**:
 
 ```bash
 # 1. Parse jar + introspect binary (no --run-cmd needed)
-python3 -m j2c_dumper_cli parse-jar      in.jar      -o classes.json
-python3 -m j2c_dumper_cli inspect-binary natives.bin -o binary.json
-python3 -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.json
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
 
 # 2. Run Ghidra headless against the native blob
 <GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
@@ -383,7 +390,7 @@ python3 -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.js
 
 # 3. Lift the pseudo-C to bytecode + rebuild
 python3 -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
-python3 -m j2c_dumper_cli rebuild --input in.jar --recovered recovered/ \
+scripts/j2c rebuild --input in.jar --recovered recovered/ \
     --manifest manifest.json -o out.jar
 ```
 
