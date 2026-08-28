@@ -197,6 +197,15 @@ names, sizes, edges — never **program data**. An extension that would
 carry the contents of a buffer belongs in a different project, not in a
 minor version of this ABI.
 
+The one free-text field — a diagnostic note's `text` (`NX86_EVENT_NOTE`)
+— is not made safe by construction: it can hold arbitrary text, so the
+rule is stated explicitly rather than implied by the layout. It carries
+host/status text only; plugins and the host must never place a key,
+buffer or payload in it. A host enforces that with a length cap — the
+reference host rejects a note whose `text` exceeds `NX86_NOTE_TEXT_MAX`
+(512 bytes) with `NX86_ERR_INVALID_ARG` — so the guarantee is policy
+plus a bound, not a structural impossibility.
+
 ---
 
 ## Host interface

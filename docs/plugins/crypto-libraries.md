@@ -11,8 +11,11 @@ traffic tool.
 > well-known entry was reached and *where* it lives — module, symbol
 > name, address, and the control-flow edge. They never read, request or
 > report the bytes those functions move: no plaintext, no ciphertext, no
-> key, no IV, no argument value, and no return value. There is no code
-> path that could, by construction of the plugin ABI (see
+> key, no IV, no argument value, and no return value. No event field is
+> defined to carry a payload; the one free-text field — a diagnostic
+> note's `text` — is host/status text only, and the host enforces that
+> with a fixed 512-byte length cap (`NX86_NOTE_TEXT_MAX`) rather than
+> relying on it being impossible by construction (see
 > [`plugin-abi.md`](../plugin-abi.md), "What events may not carry").
 
 ---

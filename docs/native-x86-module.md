@@ -57,8 +57,9 @@ unrecoverable** by the three existing paths, because code that never
 calls back through the JNI produces no trace and no recognisable
 pattern. Structural facts about the native image — which module got
 loaded at which base, which symbols it exposes, which call sites point
-where — are the kind of evidence that helps a human or an agent attack
-that residue. Collecting them is a systems problem, not a JVM problem.
+where — are the kind of evidence that helps a human or an agent make
+sense of that residue. Collecting them is a systems problem, not a JVM
+problem.
 
 ## Non-goals
 
@@ -93,10 +94,15 @@ entered and returned. That observation is deliberately bounded:
   return). This is the map and the timing, not the traffic.
 - **Out of scope, permanently:** capturing the bytes those functions
   move. No plaintext, ciphertext, key, IV, argument value or return
-  value is read or reported, and the ABI has no field that could carry
-  them. Observation never intercepts, rewrites, decrypts or alters what
-  the target computes — a breakpoint is inserted, the entry/return is
-  noted, and the original code is restored, changing no program logic.
+  value is read or reported. No event field is defined to carry a
+  payload; the one free-text field that exists — a diagnostic note's
+  `text` — is host/status text only. Plugins and the host must not place
+  keys, buffers or payloads in it, and the host rejects any note whose
+  text exceeds a fixed length cap (`NX86_NOTE_TEXT_MAX`, 512 bytes). That
+  is a policy plus a length cap, not a structural impossibility.
+  Observation never intercepts, rewrites, decrypts or alters what the
+  target computes — a breakpoint is inserted, the entry/return is noted,
+  and the original code is restored, changing no program logic.
 
 Naming and *observing* an export is in scope; interception, alteration
 and content capture are not, at any privilege level.
@@ -196,12 +202,17 @@ recording of what it processed. That is also what makes the stream
 useful to a static lifter, which needs addresses and edges rather than
 values.
 
-Two ABI-level choices keep this honest:
+These record-model choices keep this honest:
 
 - There is no generic "raw bytes" event. Adding one would silently
   convert the format into a data-capture format.
 - `call-site` carries addresses and a resolved callee name, not a
   parameter list.
+- The one free-text field, a diagnostic note's `text`, is bounded and
+  policed rather than structurally safe: it is documented as host/status
+  text, must not carry keys, buffers or payloads, and the host rejects a
+  note whose text exceeds a fixed 512-byte cap (`NX86_NOTE_TEXT_MAX`) so
+  it cannot be used as a side channel.
 
 ---
 
