@@ -11,7 +11,8 @@ What is here today:
 | `include/nativex86/plugin.h` | The versioned C plugin ABI (v0.1). The only contract. |
 | `src/host/` | Host stub: loads one plugin, replays synthetic records, shuts it down. |
 | `plugins/hello/` | Sample plugin: emits a hello note, prints what it receives. |
-| `CMakeLists.txt` | Build for the host stub and the sample plugin. |
+| `tests/abi_checks.c` | Prefix-negotiation and lifecycle-window checks. |
+| `CMakeLists.txt` | Build for the host stub, the sample plugin, and the checks. |
 | `smoke-test.sh` | Linux compile + run check (skips when no C compiler). |
 | `bridge-notes.md` | Sketch of a future JVM-side adapter. No code, by design. |
 
@@ -34,8 +35,17 @@ Expected tail:
 plugin.hello: stop after 3 events
 host: published=4 delivered=7 sink_seen=4
 host: shutdown ok
-PASS: skeleton builds, loads the sample plugin and dispatches events.
+-- running abi checks
+abi-checks: PASS
+PASS: skeleton builds, loads the sample plugin, dispatches events, and passes abi checks.
 ```
+
+The `abi checks` step is a small standalone program
+([`tests/abi_checks.c`](tests/abi_checks.c)) that exercises the two
+contracts a plain run does not: minor-version prefix negotiation in both
+directions (a newer peer never writes past an older peer's object) and
+the event-bus delivery window (nothing is dispatched outside
+`start`…`stop`).
 
 Manual run:
 

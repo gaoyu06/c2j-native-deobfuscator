@@ -42,7 +42,8 @@ side of a documented boundary.**
 For authorized diagnostics on software the user owns or is otherwise
 permitted to analyze, provide a small, reviewable, user-mode host that:
 
-1. loads observation plugins through a stable, versioned C ABI;
+1. loads observation plugins through an experimental, versioned C ABI
+   (v0.1; unstable while the major version is 0);
 2. gives them a uniform record stream describing loaded modules,
    resolved symbols and call sites;
 3. keeps that stream free of any consumer-specific vocabulary.
@@ -125,11 +126,17 @@ Properties that the skeleton already enforces:
   Plugins do not see host internals, and the host does not see plugin
   internals.
 - **Deterministic lifecycle**: `nx86_plugin_init` → `start` → events →
-  `stop` → `shutdown` → library unload. The host stops delivering
-  events before `stop` returns.
-- **Records are copies.** Text handed across the ABI is borrowed for
-  the duration of one call; anything a receiver keeps, it copies. This
-  is what makes an out-of-process transport a drop-in later.
+  `stop` → `shutdown` → library unload. The event bus opens its delivery
+  window when the host calls `start` and closes it once `stop` returns,
+  so `emit` before `start` or during `shutdown` is rejected with
+  `NX86_ERR_LIFECYCLE` and reaches no observer.
+- **Records are copies within one process.** Text handed across the ABI
+  is borrowed for the duration of one call; anything a receiver keeps, it
+  copies. This makes in-process fan-out safe. It does **not** make an
+  out-of-process transport a drop-in: the event copy is shallow and
+  `nx86_str` holds process-local pointers, so a cross-process path is
+  future work that still needs deep copying, serialization, and a wire
+  schema (see below).
 
 What a future observation source would and would not be allowed to do,
 staying inside the non-goals above: enumerate the modules of a process

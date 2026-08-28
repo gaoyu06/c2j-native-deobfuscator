@@ -38,6 +38,7 @@ if [ "$USE_CMAKE" = "1" ] && command -v cmake >/dev/null 2>&1; then
     cmake --build "$BUILD_DIR" >/dev/null
     HOST_BIN="$BUILD_DIR/bin/nx86_host"
     PLUGIN_LIB="$BUILD_DIR/lib/libnx86_plugin_hello.so"
+    CHECKS_BIN="$BUILD_DIR/bin/nx86_abi_checks"
 else
     echo "-- configuring without cmake"
     mkdir -p "$BUILD_DIR/bin" "$BUILD_DIR/lib"
@@ -53,13 +54,29 @@ else
     "$CC_BIN" $WARN -I "$SCRIPT_DIR/include" -fPIC -shared \
         -o "$BUILD_DIR/lib/libnx86_plugin_hello.so" \
         "$SCRIPT_DIR/plugins/hello/hello.c"
+    # shellcheck disable=SC2086
+    "$CC_BIN" $WARN -I "$SCRIPT_DIR/include" -I "$SCRIPT_DIR/src/host" \
+        -o "$BUILD_DIR/bin/nx86_abi_checks" \
+        "$SCRIPT_DIR/tests/abi_checks.c" \
+        "$SCRIPT_DIR/src/host/event_bus.c" \
+        "$SCRIPT_DIR/src/host/platform.c" \
+        "$SCRIPT_DIR/plugins/hello/hello.c" \
+        -ldl
     HOST_BIN="$BUILD_DIR/bin/nx86_host"
     PLUGIN_LIB="$BUILD_DIR/lib/libnx86_plugin_hello.so"
+    CHECKS_BIN="$BUILD_DIR/bin/nx86_abi_checks"
 fi
 
 echo "-- running host stub"
 OUTPUT="$("$HOST_BIN" "$PLUGIN_LIB")"
 echo "$OUTPUT"
+
+echo "-- running abi checks"
+set +e
+CHECKS_OUTPUT="$("$CHECKS_BIN")"
+CHECKS_RC=$?
+set -e
+echo "$CHECKS_OUTPUT"
 
 set +e
 FAILED=0
@@ -75,8 +92,13 @@ do
     fi
 done
 
+if [ "$CHECKS_RC" != "0" ] || ! grep -qF "abi-checks: PASS" <<<"$CHECKS_OUTPUT"; then
+    echo "FAIL: abi checks did not pass"
+    FAILED=1
+fi
+
 if [ "$FAILED" != "0" ]; then
     exit 1
 fi
 
-echo "PASS: skeleton builds, loads the sample plugin and dispatches events."
+echo "PASS: skeleton builds, loads the sample plugin, dispatches events, and passes abi checks."

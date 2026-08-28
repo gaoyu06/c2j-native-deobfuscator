@@ -51,11 +51,21 @@ Rules:
    different major in `nx86_host::abi_version` returns
    `NX86_ERR_ABI_MISMATCH` from its entry point.
 2. **Minor may differ in either direction.** Both sides then read only
-   the fields covered by the `struct_size` they were given.
-3. **Minor bumps may only append fields** to the end of an existing
+   the fields covered by the *smaller* of the two `struct_size` values —
+   the common prefix. A side never reads or writes past the size its peer
+   provided, so a newer peer cannot overwrite an older peer's object and
+   an older peer's absent tail is simply not read. `NX86_HAS_FIELD` in
+   the header performs this check for one field.
+3. **`nx86_plugin_init` capacity is an input.** The host sets
+   `out_plugin->struct_size` before the call to the byte capacity of the
+   object it owns. The plugin writes at most that many bytes — even if it
+   was built against a newer minor with a larger `nx86_plugin` — and
+   stores the number it filled back into `struct_size`. The host then
+   caps that value at its own size and reads only the common prefix.
+4. **Minor bumps may only append fields** to the end of an existing
    struct, or add new event kinds / status codes / flag bits. Reordering,
    resizing, repurposing or removing anything is a major bump.
-4. **`reserved` fields must be written as zero** and ignored on read
+5. **`reserved` fields must be written as zero** and ignored on read
    until a minor version gives them meaning.
 
 While the major version is `0`, the whole ABI is subject to change
@@ -76,6 +86,7 @@ without the courtesy above.
 | `NX86_ERR_NO_MEMORY` | -4 | Allocation failed, or a fixed table is full |
 | `NX86_ERR_NOT_FOUND` | -5 | Unknown observer token |
 | `NX86_ERR_INTERNAL` | -6 | Bug on the callee's side |
+| `NX86_ERR_LIFECYCLE` | -7 | `emit` called outside the `start`…`stop` window |
 
 Log levels are `NX86_LOG_DEBUG` (10), `INFO` (20), `WARN` (30),
 `ERROR` (40) — spaced so intermediate levels can be added later.
@@ -201,10 +212,14 @@ typedef struct nx86_host {
   call returns `NX86_ERR_NOT_FOUND`. Not callable from inside a
   callback in v0.1.
 - **`emit`** — publish a plugin-authored event. The plugin fills
-  `struct_size` and `kind`; the host overwrites `seq`, `timestamp_ns`
-  and `process_id` on a private copy, so the caller's record is not
-  mutated and needs no lifetime beyond the call. The host stub caps
-  emitted records at 256 bytes (`NX86_HOST_MAX_EVENT_SIZE`) and returns
+  `struct_size`, `kind` and, when it applies, `process_id` (the observed
+  process). The host assigns `seq` and `timestamp_ns` on a private copy
+  and leaves `process_id` as the plugin set it, so the caller's record is
+  not mutated and needs no lifetime beyond the call. `emit` is only valid
+  while the plugin is running (from `start` until `stop` returns); called
+  before `start` or during/after `shutdown` it returns
+  `NX86_ERR_LIFECYCLE` and dispatches nothing. The host stub caps emitted
+  records at 256 bytes (`NX86_HOST_MAX_EVENT_SIZE`) and returns
   `NX86_ERR_INVALID_ARG` above that; any host must document its own cap.
 - **`log`** — free-form diagnostics with a NUL-terminated message. Not
   an event: it never reaches observers.
@@ -262,10 +277,10 @@ NX86_EXPORT nx86_status nx86_plugin_init(const nx86_host *host,
 | Step | Who | Contract |
 |---|---|---|
 | load | host | Platform loader opens a path the user named. No directory scanning, no auto-load. |
-| `nx86_plugin_init` | plugin | Validate `host->abi_version` and `host->struct_size`; fill `*out_plugin`; return `NX86_OK` or `NX86_ERR_ABI_MISMATCH`. Do not register observers here. |
-| validate | host | Reject on major mismatch or `struct_size < sizeof(nx86_plugin)`. |
+| `nx86_plugin_init` | plugin | Validate `host->abi_version` major and that `host->struct_size` covers the callbacks it needs; fill up to the capacity in `out_plugin->struct_size` and store the bytes written back into it; return `NX86_OK` or `NX86_ERR_ABI_MISMATCH`. Do not register observers here. |
+| validate | host | Reject on major mismatch, or when the returned prefix is too small to cover the fields the host reads. Cap a larger returned `struct_size` at the host's own and ignore any unknown tail. |
 | `start` | plugin | Register observers, emit anything initial. Non-`NX86_OK` aborts the run; the host still calls `shutdown`. |
-| events | host | Delivered only between `start` returning `NX86_OK` and `stop` being called. |
+| events | host | The host opens the delivery window when it calls `start` and closes it once `stop` returns. `emit` outside that window returns `NX86_ERR_LIFECYCLE`. |
 | `stop` | plugin | Unregister observers, flush. No events arrive after it returns. |
 | `shutdown` | plugin | Last call in. Release `plugin_ctx`. |
 | unload | host | Library closed. No plugin code runs afterwards. |
@@ -304,13 +319,23 @@ static nx86_status NX86_CALL start(void *ctx)
 NX86_EXPORT nx86_status NX86_CALL nx86_plugin_init(const nx86_host *host,
                                                    nx86_plugin *out)
 {
+    uint32_t written;
+
     if (host == NULL || out == NULL) return NX86_ERR_INVALID_ARG;
     if (NX86_VERSION_MAJOR(host->abi_version) != NX86_ABI_VERSION_MAJOR)
         return NX86_ERR_ABI_MISMATCH;
+    if (!NX86_HAS_FIELD(host->struct_size, nx86_host, register_observer))
+        return NX86_ERR_ABI_MISMATCH;
     g_host = host;
 
-    memset(out, 0, sizeof(*out));
-    out->struct_size = (uint32_t)sizeof(*out);
+    /* out->struct_size is the host's capacity: never write past it. */
+    written = (uint32_t)sizeof(*out);
+    if (written > out->struct_size) written = out->struct_size;
+    if (!NX86_HAS_FIELD(written, nx86_plugin, start))
+        return NX86_ERR_ABI_MISMATCH;
+
+    memset(out, 0, written);
+    out->struct_size = written;
     out->abi_version = NX86_ABI_VERSION;
     out->id = "example";
     out->display_name = "example plugin";
@@ -330,19 +355,25 @@ A complete, compiling version is
 
 For a host:
 
-- [ ] Reject plugins whose ABI major differs, or whose `struct_size` is
-      smaller than the host's `nx86_plugin`.
-- [ ] Assign `seq` monotonically from 1 and stamp `timestamp_ns`.
-- [ ] Never deliver an event outside the `start` … `stop` window.
+- [ ] Reject plugins whose ABI major differs, or whose returned prefix
+      is too small to cover the fields the host reads; cap a larger
+      returned `struct_size` at the host's own and ignore the tail.
+- [ ] Set `out_plugin->struct_size` to the object's capacity before
+      calling `nx86_plugin_init`.
+- [ ] Assign `seq` monotonically from 1 and stamp `timestamp_ns`; do not
+      overwrite `process_id`.
+- [ ] Never deliver an event outside the `start` … `stop` window; reject
+      `emit` outside it with `NX86_ERR_LIFECYCLE`.
 - [ ] Copy plugin-emitted records before dispatch; never mutate the
       caller's buffer.
 - [ ] Document the maximum size accepted by `emit`.
 
 For a plugin:
 
-- [ ] Validate `host->abi_version` and `host->struct_size` in
-      `nx86_plugin_init`.
-- [ ] Zero `*out_plugin` before filling it, and set `struct_size`.
+- [ ] Validate `host->abi_version` major and that `host->struct_size`
+      covers the callbacks you call.
+- [ ] Zero `*out_plugin` up to the host's capacity, never write past it,
+      and store the bytes written into `struct_size`.
 - [ ] Check `struct_size` before casting an event to a concrete type.
 - [ ] Copy any borrowed text you keep past the callback.
 - [ ] Unregister in `stop` and release state in `shutdown`.
