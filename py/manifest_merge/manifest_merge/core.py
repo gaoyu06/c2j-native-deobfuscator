@@ -7,6 +7,38 @@ from pathlib import Path
 from typing import Any
 
 
+def _jni_mangle(text: str) -> str:
+    """Encode a class, method, or argument descriptor per the JNI spec."""
+    out: list[str] = []
+    encoded = text.encode("utf-16-be")
+    for offset in range(0, len(encoded), 2):
+        unit = int.from_bytes(encoded[offset:offset + 2], "big")
+        char = chr(unit)
+        if (
+            ord("a") <= unit <= ord("z")
+            or ord("A") <= unit <= ord("Z")
+            or ord("0") <= unit <= ord("9")
+        ):
+            out.append(char)
+        elif char == "/":
+            out.append("_")
+        elif char == "_":
+            out.append("_1")
+        elif char == ";":
+            out.append("_2")
+        elif char == "[":
+            out.append("_3")
+        else:
+            out.append(f"_0{unit:04x}")
+    return "".join(out)
+
+
+def _jni_export_names(owner: str, name: str, desc: str) -> tuple[str, str]:
+    short = f"Java_{_jni_mangle(owner)}_{_jni_mangle(name)}"
+    args = desc[1:desc.find(")")] if desc.startswith("(") and ")" in desc else ""
+    return short, f"{short}__{_jni_mangle(args)}"
+
+
 def load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -54,6 +86,31 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
         for m in entry.get("methods", []):
             fn_index[(cls, m["name"], m["desc"])] = m
 
+    # Bind specification-defined Java_* exports exactly. The binary report
+    # intentionally preserves encoded symbols because demangling alone cannot
+    # reliably distinguish package/class separators from the method separator.
+    exported = {
+        entry.get("fnSymbol"): entry
+        for entry in (binary or {}).get("nativeRegistry") or []
+        if entry.get("source") == "jni-export" and entry.get("fnSymbol")
+    }
+    for cls in classes.get("classes", []):
+        owner = cls.get("name")
+        if not owner:
+            continue
+        for method in cls.get("methods", []):
+            if not method.get("isObfuscatedNative"):
+                continue
+            short, long = _jni_export_names(
+                owner, method["name"], method["desc"]
+            )
+            export = exported.get(long) or exported.get(short)
+            if export:
+                fn_index[(owner, method["name"], method["desc"])] = {
+                    "fnAddr": export.get("fnAddr"),
+                    "fnSymbol": export.get("fnSymbol"),
+                }
+
     # ALSO bind by position: when binary-introspect found a RegisterNatives
     # call site with N fnAddrs, and a jar-parser class has N obfuscated
     # native methods, assume the binary's fn list matches the class's
@@ -70,10 +127,36 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
         nats = [m for m in cls.get("methods", []) if m.get("isObfuscatedNative")]
         if nats:
             class_natives.append((cls["name"], nats))
-    # Match each call site to the first class with a matching native count.
-    # Each class can only be bound once.
+    # Match tables carrying names/descriptors first. This is stronger than
+    # count-only positional matching and is available for static tables and
+    # RegisterNatives calls captured through emulation.
     used_classes: set[str] = set()
     for site in register_sites:
+        methods = site.get("methods") or []
+        if not methods:
+            continue
+        signature = [(m.get("name"), m.get("desc")) for m in methods]
+        candidates = [
+            (cname, nats)
+            for cname, nats in class_natives
+            if [(m.get("name"), m.get("desc")) for m in nats] == signature
+        ]
+        if len(candidates) != 1:
+            continue
+        cname, nats = candidates[0]
+        used_classes.add(cname)
+        for nat, method in zip(nats, methods):
+            fn_index[(cname, nat["name"], nat["desc"])] = {
+                "fnAddr": method.get("fnAddr"),
+                "fnSymbol": method.get("fnSymbol"),
+            }
+        site["boundTo"] = cname
+
+    # Fall back to positional count matching for stack-built tables whose
+    # string pointers are materialised only at runtime.
+    for site in register_sites:
+        if site.get("boundTo"):
+            continue
         addrs = site.get("fnAddrs") or []
         n = len(addrs)
         if n == 0:
@@ -81,6 +164,10 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
         for cname, nats in class_natives:
             if cname in used_classes or len(nats) != n:
                 continue
+            if all((cname, nat["name"], nat["desc"]) in fn_index for nat in nats):
+                used_classes.add(cname)
+                site["boundTo"] = cname
+                break
             used_classes.add(cname)
             for nat, addr in zip(nats, addrs):
                 fn_index[(cname, nat["name"], nat["desc"])] = {

@@ -19,6 +19,7 @@ AMD64_WINDOWS = Abi(
     cs_arch=CS_ARCH_X86,
     cs_mode=CS_MODE_64,
     n_methods_arg_regs=(x86_const.X86_REG_R9, x86_const.X86_REG_R9D),
+    methods_arg_regs=(x86_const.X86_REG_R8,),
     pc_register=x86_const.X86_REG_RIP,
     binary_matches=[("PE", 0x8664)],
 )

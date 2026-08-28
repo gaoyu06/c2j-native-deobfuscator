@@ -12,10 +12,12 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 | 路径 | 输入 | 思路 |
 |---|---|---|
 | **动态** | 混淆后的 JAR + 一条可运行的命令 | 加载 JVMTI agent，观察 JNI 调用流，把它重新拼回 JVM 字节码 |
-| **静态** | 混淆后的 JAR + Ghidra | 在 native blob 里定位 JNI method table，逐函数反编译，把 pseudo-C 抬升回 JVM 字节码 |
+| **轻量静态** | 转译后的 JAR + native blob | 无需 Ghidra，发现 JNI 方法表、生成 manifest 和字节码还原 stub |
 | **模拟** | 混淆后的 blob（不需运行、不需 Ghidra） | 用 CPU 模拟器 + mock JNI 直接跑 native 代码：恢复方法表、dump 解密后的常量、把方法当纯函数来调用 |
 
-动态/静态路径会输出一个干净的 `out.jar`：原先的 native 方法现在拥有真实的字节码方法体，loader / native blob 资源条目被剥离。模拟路径则负责挖出另外两条路看不到的"纯 C 秘密"（被内联的比较、`<clinit>` 字符串表），并给你一个可执行的 oracle。
+动态路径和可选的方法体插件可以输出干净的 `out.jar`。轻量静态路径先生成
+可审计的方法 manifest 与可通过校验的 stub；模拟路径还能补充运行时注册信息、
+解密后的常量和纯函数 oracle。
 
 协议：**GPLv3**。
 
@@ -106,16 +108,17 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
   / `ACONST_NULL`，让最终的字节码可以通过 ASM 的
   `COMPUTE_FRAMES` 校验。
 
-### 静态路径
+### 静态方法发现
 
-- **反汇编层的 native 表发现**（`py/binary_introspect/`，`capstone`）。
-  扫描 native blob 的可执行节，定位所有
-  `call qword ptr [reg + 0x6B8]`（`RegisterNatives` 在 JNI vtable 中的偏移）
-  调用点，往前回扫 PC 相对的 `lea`（指向 `.text`，即栈上构造的
-  `JNINativeMethod[]` 里的函数指针）以及最近的
-  `mov <nMethods-reg>, imm`（表长度）。
-- **Ghidra 反编译器**（`ghidra/scripts/DumpFromManifest.java`，Ghidra
-  Headless）。读取 `manifest.json` 中的 `(class, method, fnAddr)`，对每个
+- **基于 JNI 规范的方法表发现**（`py/binary_introspect/`，`capstone`）。
+  从指令操作数识别 vtable 索引 215 的 `RegisterNatives`，再核对 ABI 对应的
+  方法表参数与长度参数。当前支持 PE/Microsoft x64 和 ELF/Mach-O System V。
+  静态 `JNINativeMethod[]`、栈上构造的表、共享调用点和规范定义的
+  `Java_*` 导出可互相补充。
+- **轻量静态编排**无需反编译器即可生成 `binary.json`、`manifest.json`
+  以及可通过校验的 stub；可选的注册模拟还能补全运行时名称和 descriptor。
+- **可选 Ghidra 插件**（`ghidra/scripts/DumpFromManifest.java`）。读取
+  `manifest.json` 中的 `(class, method, fnAddr)`，对每个
   地址跑一次 p-code 反编译，结果汇总到 `ghidra-dump.json`，每个方法对应
   一段 pseudo-C。
 - **tree-sitter-c AST 解析**（`py/ast_matcher/`，`tree-sitter-c`）。把
@@ -123,13 +126,13 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
   识别 `env->FnName(args)` 形式的 JNI 调用（这是从 Ghidra 的
   `(**(code **)(*reg + 0xN))(...)` 形式改写来的）、JNI helper 模式以及
   异常检查守卫。
-- **异常文案推断**。native-obfuscator 家族会在每次潜在 Java 调用前生成
+- **可选异常文案推断**。部分变体会在每次潜在 Java 调用前生成
   `"Cannot invoke X.Y.Z(args)"` 字符串以备运行时抛异常用。当符号跟踪
   穿不过混淆器自己的 helper 时，抬升器把这些字符串解析成 invoke hint
   做兜底的 `(owner, name, args-desc)` 来源。
-- **Profile 自动探测**。当前混淆器变体的采集策略（每类一张表
+- **Profile 自动探测**。匹配变体的采集策略（每类一张表
   vs 共享 dispatch）、异常文案正则、if-guard 跳过规则等都来自一个
-  `Profile`，由二进制扫描出来的探测器选定。
+  `Profile`，由二进制扫描出来的探测器选定；这些启发式在 `generic` 下关闭。
 
 ### 模拟路径
 
@@ -167,11 +170,11 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 
 | | 动态 | 静态 | 模拟 |
 |---|---|---|---|
-| **适合的场景** | 二进制被加壳 / 虚拟机保护 / 反调试 —— JVMTI agent 工作在 Java 侧，native 层的保护不影响它的可见性。 | 二进制未经额外保护（例如直接 native-obfuscator + zig c++ 输出），Ghidra 能直接反编译每个 `fnAddr`。 | 逻辑被改写成纯 C（比较 / 加密 / 字符串表），或者 jar 跑不起来**且** Ghidra 结构化不了，或者你需要解密后的常量。 |
-| **要求** | 一条可执行的命令（`java -jar ...`），并且能跑到目标类。 | 安装了 Ghidra 11.x。 | 只要 blob + `pip install unicorn`。不需要 JVM，不需要 Ghidra。 |
-| **覆盖率** | 只覆盖实际被执行到的分支；从未被调用的方法完全采集不到。 | 通过 `RegisterNatives` 注册的所有方法，无论运行时是否被触发。 | 方法表 + 解密常量总能拿到；单个方法的行为通过 oracle 探测。 |
-| **准确性** | 高 —— 每条 opcode 都对应 JVM 实际观察到的 JNI 调用。 | best-effort —— 抬升器靠模式匹配，无法保持栈平衡时退化为 stub。 | 精确（它执行真实代码），但算法要你从 oracle 的输入/输出去逆 —— 它**不会**自动产出字节码。 |
-| **耗时** | 受目标本身执行时长 + agent 开销限制。 | 受 Ghidra 自动分析限制（1 MB 量级的 blob 通常需要数分钟）。 | 快 —— 无 Ghidra、无活 JVM。 |
+| **适合的场景** | JAR 能运行并触达相关类。 | 支持的 x86-64 二进制中能看到标准 JNI 导出或 `RegisterNatives`。 | 逻辑被改写成纯 C、注册表在运行时构造，或需要解密后的常量。 |
+| **要求** | 一条能触达转译类的运行命令。 | JAR + native blob；方法清单、manifest 和 stub 不需要 Ghidra。 | native blob + 可选 `unicorn`；不需要 JVM 或 Ghidra。 |
+| **覆盖率** | 只覆盖实际执行到的分支。 | 覆盖通过结构校验的导出/方法表；方法体恢复是独立步骤。 | 覆盖模拟能触达的方法与常量；方法行为通过 oracle 探测。 |
+| **准确性** | 对已观察到的 JNI 调用准确度高。 | 命名表/导出的元数据可精确绑定；栈构造表按地址顺序兜底。 | 执行真实 native 代码，但不会自动产出字节码。 |
+| **耗时** | 受目标运行时长与 agent 开销限制。 | 反汇编和表解码通常很快。 | 相关入口可触达时通常很快。 |
 
 ---
 
@@ -235,37 +238,47 @@ python -m j2c_dumper_cli.main recover \
 5. `trace-to-bc`       抬升到 `recovered/*.json`
 6. `rebuild`           输出 loader 已剥离的最终 JAR
 
-### 静态恢复（目标跑不起来时使用 —— 需要 Ghidra）
+### 通用轻量静态恢复（无需 Ghidra）
 
 ```bash
-# 1. 解析 jar + 内省二进制（不需要 --run-cmd）
-python -m j2c_dumper_cli.main parse-jar      in.jar      -o classes.json
-python -m j2c_dumper_cli.main inspect-binary natives.bin -o binary.json
-python -m j2c_dumper_cli.main merge-manifest classes.json binary.json -o manifest.json
+python -m j2c_dumper_cli.main static-lite in.jar \
+    --lib natives.bin --profile generic -o static-lite/
 
-# 2. 用 Ghidra Headless 跑 native blob
+# 可选：同时捕获运行时构造的 RegisterNatives 表
+python -m j2c_dumper_cli.main inspect-binary natives.bin \
+    --profile generic --emulate-registration -o binary.json
+```
+
+该命令生成 `binary.json`、`manifest.json` 和 `recovered/*.json` stub。
+详见 [`docs/generic-recovery.md`](docs/generic-recovery.md)。
+
+如需可选的 pseudo-C 方法体抬升，可在轻量静态步骤后运行 Ghidra：
+
+```bash
 <GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
     -import natives.bin \
     -scriptPath <repo>/ghidra/scripts \
-    -postScript DumpFromManifest.java manifest.json ghidra-dump.json
+    -postScript DumpFromManifest.java static-lite/manifest.json ghidra-dump.json
 
-# 3. pseudo-C 抬升到字节码 + 重建 JAR
-python -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
-python -m j2c_dumper_cli.main rebuild --input in.jar --recovered recovered/ \
-    --manifest manifest.json -o out.jar
+python -m ast_matcher.cli ghidra-dump.json \
+    --manifest static-lite/manifest.json -o static-lite/recovered/
+python -m j2c_dumper_cli.main rebuild --input in.jar \
+    --recovered static-lite/recovered/ \
+    --manifest static-lite/manifest.json -o out.jar
 ```
 
 ### 模拟恢复（无需 JVM、无需 Ghidra —— 针对纯 C 改写的逻辑 / 解密常量）
 
 ```bash
 # 列出 native 方法（入口自动发现）
-python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+python -m j2c_dumper_cli.main emulate natives.bin --operation recover \
+    --binary-json binary.json
 
 # dump 某个函数解密后的字符串常量（字母表、密文、提示语）
-python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+python -m j2c_dumper_cli.main emulate natives.bin --operation strings --fn 0x<addr>
 
 # 把 native 方法当纯函数调用（oracle）
-python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+python -m j2c_dumper_cli.main emulate natives.bin --operation call --fn 0x<addr> \
     --arg-bytes "input" --static "v=@alphabet.txt"
 ```
 
@@ -281,18 +294,24 @@ python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
 
 ## 通用性
 
-项目预置了两个会自动探测的混淆器 **Profile**：
+`generic` 是默认兜底，只依赖 JNI 规范中的结构事实：
 
-- `native_obfuscator` — radioegor146/native-obfuscator 及兼容衍生版本
-- `j2cc`              — me.x150.j2cc（单一共享 `initClass` dispatch）
-- `generic`           — 无 Profile 命中时的兜底，只依赖 JNI 规范
+- `RegisterNatives` 的 vtable 索引 215；
+- Microsoft x64 与 System V x86-64 的参数寄存器；
+- 合法的 `JNINativeMethod` 名称/descriptor 与可执行函数指针；
+- 规范定义的 `Java_*` 导出；
+- 可选的二进制模拟注册捕获。
 
-自定义变体可以以新 Profile 形式接入，不需要改主流程。
-参见 [`docs/adding-obfuscator-profile.md`](docs/adding-obfuscator-profile.md)。
+它不会开启异常文案正则、反编译器输出重写、缓存表命名假设或异常/缓存
+guard 跳过。匹配的变体 Profile 可以按需开启这些能力。Ghidra 脚本是可选的
+方法体插件，不参与通用方法发现。
 
-静态路径的抬升器把每个推断 / 匹配步骤都暴露成 feature flag（异常文案
-hint、ExceptionCheck-guard 跳过、符号表跟踪、查表解析等等）。哪个 flag
-对当前二进制误判，就把它关掉：
+通用能力有明确边界：不支持的 ABI、模拟无法触达的非标准或加密注册流程、
+自定义方法体布局仍需扩展 Profile 或 backend。详见
+[`docs/generic-recovery.md`](docs/generic-recovery.md) 与
+[`docs/adding-obfuscator-profile.md`](docs/adding-obfuscator-profile.md)。
+
+可选 lifter 启发式仍可逐项关闭：
 
 ```bash
 python -m ast_matcher.cli ghidra-dump.json -o recovered/ \
@@ -339,6 +358,8 @@ python -m ast_matcher.cli --list-flags
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — 模块边界、管线、artifact schema、扩展点
 - [emulation-recovery.md](docs/emulation-recovery.md) — 模拟路径使用指南
   （命令参考见 [`py/native_emulate/README.md`](py/native_emulate/README.md)）
+- [generic-recovery.md](docs/generic-recovery.md) — 无 Ghidra 的方法发现、
+  manifest、stub 与可选模拟
 - [manual-restoration.md](docs/manual-restoration.md) — 手工清理恢复产物
 - [ROADMAP.md](docs/ROADMAP.md) — 已知限制和计划工作
 - [adding-obfuscator-profile.md](docs/adding-obfuscator-profile.md) — 如何注册新混淆器变体

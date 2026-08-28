@@ -18,7 +18,7 @@ def cli(ctx: click.Context) -> None:
         ctx.invoke(introspect_cmd)
 
 
-@cli.command("introspect", help="Parse a native-obfuscator-style .dll/.so/.dylib.")
+@cli.command("introspect", help="Discover JNI metadata in a .dll/.so/.dylib.")
 @click.argument("lib", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("-o", "--output", required=True, type=click.Path(path_type=Path),
               help="Path to write binary.json")
@@ -41,7 +41,8 @@ def introspect_cmd(lib: Path, output: Path, profile_name: str | None,
         f"Wrote {output}\n"
         f"  format={report.fmt} arch={report.arch}\n"
         f"  strings={len(report.string_pool)} hidden-classes={len(report.hidden_classes)} "
-        f"exports={len(report.exported_functions)}",
+        f"exports={len(report.exported_functions)} "
+        f"registry-records={len(report.native_registry)}",
         err=True,
     )
 
@@ -54,19 +55,22 @@ def synth_stubs_cmd(manifest: Path, output: Path) -> None:
     click.echo(f"Synthesized {n} stub(s) → {output}", err=True)
 
 
-@click.command(help="Parse a native-obfuscator-style .dll/.so/.dylib and dump metadata.")
+@click.command(help="Discover JNI metadata without requiring Ghidra.")
 @click.argument("lib", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("-o", "--output", required=True, type=click.Path(path_type=Path),
               help="Path to write binary.json")
-def main(lib: Path, output: Path) -> None:
+@click.option("--profile", "profile_name", default=None,
+              help="Discovery profile (auto-detect when omitted).")
+def main(lib: Path, output: Path, profile_name: str | None) -> None:
     """Backward-compatible single-arg entry."""
-    report = introspect(lib)
+    report = introspect(lib, profile_name=profile_name)
     write_report(report, output)
     click.echo(
         f"Wrote {output}\n"
         f"  format={report.fmt} arch={report.arch}\n"
         f"  strings={len(report.string_pool)} hidden-classes={len(report.hidden_classes)} "
-        f"exports={len(report.exported_functions)}",
+        f"exports={len(report.exported_functions)} "
+        f"registry-records={len(report.native_registry)}",
         err=True,
     )
 

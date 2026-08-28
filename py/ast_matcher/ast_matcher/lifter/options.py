@@ -28,6 +28,10 @@ class LifterOptions:
     #: Owner is taken from the enclosing method's declaring class.
     use_throw_reason_field_hints: bool = True
 
+    #: Rewrite untyped JNI vtable expressions emitted by Ghidra. The active
+    #: profile must also opt in; ``generic`` leaves source text untouched.
+    rewrite_ghidra_vtable_calls: bool = True
+
     # ---- Symbol-tracking ----
     #: Track variable → jclass / jmethodID / jfieldID / jstring bindings
     #: across statements so ``env->Call*Method(receiver, mid, ...)`` can
@@ -44,7 +48,7 @@ class LifterOptions:
 
     # ---- Control-flow cleanup ----
     #: Drop ``if (env->ExceptionCheck()) return 0;`` and equivalent
-    #: ``if (cVar != 0) return 0;`` patterns. Profile-controlled.
+    #: ``if (cVar != 0) return 0;`` patterns. The profile must opt in.
     skip_native_exception_guards: bool = True
 
     #: After lifting, remove jump instructions whose target label isn't

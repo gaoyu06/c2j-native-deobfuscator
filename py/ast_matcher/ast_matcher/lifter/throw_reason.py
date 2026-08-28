@@ -71,6 +71,8 @@ class InvokeHintParser:
         self.regex = profile.invoke_error_re
 
     def parse(self, code: str) -> list[InvokeHint]:
+        if self.regex is None:
+            return []
         out: list[InvokeHint] = []
         for m in self._LITERAL.finditer(code):
             msg = m.group(1)
@@ -101,6 +103,8 @@ class FieldHintParser:
         self.regex = profile.field_error_re
 
     def parse(self, code: str) -> list[FieldHint]:
+        if self.regex is None:
+            return []
         out: list[FieldHint] = []
         for m in self._LITERAL.finditer(code):
             msg = m.group(1).encode("utf-8").decode("unicode_escape", errors="replace")

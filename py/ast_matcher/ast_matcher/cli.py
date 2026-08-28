@@ -1,4 +1,4 @@
-"""CLI: ast-matcher [ghidra-dump.json | .cpp file] -o recovered/
+"""Optional pseudo-C lifter: ast-matcher [ghidra-dump.json | .cpp] -o recovered/
 
 The lifter recognises two inputs:
   - a Ghidra pseudo-C dump JSON  ({"functions": [{addr, name, code}, ...]});

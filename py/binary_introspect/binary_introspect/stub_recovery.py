@@ -90,8 +90,8 @@ def synthesize_stubs(
             if fn_addr:
                 marker_method = f"NATIVE_STUB_{fn_addr.replace('0x', 'at_')}"
                 note = (
-                    f"native body resides at {fn_addr} — full pseudo-C "
-                    f"recovery requires Ghidra (use ExtractRegisterNatives.java)."
+                    f"native body resides at {fn_addr}; restore behavior with "
+                    f"JVMTI tracing, binary emulation, or an optional decompiler plugin."
                 )
                 kind = "native_stub"
                 confidence = "stub"
@@ -100,8 +100,8 @@ def synthesize_stubs(
                 note = (
                     "native body address not yet recovered: static-path "
                     "table extraction couldn't match this method to a "
-                    "RegisterNatives call site. Run Ghidra with "
-                    "ExtractRegisterNatives.java for deeper analysis."
+                    "RegisterNatives call site. Try --emulate-registration "
+                    "or provide a variant profile."
                 )
                 kind = "native_stub_unbound"
                 confidence = "stub_unbound"

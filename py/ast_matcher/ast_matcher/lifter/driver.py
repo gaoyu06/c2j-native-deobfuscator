@@ -745,7 +745,11 @@ def _emit_if(
     #   * `cVar != 0` body=return0 → skip entirely (exception path)
     #   * `cVar == 0` body=<work>  → fall through into cons straight-
     #     line (no exception so do the work; ignore the implicit alt)
-    if ctx.options.skip_native_exception_guards and ctx.exception_check_vars:
+    if (
+        ctx.options.skip_native_exception_guards
+        and ctx.profile.enable_exception_guard_heuristics
+        and ctx.exception_check_vars
+    ):
         m = re.fullmatch(
             r"(\w+)\s*([!=]=)\s*(?:'\\0'|0|0L|\(char\)\s*0)",
             cond_text,
@@ -772,7 +776,11 @@ def _emit_if(
     # of it is part of the user's JVM code, so skip the whole if outright
     # — we lose the symbol-table side effects (no way to bind cfields[N]
     # to a name in this pass), but the rest of the body stays clean.
-    if ctx.options.skip_native_exception_guards and _looks_like_cache_init(cond_text, cons_text):
+    if (
+        ctx.options.skip_native_exception_guards
+        and ctx.profile.enable_exception_guard_heuristics
+        and _looks_like_cache_init(cond_text, cons_text)
+    ):
         return
 
     # cond+goto-target → IF*
@@ -940,7 +948,10 @@ def lift_ghidra_function(
     from .. import jni_vtable
     options = options or LifterOptions()
     profile = profile or get_profile("generic")
-    code_rewritten = jni_vtable.rewrite_vtable_calls(code)
+    if options.rewrite_ghidra_vtable_calls and profile.rewrite_ghidra_vtable_calls:
+        code_rewritten = jni_vtable.rewrite_vtable_calls(code)
+    else:
+        code_rewritten = code
 
     ctx = _Ctx(
         options=options,

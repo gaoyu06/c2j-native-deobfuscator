@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import lief
 
@@ -34,6 +33,10 @@ class Abi:
     #: Tuple to accept both 32- and 64-bit aliases (e.g. ``r9`` / ``r9d``).
     n_methods_arg_regs: tuple[int, ...]
 
+    #: Register(s) used for the third argument, ``JNINativeMethod *methods``.
+    #: Pointer arguments only use the architecture's full-width register.
+    methods_arg_regs: tuple[int, ...]
+
     #: capstone register id used by the calling convention for the
     #: PC-relative argument addressing (``RIP`` on x86_64). Used by
     #: :meth:`decode_pc_relative_lea` to recognise "load address of
@@ -60,22 +63,23 @@ class Abi:
             return None
 
     def is_indirect_vtable_call(self, ins: Any) -> int | None:
-        """If ``ins`` is an ``call qword ptr [reg + 0xN]`` (or arch
-        equivalent), return ``N``. Otherwise return ``None``.
+        """Return the displacement of an indirect memory call.
 
-        Default implementation matches x86 Intel-syntax indirect calls.
-        Override for non-x86 arches.
+        This deliberately inspects Capstone operands rather than rendered
+        instruction text. Intel/AT&T syntax selection and register naming are
+        presentation details; the memory operand and its displacement are the
+        structural facts relevant to a JNI vtable slot.
         """
+        from capstone import x86_const
+
         if ins.mnemonic != "call":
             return None
-        m = re.search(r"\[\w+\s*\+\s*(0x[0-9a-fA-F]+|\d+)\]", ins.op_str)
-        if not m:
+        if len(ins.operands) != 1:
             return None
-        off = m.group(1)
-        try:
-            return int(off, 16) if off.startswith("0x") else int(off)
-        except ValueError:
+        operand = ins.operands[0]
+        if operand.type != x86_const.X86_OP_MEM or operand.mem.base == 0:
             return None
+        return operand.mem.disp
 
     def decode_pc_relative_lea(self, ins: Any) -> int | None:
         """If ``ins`` is a "load effective address of a constant"
@@ -133,6 +137,24 @@ class Abi:
         if dst.reg not in self.n_methods_arg_regs:
             return None
         return src.imm
+
+    def methods_address_load(self, ins: Any) -> int | None:
+        """Return a statically known method-table address loaded into arg 3.
+
+        On x86-64 this recognises ``lea <methods-arg>, [rip + disp]``. Stack
+        tables use ``rsp``/``rbp`` addressing and are handled by the stack
+        store harvester instead.
+        """
+        from capstone import x86_const
+
+        if ins.mnemonic != "lea" or len(ins.operands) != 2:
+            return None
+        dst, src = ins.operands
+        if dst.type != x86_const.X86_OP_REG or dst.reg not in self.methods_arg_regs:
+            return None
+        if src.type != x86_const.X86_OP_MEM or src.mem.base != self.pc_register:
+            return None
+        return ins.address + ins.size + src.mem.disp
 
     def applies_to(self, binary: lief.Binary) -> bool:
         """Default: match by (binary format, machine id) against the
