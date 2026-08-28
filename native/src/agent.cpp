@@ -28,7 +28,6 @@ namespace hook = j2c::jni_hook;
 namespace {
 
 std::string g_trace_path = "trace.jsonl";
-bool g_log_all = false; // log even outside __ngen native frames
 
 std::string esc(const char* s) {
     if (!s) return "null";
@@ -68,7 +67,7 @@ void parse_options(const char* options) {
         std::string k = pair.substr(0, eq);
         std::string v = eq == std::string::npos ? "" : pair.substr(eq + 1);
         if (k == "trace") g_trace_path = v;
-        else if (k == "log-all" && (v == "1" || v == "true")) g_log_all = true;
+        else if (k == "log-all" && (v == "1" || v == "true")) hook::set_log_all(true);
         else if (k == "max-frame-events") {
             try { hook::set_max_frame_events(std::stoi(v)); } catch (...) {}
         }
@@ -297,7 +296,8 @@ void emit_gap(const char* kind, const char* phase, const std::string& detail,
 // table until they exit. We install on the current thread (so the hooked table
 // is built and picked up by every future ThreadStart) and record the coverage
 // gap for the threads we cannot reach.
-void install_on_live_threads(JavaVM* vm, jvmtiEnv* jvmti, const char* phase) {
+void install_on_live_threads(JavaVM* vm, jvmtiEnv* jvmti, const char* phase,
+                             const std::string& enabled_events) {
     JNIEnv* jni = nullptr;
     jint gr = vm->GetEnv(reinterpret_cast<void**>(&jni), JNI_VERSION_1_6);
     bool table_installed = false;
@@ -317,13 +317,17 @@ void install_on_live_threads(JavaVM* vm, jvmtiEnv* jvmti, const char* phase) {
 
     std::ostringstream extra;
     extra << "\"tableInstalled\":" << (table_installed ? "true" : "false")
-          << ",\"runningThreads\":" << count;
-    emit_gap("jni-table-running-threads", phase,
-             "live attach installs JNI wrappers on the attach thread and every "
-             "thread started afterwards; native methods on already-running "
-             "threads still emit bind/enter/exit/exception (JVMTI) events but "
-             "not per-JNI-call argument events",
-             extra.str());
+          << ",\"runningThreads\":" << count
+          << ",\"enabledEvents\":" << esc(enabled_events.c_str());
+    // Only claim the events we actually enabled for this phase. Threads already
+    // running at attach time still receive those process-wide JVMTI events, but
+    // never per-JNI-call argument events (their JNIEnv table is unchanged).
+    std::string detail =
+        "live attach installs JNI wrappers on the attach thread and every thread "
+        "started afterwards; threads already running at attach time still emit "
+        "the process-wide JVMTI events enabled in this phase (" + enabled_events +
+        ") but not per-JNI-call argument events";
+    emit_gap("jni-table-running-threads", phase, detail, extra.str());
 }
 
 // Shared initialization for both startup (-agentpath, Agent_OnLoad) and live
@@ -352,6 +356,7 @@ jint init_agent(JavaVM* vm, char* options, bool live_attach) {
        << ",\"thr\":" << TraceWriter::tid()
        << ",\"mode\":" << esc(live_attach ? "live-attach" : "startup")
        << ",\"phase\":" << esc(pname)
+       << ",\"logAll\":" << (hook::log_all() ? "true" : "false")
        << ",\"trace\":" << esc(g_trace_path.c_str()) << "}";
     TraceWriter::instance().write_line(lc.str());
 
@@ -372,7 +377,7 @@ jint init_agent(JavaVM* vm, char* options, bool live_attach) {
         cap_bit([](jvmtiCapabilities& c) { c.can_generate_method_exit_events = 1; }),
         "can_generate_method_exit_events", pname);
     // Needed to read parameter values of a native method at MethodEntry.
-    add_capability(jvmti,
+    bool cap_locals = add_capability(jvmti,
         cap_bit([](jvmtiCapabilities& c) { c.can_access_local_variables = 1; }),
         "can_access_local_variables", pname);
     // Exception events drive recovery of try/catch tables.
@@ -380,10 +385,43 @@ jint init_agent(JavaVM* vm, char* options, bool live_attach) {
         cap_bit([](jvmtiCapabilities& c) { c.can_generate_exception_events = 1; }),
         "can_generate_exception_events", pname);
 
+    // Describe exactly which thread-independent JVMTI events we could enable, so
+    // downstream records never imply coverage we do not actually have.
+    std::string enabled_events;
+    auto add_ev = [&](bool on, const char* n) {
+        if (on) { if (!enabled_events.empty()) enabled_events += ", "; enabled_events += n; }
+    };
+    add_ev(cap_bind,  "native-method-bind");
+    add_ev(cap_entry, "method-entry");
+    add_ev(cap_exit,  "method-exit");
+    add_ev(cap_exc,   "exception/exception-catch");
+    if (enabled_events.empty()) enabled_events = "none";
+
     if (!cap_bind && !cap_entry && !cap_exit) {
         emit_gap("no-core-capabilities", pname,
                  "neither native-method-bind nor method entry/exit capabilities "
                  "are available in this phase; the recovery trace will be empty");
+    } else if (live_attach && (!cap_entry || !cap_exit || !cap_exc || !cap_locals)) {
+        // On many JDKs (observed on OpenJDK 21) a live attach can only add
+        // native-method-bind; method entry/exit, local-variable access, and
+        // exception capabilities return JVMTI_ERROR_NOT_AVAILABLE in the live
+        // phase. Record precisely what was obtained rather than implying full
+        // coverage. Without method entry/exit there is no user-native-frame
+        // detection, so per-JNI-call argument events (which gate on being inside
+        // such a frame) will not be produced either.
+        std::ostringstream extra;
+        extra << "\"nativeMethodBind\":" << (cap_bind ? "true" : "false")
+              << ",\"methodEntry\":" << (cap_entry ? "true" : "false")
+              << ",\"methodExit\":" << (cap_exit ? "true" : "false")
+              << ",\"localVariables\":" << (cap_locals ? "true" : "false")
+              << ",\"exceptions\":" << (cap_exc ? "true" : "false")
+              << ",\"enabledEvents\":" << esc(enabled_events.c_str());
+        emit_gap("reduced-live-capabilities", pname,
+                 "live attach obtained only a subset of JVMTI capabilities; "
+                 "entry/exit, local-variable, and exception events unavailable "
+                 "in this phase are not enabled and will not appear in the trace. "
+                 "For full method-body recovery use the startup -agentpath path.",
+                 extra.str());
     }
 
     jvmtiEventCallbacks cbs{};
@@ -415,7 +453,7 @@ jint init_agent(JavaVM* vm, char* options, bool live_attach) {
     }
 
     if (live_attach) {
-        install_on_live_threads(vm, jvmti, pname);
+        install_on_live_threads(vm, jvmti, pname, enabled_events);
     }
 
     return JNI_OK;
