@@ -253,3 +253,258 @@ def jcmd_load_error(returncode: int, output: str) -> Optional[str]:
             "(load failed; see the target JVM's stderr for details)"
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Refusal / failure classification
+#
+# The point of these helpers is *honesty*: detect the common situations where a
+# live attach cannot happen (or already failed), map them to a small set of
+# stable reason codes, and hand the caller an explanation plus the honest next
+# step. None of this bypasses, hides, or patches anything on the target — the
+# recommended remedy is always to restart the target with startup
+# instrumentation (``-agentpath``), the default highest-fidelity recovery path.
+# ---------------------------------------------------------------------------
+
+# Stable reason codes (kept intentionally short and machine-greppable).
+REASON_ATTACH_DISABLED = "attach-disabled"
+REASON_DYNAMIC_AGENT_DISABLED = "dynamic-agent-disabled"
+REASON_ALLOW_ATTACH_SELF_DISABLED = "allow-attach-self-disabled"
+REASON_NOT_A_JVM = "not-a-jvm"
+REASON_CROSS_USER = "cross-user"
+REASON_AGENT_ONATTACH_MISSING = "agent-onattach-missing"
+REASON_AGENT_INIT_FAILED = "agent-init-failed"
+REASON_JCMD_FALSE_SUCCESS = "jcmd-false-success"
+REASON_UNKNOWN = "unknown"
+
+# The one honest remedy this tool offers for every refusal below. It does not
+# bypass the target's flags; it restarts the target under instrumentation.
+STARTUP_PATH_RECOMMENDATION = (
+    "Restart the target under startup instrumentation instead: "
+    "java -agentpath:<path-to-j2c_agent> ... (see `recover` / `dynamic-trace` "
+    "and docs/jvm-attach.md). This tool does not, and will not, bypass the "
+    "target JVM's own attach/agent flags."
+)
+
+# How much raw error text an `unknown` classification keeps for context.
+_UNKNOWN_SNIPPET_LIMIT = 400
+
+
+@dataclass
+class AttachRefusal:
+    """A classified reason a live attach will not / did not happen.
+
+    ``reason`` is one of the stable ``REASON_*`` codes; ``message`` explains it
+    for a human; ``detail`` optionally carries a (truncated) raw snippet for the
+    ``unknown`` case. ``recommend_startup`` is True for every case here — the
+    honest remedy is always the startup ``-agentpath`` path.
+    """
+
+    reason: str
+    message: str
+    detail: str = ""
+    recommend_startup: bool = True
+
+
+def _truncate(text: str, limit: int = _UNKNOWN_SNIPPET_LIMIT) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " …[truncated]"
+
+
+def _allow_attach_self_disabled(cmdline: List[str]) -> bool:
+    """True if argv sets ``jdk.attach.allowAttachSelf`` to a false-y value.
+
+    Java's ``Boolean.getBoolean`` treats only ``"true"`` (case-insensitively) as
+    true, so any other value — most obviously ``false`` — disables it. We only
+    flag the obvious explicit ``=false`` form the docs mention.
+    """
+    for tok in cmdline:
+        low = tok.lower()
+        if "jdk.attach.allowattachself=" in low:
+            value = low.split("jdk.attach.allowattachself=", 1)[1]
+            if value != "true":
+                return True
+    return False
+
+
+def scan_cmdline_for_refusals(cmdline: List[str]) -> Optional[AttachRefusal]:
+    """Scan a target's argv for flags that make a live attach fail/refused.
+
+    Runs *before* jcmd/VirtualMachine is invoked so the CLI can classify and
+    refuse cleanly instead of surfacing an opaque attach-layer error. Detects:
+
+      * ``-XX:+DisableAttachMechanism``          -> ``attach-disabled``
+      * ``-XX:-EnableDynamicAgentLoading``       -> ``dynamic-agent-disabled``
+      * ``-Djdk.attach.allowAttachSelf=false``   -> ``allow-attach-self-disabled``
+
+    Returns the most severe matching refusal, or None if nothing was detected
+    (which is not a guarantee the attach will succeed — the target may carry the
+    flags in ``JAVA_TOOL_OPTIONS`` etc. that argv does not show).
+    """
+    tokens = list(cmdline or [])
+    joined = " ".join(tokens)
+
+    if "-XX:+DisableAttachMechanism" in joined:
+        return AttachRefusal(
+            reason=REASON_ATTACH_DISABLED,
+            message=(
+                "target was started with -XX:+DisableAttachMechanism; the JVM "
+                "attach handshake is disabled, so no agent can be loaded into "
+                "this live process."
+            ),
+        )
+
+    if "-XX:-EnableDynamicAgentLoading" in joined:
+        return AttachRefusal(
+            reason=REASON_DYNAMIC_AGENT_DISABLED,
+            message=(
+                "target was started with -XX:-EnableDynamicAgentLoading; "
+                "dynamically loading a JVMTI agent into this live process is "
+                "disallowed."
+            ),
+        )
+
+    if _allow_attach_self_disabled(tokens):
+        return AttachRefusal(
+            reason=REASON_ALLOW_ATTACH_SELF_DISABLED,
+            message=(
+                "target sets jdk.attach.allowAttachSelf=false; self-attach is "
+                "disabled (this blocks a same-process attach — attach from a "
+                "separate process, or use the startup path)."
+            ),
+        )
+
+    return None
+
+
+def classify_attach_error(
+    returncode: int, output: str, agent_return_code: Optional[int] = None
+) -> AttachRefusal:
+    """Map a jcmd / VirtualMachine attach failure to a stable reason code.
+
+    ``returncode`` is the launcher process exit status, ``output`` its combined
+    stdout+stderr, and ``agent_return_code`` (if known) the value
+    ``Agent_OnAttach`` returned as parsed from jcmd output. This is a pure text
+    classifier — it never spawns a JVM — so callers can unit-test it directly.
+    Unrecognized failures return ``unknown`` with a truncated raw snippet.
+    """
+    text = output or ""
+    low = text.lower()
+
+    # Attach mechanism / handshake unavailable.
+    if (
+        "disableattachmechanism" in low
+        or "attach mechanism is disabled" in low
+        or "attachnotsupportedexception" in low
+        or "unable to open socket file" in low
+        or "the attach listener" in low
+        or "doesn't respond within" in low
+    ):
+        return AttachRefusal(
+            reason=REASON_ATTACH_DISABLED,
+            message=(
+                "the JVM attach mechanism is unavailable on the target "
+                "(commonly -XX:+DisableAttachMechanism or a stale/rejected "
+                "attach socket); no agent could be loaded."
+            ),
+            detail=_truncate(text),
+        )
+
+    # Dynamic agent loading disabled.
+    if (
+        "enabledynamicagentloading" in low
+        or "dynamic agent loading is not enabled" in low
+        or "dynamic loading of agents" in low
+    ):
+        return AttachRefusal(
+            reason=REASON_DYNAMIC_AGENT_DISABLED,
+            message=(
+                "dynamic agent loading is disabled on the target "
+                "(-XX:-EnableDynamicAgentLoading); the agent cannot be attached "
+                "to this live process."
+            ),
+            detail=_truncate(text),
+        )
+
+    # Cross-user / permission refusal from the attach layer.
+    if (
+        "operation not permitted" in low
+        or "well-known file is not secure" in low
+        or "not owned by the current user" in low
+        or ("permission denied" in low and "socket" in low)
+    ):
+        return AttachRefusal(
+            reason=REASON_CROSS_USER,
+            message=(
+                "the attach layer refused for permission / ownership reasons; "
+                "attach is same-user only — run as the owning user, do not use "
+                "elevated privileges to cross users."
+            ),
+            detail=_truncate(text),
+        )
+
+    # Agent library present but does not export Agent_OnAttach. Match only the
+    # "missing export" phrasings, not any mention of Agent_OnAttach (an init
+    # *failure* also names it and is classified separately below).
+    if (
+        "does not have agent_onattach" in low
+        or "no agent_onattach" in low
+        or "failed to find agent_onattach" in low
+        or "agent_onattach not found" in low
+        or "can't find agent_onattach" in low
+        or "cannot find agent_onattach" in low
+    ):
+        return AttachRefusal(
+            reason=REASON_AGENT_ONATTACH_MISSING,
+            message=(
+                "the agent library does not export Agent_OnAttach, so it cannot "
+                "be loaded into a live VM; rebuild the current native/ sources, "
+                "which export it (nm -D ... | grep Agent_On)."
+            ),
+            detail=_truncate(text),
+        )
+
+    # jcmd's false success: process exit 0 but Agent_OnAttach returned non-zero.
+    if returncode == 0 and agent_return_code is not None and agent_return_code != 0:
+        return AttachRefusal(
+            reason=REASON_JCMD_FALSE_SUCCESS,
+            message=(
+                f"jcmd exited 0 but Agent_OnAttach returned {agent_return_code}; "
+                "the agent did not initialize (this is a failure, not a "
+                "successful attach)."
+            ),
+            detail=_truncate(text),
+        )
+
+    # Agent reached Agent_OnAttach but initialization failed.
+    if (
+        "agentinitializationexception" in low
+        or "agent_onattach failed" in low
+        or "the agent library failed to init" in low
+        or (agent_return_code is not None and agent_return_code != 0)
+    ):
+        rc = (
+            f" (Agent_OnAttach returned {agent_return_code})"
+            if agent_return_code is not None
+            else ""
+        )
+        return AttachRefusal(
+            reason=REASON_AGENT_INIT_FAILED,
+            message=(
+                f"the agent reached Agent_OnAttach but failed to initialize{rc}; "
+                "see the target JVM's stderr for the agent's own diagnostics."
+            ),
+            detail=_truncate(text),
+        )
+
+    return AttachRefusal(
+        reason=REASON_UNKNOWN,
+        message=(
+            f"attach failed and the error was not recognized "
+            f"(launcher exit status {returncode}); treating as a failure, not a "
+            "successful attach."
+        ),
+        detail=_truncate(text),
+    )

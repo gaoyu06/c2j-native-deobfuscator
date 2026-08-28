@@ -162,6 +162,45 @@ the agent failed*. The CLI parses that line and treats any non-zero agent return
 print `attached`. The `vm` helper surfaces the same failure as an
 `AgentInitializationException`, which likewise fails the CLI.
 
+## Common refusals and what this tool does
+
+Live attach can be blocked, or produce only reduced coverage, for several
+routine reasons. The CLI **classifies** each situation into a stable reason code,
+**explains** it, and **recommends** the honest next step — it never bypasses the
+target's flags, hides the agent, patches the target's checks, or reports success
+when the attach did not happen.
+
+Two detection points feed the same small set of reason codes:
+
+- a **pre-attach cmdline scan** of the target's `/proc/<pid>/cmdline` (Linux),
+  so the obvious cases are refused *before* `jcmd`/`VirtualMachine` is invoked;
+- a **post-failure classifier** of the launcher/attach-layer output for cases
+  the argv scan cannot see (e.g. flags set via `JAVA_TOOL_OPTIONS`, or a stale
+  attach socket).
+
+On any refusal the CLI exits non-zero, prints
+`attach failed (reason=<code>): …`, and points to the startup `-agentpath` path.
+It never prints `attached (preview)` in these cases.
+
+| Reason code | Detected when | What the tool does |
+|---|---|---|
+| `attach-disabled` | `-XX:+DisableAttachMechanism` on argv, or the attach handshake is unavailable (`AttachNotSupportedException`, "unable to open socket file", "attach listener", "doesn't respond within …") | Refuse; recommend restarting under startup `-agentpath`. **No bypass** of `DisableAttachMechanism`. |
+| `dynamic-agent-disabled` | `-XX:-EnableDynamicAgentLoading` on argv, or "dynamic agent loading is not enabled" from the attach layer | Refuse; recommend startup `-agentpath`. |
+| `allow-attach-self-disabled` | `-Djdk.attach.allowAttachSelf=false` on argv | Refuse (this only blocks a *self*-attach); attach from a separate process, or use the startup path. |
+| `cross-user` | Same-user check fails pre-attach, or the attach layer refuses on ownership/permission grounds ("operation not permitted", "well-known file is not secure") | Refuse; run as the owning user — **no** privilege escalation to cross users. |
+| `not-a-jvm` | The target does not look like a JVM (pre-attach validation) | Refuse before touching the target. |
+| `agent-onattach-missing` | Attach output shows the agent has no `Agent_OnAttach` export | Refuse; rebuild the current `native/` sources (they export it). |
+| `agent-init-failed` | `Agent_OnAttach` ran but returned non-zero / `AgentInitializationException` | Refuse; check the target JVM's stderr for the agent's own diagnostics. |
+| `jcmd-false-success` | `jcmd` exited 0 but `return code: <N≠0>` | Treat as failure, not success (see "Failure reporting" above). |
+| `unknown` | Attach failed with an unrecognized error | Refuse; include a truncated raw snippet for context. |
+
+**Reduced coverage is not a refusal.** If the attach *succeeds* but the JDK
+grants only bind-only capabilities (the common OpenJDK 21 case), that is honest
+reduced coverage, not a failure: the CLI reports `attached (preview)`, the trace
+carries the `capability` / `gap` records that state exactly what was obtained,
+and the CLI prints a one-line reminder that full method-body recovery needs the
+startup `-agentpath` path. See [Capability and gap records](#capability-and-gap-records).
+
 ## Capability and gap records
 
 On attach the agent writes structured records to the trace before normal events:

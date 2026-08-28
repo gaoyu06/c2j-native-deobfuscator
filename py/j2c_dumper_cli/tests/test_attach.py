@@ -318,3 +318,199 @@ def test_attach_jcmd_success_reports_attached(runner, app, monkeypatch, tmp_path
     ])
     assert result.exit_code == 0
     assert "attached (preview)" in _flat(result)
+    # Reduced coverage is not a refusal, but a one-line startup reminder is shown.
+    assert "startup -agentpath" in _flat(result)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers: pre-attach cmdline scan (scan_cmdline_for_refusals)
+# ---------------------------------------------------------------------------
+
+def test_scan_clean_cmdline_returns_none():
+    assert A.scan_cmdline_for_refusals(
+        ["/usr/bin/java", "-Xmx1g", "-jar", "app.jar"]
+    ) is None
+    assert A.scan_cmdline_for_refusals([]) is None
+
+
+def test_scan_detects_disable_attach_mechanism():
+    r = A.scan_cmdline_for_refusals(
+        ["java", "-XX:+DisableAttachMechanism", "-jar", "app.jar"]
+    )
+    assert r is not None
+    assert r.reason == A.REASON_ATTACH_DISABLED
+    assert r.recommend_startup is True
+
+
+def test_scan_detects_dynamic_agent_loading_disabled():
+    r = A.scan_cmdline_for_refusals(
+        ["java", "-XX:-EnableDynamicAgentLoading", "-jar", "app.jar"]
+    )
+    assert r is not None
+    assert r.reason == A.REASON_DYNAMIC_AGENT_DISABLED
+
+
+def test_scan_does_not_flag_dynamic_agent_loading_enabled():
+    # The '+' (enabled) form must NOT be treated as a refusal.
+    assert A.scan_cmdline_for_refusals(
+        ["java", "-XX:+EnableDynamicAgentLoading", "-jar", "app.jar"]
+    ) is None
+
+
+def test_scan_detects_allow_attach_self_false():
+    r = A.scan_cmdline_for_refusals(
+        ["java", "-Djdk.attach.allowAttachSelf=false", "-jar", "app.jar"]
+    )
+    assert r is not None
+    assert r.reason == A.REASON_ALLOW_ATTACH_SELF_DISABLED
+
+
+def test_scan_ignores_allow_attach_self_true():
+    assert A.scan_cmdline_for_refusals(
+        ["java", "-Djdk.attach.allowAttachSelf=true", "-jar", "app.jar"]
+    ) is None
+
+
+def test_scan_priority_attach_disabled_first():
+    # If several blockers are present, the most fundamental one wins.
+    r = A.scan_cmdline_for_refusals([
+        "java",
+        "-XX:-EnableDynamicAgentLoading",
+        "-XX:+DisableAttachMechanism",
+        "-Djdk.attach.allowAttachSelf=false",
+    ])
+    assert r.reason == A.REASON_ATTACH_DISABLED
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers: post-failure classification (classify_attach_error)
+# ---------------------------------------------------------------------------
+
+def test_classify_attach_disabled_from_output():
+    r = A.classify_attach_error(
+        1, "com.sun.tools.attach.AttachNotSupportedException: Unable to open "
+           "socket file: target process not responding",
+    )
+    assert r.reason == A.REASON_ATTACH_DISABLED
+    assert r.detail  # keeps a raw snippet
+
+
+def test_classify_dynamic_agent_disabled_from_output():
+    r = A.classify_attach_error(
+        1, "Dynamic agent loading is not enabled. "
+           "Use -XX:+EnableDynamicAgentLoading",
+    )
+    assert r.reason == A.REASON_DYNAMIC_AGENT_DISABLED
+
+
+def test_classify_cross_user_from_output():
+    r = A.classify_attach_error(
+        1, "java.io.IOException: well-known file is not secure: not owned by "
+           "the current user",
+    )
+    assert r.reason == A.REASON_CROSS_USER
+
+
+def test_classify_agent_onattach_missing():
+    r = A.classify_attach_error(
+        1, "The agent library does not have Agent_OnAttach and cannot be "
+           "loaded into a running VM",
+    )
+    assert r.reason == A.REASON_AGENT_ONATTACH_MISSING
+
+
+def test_classify_jcmd_false_success():
+    # jcmd process exit 0 but Agent_OnAttach returned -1.
+    r = A.classify_attach_error(0, "4321:\nreturn code: -1\n", agent_return_code=-1)
+    assert r.reason == A.REASON_JCMD_FALSE_SUCCESS
+    assert "-1" in r.message
+
+
+def test_classify_agent_init_failed():
+    r = A.classify_attach_error(
+        1, "com.sun.tools.attach.AgentInitializationException: "
+           "Agent_OnAttach failed",
+    )
+    assert r.reason == A.REASON_AGENT_INIT_FAILED
+
+
+def test_classify_agent_init_failed_from_nonzero_agent_rc():
+    r = A.classify_attach_error(1, "some java noise", agent_return_code=2)
+    assert r.reason == A.REASON_AGENT_INIT_FAILED
+
+
+def test_classify_unknown_keeps_truncated_snippet():
+    noise = "x" * 1000
+    r = A.classify_attach_error(3, noise)
+    assert r.reason == A.REASON_UNKNOWN
+    assert "truncated" in r.detail
+    assert len(r.detail) < len(noise)
+
+
+# ---------------------------------------------------------------------------
+# CLI-level: pre-attach cmdline scan refuses before invoking jcmd
+# ---------------------------------------------------------------------------
+
+def test_attach_refuses_disable_attach_mechanism_before_jcmd(
+    runner, app, monkeypatch, tmp_path
+):
+    """A target started with -XX:+DisableAttachMechanism must be refused with a
+    stable reason code *before* any attach subprocess runs, and must never print
+    'attached (preview)'."""
+    from j2c_dumper_cli import main as M
+
+    agent = tmp_path / "j2c_agent.so"
+    agent.write_bytes(b"\x7fELF")
+
+    monkeypatch.setattr(M, "_jdk_tool", lambda name: name)
+    monkeypatch.setattr(
+        M, "read_proc_info",
+        lambda p: A.ProcInfo(
+            pid=p, exists=True, uid=None, comm="java",
+            cmdline=["/usr/bin/java", "-XX:+DisableAttachMechanism",
+                     "-jar", "app.jar"],
+        ),
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("subprocess.run must not be called after refusal")
+
+    monkeypatch.setattr(M.subprocess, "run", boom)
+
+    result = runner.invoke(app, [
+        "attach", "--pid", "4321", "--i-own-this-process",
+        "--agent", str(agent), "--mechanism", "jcmd",
+    ])
+    assert result.exit_code != 0
+    flat = _flat(result)
+    assert "attach-disabled" in flat
+    assert "attached (preview)" not in result.output
+
+
+def test_attach_jcmd_failure_prints_reason_and_startup_path(
+    runner, app, monkeypatch, tmp_path
+):
+    """A post-failure jcmd error is classified and the startup path recommended;
+    'attached (preview)' is never printed."""
+    from j2c_dumper_cli import main as M
+
+    agent = tmp_path / "j2c_agent.so"
+    agent.write_bytes(b"\x7fELF")
+    _patch_attach_gate(monkeypatch, 4321, agent)
+
+    monkeypatch.setattr(
+        M.subprocess, "run",
+        lambda *a, **k: _FakeCompleted(
+            1, stderr="Dynamic agent loading is not enabled"
+        ),
+    )
+
+    result = runner.invoke(app, [
+        "attach", "--pid", "4321", "--i-own-this-process",
+        "--agent", str(agent), "--mechanism", "jcmd",
+    ])
+    assert result.exit_code != 0
+    flat = _flat(result)
+    assert "dynamic-agent-disabled" in flat
+    assert "-agentpath" in flat
+    assert "attached (preview)" not in result.output

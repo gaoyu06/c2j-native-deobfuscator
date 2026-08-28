@@ -17,11 +17,16 @@ from rich.console import Console
 
 from .attach_support import (
     CONFIRM_FLAG,
+    STARTUP_PATH_RECOMMENDATION,
+    AttachRefusal,
     build_agent_options,
     build_jcmd_agent_load_argv,
+    classify_attach_error,
     current_uid,
     jcmd_load_error,
+    parse_jcmd_return_code,
     read_proc_info,
+    scan_cmdline_for_refusals,
     validate_attach_target,
 )
 
@@ -123,6 +128,22 @@ def _jdk_tool(name: str) -> str:
     )
 
 
+def _report_refusal(refusal: AttachRefusal) -> None:
+    """Print a classified attach refusal/failure and exit non-zero.
+
+    Never prints ``attached``: reaching here means the attach did not happen.
+    """
+    console.print(
+        f"[red]error:[/] attach failed (reason={refusal.reason}): "
+        f"{refusal.message}"
+    )
+    if refusal.detail:
+        console.print(f"[dim]target output: {refusal.detail}[/]")
+    if refusal.recommend_startup:
+        console.print(f"[yellow]next step:[/] {STARTUP_PATH_RECOMMENDATION}")
+    raise typer.Exit(code=1)
+
+
 def _attach_via_jcmd(pid: int, agent_path: Path, opts: str) -> None:
     """Attach via `jcmd <pid> JVMTI.agent_load` (documented diagnostic command,
     routed through the same attach mechanism, invokes Agent_OnAttach).
@@ -132,6 +153,9 @@ def _attach_via_jcmd(pid: int, agent_path: Path, opts: str) -> None:
         agent option, so the option string must be passed single-quoted; and
       * ``jcmd`` exits 0 even when ``Agent_OnAttach`` fails, printing
         ``return code: <N>`` on stdout — so we parse that and fail loudly.
+
+    On any failure the error is classified into a stable reason code and the
+    honest next step (startup ``-agentpath``) is printed.
     """
     jcmd = _jdk_tool("jcmd")
     argv = build_jcmd_agent_load_argv(jcmd, pid, str(agent_path), opts)
@@ -142,19 +166,35 @@ def _attach_via_jcmd(pid: int, agent_path: Path, opts: str) -> None:
         console.log(combined.rstrip())
     error = jcmd_load_error(res.returncode, combined)
     if error:
-        console.print(f"[red]error:[/] jcmd agent load failed: {error}")
-        raise typer.Exit(code=1)
+        refusal = classify_attach_error(
+            res.returncode, combined, parse_jcmd_return_code(combined)
+        )
+        _report_refusal(refusal)
 
 
 def _attach_via_vm(pid: int, agent_path: Path, opts: str) -> None:
-    """Attach via com.sun.tools.attach.VirtualMachine using a compiled helper."""
+    """Attach via com.sun.tools.attach.VirtualMachine using a compiled helper.
+
+    The compile step is a local-toolchain concern (surfaced by ``run``); the
+    attach invocation itself captures output so a failure is classified into a
+    stable reason code rather than an opaque Java stack trace.
+    """
     javac = _jdk_tool("javac")
     java = _jdk_tool("java")
     helper_dir = Path(tempfile.mkdtemp(prefix="j2c-attach-"))
     src = helper_dir / "J2cAttach.java"
     src.write_text(_ATTACH_HELPER_SOURCE)
     run([javac, "-d", str(helper_dir), str(src)])
-    run([java, "-cp", str(helper_dir), "J2cAttach", str(pid), str(agent_path), opts])
+    argv = [java, "-cp", str(helper_dir), "J2cAttach", str(pid), str(agent_path), opts]
+    console.log(f"[dim]$ {' '.join(str(x) for x in argv)}[/]")
+    res = subprocess.run([str(x) for x in argv], check=False,
+                         capture_output=True, text=True)
+    combined = f"{res.stdout}{res.stderr}"
+    if combined.strip():
+        console.log(combined.rstrip())
+    if res.returncode != 0:
+        refusal = classify_attach_error(res.returncode, combined)
+        _report_refusal(refusal)
 
 
 def _do_attach(pid: int, agent_path: Path, opts: str, mechanism: str) -> None:
@@ -457,6 +497,14 @@ def cli_attach(
             console.print(f"[red]error:[/] {problem}")
         raise typer.Exit(code=2)
 
+    # 2b. Pre-attach cmdline scan: if the target's own argv shows the attach or
+    # dynamic-agent-loading mechanism is disabled, classify and refuse *before*
+    # invoking jcmd/VirtualMachine. This is honest handling, not a bypass: the
+    # remedy is to restart under startup instrumentation.
+    refusal = scan_cmdline_for_refusals(proc.cmdline)
+    if refusal is not None:
+        _report_refusal(refusal)
+
     # 3. Resolve the agent library.
     if agent is not None:
         agent_path = agent
@@ -480,6 +528,15 @@ def cli_attach(
         f"[bold green]attached (preview).[/] trace -> {output}\n"
         "Clean stop: terminate the target JVM normally; the agent flushes and "
         "closes the trace on VM exit. Then feed the trace to `trace-to-bc`."
+    )
+    # Reduced coverage is not a refusal: the attach happened. Remind the user
+    # that a live attach commonly obtains only native-method-bind (see the
+    # trace's capability/gap records) and full method-body recovery needs the
+    # startup -agentpath path.
+    console.print(
+        "[dim]note: a live attach commonly obtains only native-method-bind "
+        "coverage (see the trace's capability/gap records); for full "
+        "method-body recovery use the startup -agentpath path.[/]"
     )
 
 
