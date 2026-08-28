@@ -334,18 +334,26 @@ def _canonical_jni_symbol(name: str, fmt: str) -> str:
 
 
 def extract_exported_functions(b: lief.Binary) -> list[dict[str, Any]]:
+    # Deduplicate by (name, addr), preserving first-seen order. LIEF exposes
+    # each ELF dynamic symbol under more than one accessor on some versions, so
+    # ``exported_symbols`` can list the same export twice; without this a single
+    # Java_* export would be recorded as two identical native-registry entries.
     result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(name: str, addr: str) -> None:
+        key = (name, addr)
+        if key not in seen:
+            seen.add(key)
+            result.append({"name": name, "addr": addr})
+
     if b.format == lief.Binary.FORMATS.PE and b.has_exports:
         for e in b.get_export().entries:
-            result.append({"name": e.name, "addr": hex(b.imagebase + e.address)})
-    elif b.format == lief.Binary.FORMATS.ELF:
+            _add(e.name, hex(b.imagebase + e.address))
+    elif b.format in (lief.Binary.FORMATS.ELF, lief.Binary.FORMATS.MACHO):
         for s in b.exported_symbols:
             if s.name:
-                result.append({"name": s.name, "addr": hex(s.value)})
-    elif b.format == lief.Binary.FORMATS.MACHO:
-        for s in b.exported_symbols:
-            if s.name:
-                result.append({"name": s.name, "addr": hex(s.value)})
+                _add(s.name, hex(s.value))
     return result
 
 
