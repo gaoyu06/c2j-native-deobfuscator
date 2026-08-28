@@ -6,8 +6,8 @@
 > those branches landed, how their reviews judged them, what is now true versus
 > what the original documentation claimed, and which decisions still need a
 > human. It is docs-only and is **not a product ship**. Every draft branch was
-> read but left unchanged; this report is the only new file, added on a fresh
-> branch from `main`.
+> read but left unchanged; this report (PR #10) is the only new file, added on a
+> fresh branch from `main`.
 >
 > Terminology is deliberately neutral: JNI-native transpiled JARs, bytecode
 > restoration, JVMTI diagnostics, process inspection, library instrumentation,
@@ -34,16 +34,20 @@
 - **#5 平台计划 + 决策记录 + 交叉核对**（纯文档）：第二份独立计划，区分"本计划可
   自行决定"与"必须人来拍板"的决策（D1–D11 / B1–B11）。可原样合并。
 - **#6 doctor / setup 脚本 / 上手指南**（代码）：新增环境自检、安装脚本、双语上手
-  文档，把"手动 CLI"重新定位为默认用法。评审判定：**可作为草稿合并，但合并前必须
-  修复**（缺 `capstone` 依赖、JDK17→21 越级、doctor 误报就绪/把告警当阻断等 7 项）。
+  文档，把"手动 CLI"重新定位为默认用法。评审判定：原 7 项必修项已解决，**现处于最后
+  收尾细节阶段**（README 仍残留 `python -m` 示例、ARM 上 doctor 不得把 ARM 标记的
+  遗留 agent 判为 OK、README 引言仍过度宣称"真实字节码方法体"）。
 - **#7 native-x86 隔离 + 插件 ABI**（文档 + 骨架）：独立的用户态观测骨架 + 版本化
   C 插件 ABI，公共头**不含任何 Java/JNI 类型**，且**尚未实现任何观测**。评审判定：
-  **必须修复**（次版本协商会越界写内存、`process_id` 打错进程、生命周期/传输过度宣称）。
+  经必修 + 复审后，**作为文档 + 实验性骨架落地**；早前的 `process_id` / 次版本协商越界写
+  问题已修复；**ABI v0.1 明确为实验性、非产品功能**。
 - **#8 Swing 桌面查看器**（代码）：只读的 CLI 产物查看器（Swing + FlatLaf），不含任何
-  还原逻辑。视觉评审发现并修复 6 个问题，并删除了一个"附加—暂不可用"的假按钮。测试通过。
+  还原逻辑。视觉评审已完成、发现并修复 6 个问题并删除了一个"附加—暂不可用"的假按钮；
+  测试通过。属于**可选桌面草稿**，与其余模块存在 JDK 17/21 分歧，**非正式 UI 发布**。
 - **#9 可选的 JVMTI 实时附加预览**（代码）：新增 `Agent_OnAttach` 与基于 `jdk.attach`
-  的**同用户**附加 CLI；默认 `recover` 流程不变。评审判定：**仅作为可选预览**，且已修复
-  三个必修项（jcmd 误报成功、能力宣称过高、`--log-all` 空开关）。
+  的**同用户**附加 CLI；默认 `recover` 流程不变。评审判定：经必修 + 复审后，**作为预览
+  草稿落地**；三个必修项（jcmd 误报成功、能力宣称过高、`--log-all` 空开关）已修复；
+  OpenJDK 21 实时附加常常只能拿到 bind 能力，**不作默认 recover**。
 
 **所有 8 个 PR 目前都是 OPEN + 草稿状态**，评审结论以仓库内文档形式存在（GitHub 上无
 正式 review 记录）。
@@ -56,7 +60,7 @@
 - **Ghidra 可选**：原文档把静态路径写成"需要 Ghidra"。#4/#6 在文档与命令层把 Ghidra
   降级为可选方法体插件，并提供无 Ghidra 的发现/桩生成路径；但这尚未合并进 `main`。
 - **使用门槛**：原 README 主张"用编码 agent 驱动、别指望手动跑脚本"。#6 用 doctor + 安装
-  脚本 + 上手指南把手动 CLI 变成默认路径；但存在未修复的必修项，尚未合并。
+  脚本 + 上手指南把手动 CLI 变成默认路径；原 7 项必修项已解决，仅剩最后收尾细节，尚未合并。
 - **GUI**：原仓库只有静态截图，无桌面应用。#8 提供了只读桌面查看器（Swing + FlatLaf）。
 - **附加（attach）**：原实现里"attach"其实是用 `-agentpath` 启动新进程。#9 才提供真正的
   实时附加预览（同用户 + 显式 `--pid`），但受 JVM 限制，实时附加通常只能拿到
@@ -72,20 +76,20 @@
 | 桌面技术栈 | Swing + FlatLaf | **已**：#8 已按此实现 |
 | 实时附加策略 | 同用户 + 显式 PID 确认；允许更严的企业策略 | **已**：#9 已按此实现为预览 |
 | native-x86 是否留在本仓库 | 留在仓库但保持隔离（可后续再拆分） | **部分**：骨架已在仓库内且已隔离；"留还是拆"仍开放 |
-| 插件信任 / 传输 | 版本化 C ABI，出现两个真实插件后再冻结；进程内先行，跨进程传输另行定义线格式 | **部分**：#7 给出 ABI 设计与骨架，但有内存安全必修项，传输尚未定义 |
+| 插件信任 / 传输 | 版本化 C ABI，出现两个真实插件后再冻结；进程内先行，跨进程传输另行定义线格式 | **部分**：#7 给出 ABI 设计与骨架，早前内存安全必修项经复审已修复；ABI v0.1 仍为实验性、未冻结，跨进程线格式与信任模型仍待定 |
 | 是否要做特权观测者 | **默认否**，仅在测得用户态确有反复无法覆盖的盲区后，作为后期可选项 | **未**（符合推荐）：仅有边界文档，无任何代码 |
 | 敏感缓冲区 / 库观测 | **默认只采集元数据**；如需内容，须单会话、本地、可打码、显式开启、不外传 | **未**（符合推荐）：未实现；native-x86 记录仅为结构性元数据 |
 
 ### (d) 建议合并顺序
 
-先文档（#2、#3、#5、以及本报告）→ 再 doctor/setup（#6，修完必修项后）→
-通用发现（#4，作为草稿/开发合并，未达默认发布）→ 桌面查看器（#8）→
-实时附加（#9，保持可选预览）→ native-x86（#7，修完必修项后仅作开发者预览）。
+先文档（#2、#3、#5、以及本报告 #10）→ 再 doctor/setup（#6，收尾细节完成后）→
+通用发现（#4，作为草稿/开发合并，未达默认发布）→ 桌面查看器（#8，可选草稿）→
+实时附加（#9，保持预览）→ native-x86（#7，作为实验性文档骨架）。
 
 **在各自评审说 OK 之前不得合并/提升**：#4 在未关闭"仅按数量的无名表定位误绑"前不得
-成为默认发布路径；#6 未修完 7 项必修项不得合并；#7 未修好次版本协商越界写与
-`process_id` 打错前不得被当作稳定 ABI；#9 必须保持可选预览、不得提升为默认或宣称完整
-覆盖；未获人决策前不得开工敏感缓冲区/库内容采集与特权观测者。
+成为默认发布路径；#6 未完成最后收尾细节不得合并；#7 的 ABI v0.1 为实验性，未经稳定化
+不得被当作稳定 ABI 或产品功能；#9 必须保持可选预览、不得提升为默认或宣称完整覆盖；
+未获人决策前不得开工敏感缓冲区/库内容采集与特权观测者。
 
 ### 明确不在范围内 / 未做
 
@@ -114,10 +118,10 @@
 | **#3** | `cursor/genericity-audit-966b` | Docs only: inventory of **85 findings** where code assumes a specific variant, compiler, OS/CPU, or decompiler output shape (`docs/genericity-audit.md`). Facts only, no fix. | **Yes — docs-only.** | Factual inventory; nothing is "fixed" by it. Mergeable as a reference for later generality work. |
 | **#4** | `cursor/generic-first-discovery-ca12` | Code: generic method discovery from JNI structure (vtable index 215 via decoded operands, ABI arg registers, `Java_*` exports), Ghidra demoted to an optional method-body plugin, new `static-lite`/`inventory`-style commands, schema additions, tests + a real ELF fixture (`docs/reviews/generic-first-pr.md`, `docs/generic-recovery.md`). | **As a draft / dev merge: yes. As the default release: no.** | Reviewed twice. Both original must-fixes resolved (real-ELF loading test committed; lifter derives profile from the artifact). Full Python suite 21 passed. Residual (not must-fix): unnamed count-only positional mis-binding; PE/Mach-O loading unproven; section-stripped ELF returns a silent empty registry. |
 | **#5** | `cursor/platform-plan-docs-7274` | Docs only: a second, independent platform plan plus ADR-style decision records that split "decisions this plan makes" (D1–D11) from "decisions reserved for a human" (B1–B11), and a cross-check against #2 (`docs/platform-plan.md`, `docs/decisions.md`, `docs/plan-crosscheck.md`). | **Yes — docs-only.** | Endorses #2's diagnosis; differs on sequencing (front-load decision-free value; defer the event-IR/fusion rebuild). Mergeable as documentation. |
-| **#6** | `cursor/cli-doctor-setup-getting-started-b8b1` | Code: read-only `doctor` preflight, `setup.sh`/`setup.ps1`, `j2c` launchers, bilingual getting-started, Ghidra-free tests; both READMEs reframed so manual CLI is the default and assisted adaptation is optional (`docs/reviews/cli-doctor-setup.md`). | **Ship as draft; must-fix before merge.** | Directionally right, but 7 must-fix items: missing `capstone` dependency (doctor can print `Ready` before `recover` fails), unneeded repo-wide JDK 17→21 bump, native-artifact checks that neither prove readiness nor rebuild staleness, warnings treated as blocking, no-argument path exits non-zero, an undocumented Windows `bash` prerequisite, and readiness/output claims that overstate what `doctor` checks. May still be in re-review. |
-| **#7** | `cursor/native-x86-plugin-abi-5384` | Docs + skeleton: a separate user-mode `native-x86/` module (owned-process/module enumeration, PE/ELF inspection, scoped instrumentation — **none implemented yet**), a versioned C plugin ABI whose public header carries **no Java/JNI types**, and a boundary doc for an optional, unimplemented privileged observer (`docs/reviews/native-x86-abi.md`, `docs/plugin-abi.md`, `docs/privileged-observer.md`). | **No — developer preview / design only.** | Must-fix: minor-version negotiation can overwrite host memory; `process_id` is stamped with the host PID instead of the observed process (or zero); lifecycle/transport docs claim guarantees the skeleton does not enforce. Java/JNI isolation, recovery-pipeline isolation, and the Linux smoke build all pass. |
-| **#8** | `cursor/swing-desktop-viewer-7389` | Code: an optional read-only Swing + FlatLaf desktop viewer that launches CLI stages and renders pipeline status, the method table, and JVMTI trace — **no recovery logic, no browser server** (`docs/reviews/desktop-ui-visual.md`, `jvm/desktop-ui/README.md`). | **Yes, optional** — after CLI/event contracts are stable. | Visual review found and fixed 6 issues (clipped detail pane, mid-token command wrap, centered headers, jumping divider, non-reproducible screenshots) and **removed a permanently-disabled "Attach — not available yet" button**. `:desktop-ui:test` passes. Note: the module targets JDK 21 while the rest of `jvm/` targets JDK 17. |
-| **#9** | `cursor/opt-in-jvmti-live-attach-1155` | Code: opt-in live attach preview — export `Agent_OnAttach`, a `jdk.attach` **same-user** CLI (`--i-own-this-process` + required explicit `--pid`), lazy per-thread install, capability/gap/drop records over the existing agent; default `recover` (startup `-agentpath`) unchanged (`docs/reviews/jvm-attach.md`, `docs/jvm-attach.md`). | **No initially — opt-in preview only.** | Three must-fix items resolved: `jcmd` false success on load failure, coverage claims that exceeded what a live attach obtains, and a dead `--log-all` switch. Empirically on OpenJDK 21 a live attach obtains **only** `native-method-bind`; entry/exit/locals/exception are `OnLoad`-only, so records and docs were corrected to say so. Full method-body recovery still needs the startup path. |
+| **#6** | `cursor/cli-doctor-setup-getting-started-b8b1` | Code: read-only `doctor` preflight, `setup.sh`/`setup.ps1`, `j2c` launchers, bilingual getting-started, Ghidra-free tests; both READMEs reframed so manual CLI is the default and assisted adaptation is optional (`docs/reviews/cli-doctor-setup.md`). | **Ship as draft; final nit pass.** | The original 7 must-fix items are resolved. What remains is a **final nit pass**: the README still shows leftover `python -m` examples, `doctor` on ARM must not report an ARM-labelled leftover agent as OK, and the README intro still over-claims "real bytecode bodies." Merge once those nits close. |
+| **#7** | `cursor/native-x86-plugin-abi-5384` | Docs + skeleton: a separate user-mode `native-x86/` module (owned-process/module enumeration, PE/ELF inspection, scoped instrumentation — **none implemented yet**), a versioned C plugin ABI whose public header carries **no Java/JNI types**, and a boundary doc for an optional, unimplemented privileged observer (`docs/reviews/native-x86-abi.md`, `docs/plugin-abi.md`, `docs/privileged-observer.md`). | **Ship as a documentation + experimental skeleton.** | After must-fix + re-review: the earlier must-fixes (minor-version negotiation memory overwrite, `process_id` mislabeling, overclaimed lifecycle/transport) are addressed. **ABI v0.1 is explicitly experimental/unstable and is not a product feature.** Java/JNI isolation, recovery-pipeline isolation, and the Linux smoke build pass. |
+| **#8** | `cursor/swing-desktop-viewer-7389` | Code: an optional read-only Swing + FlatLaf desktop viewer that launches CLI stages and renders pipeline status, the method table, and JVMTI trace — **no recovery logic, no browser server** (`docs/reviews/desktop-ui-visual.md`, `jvm/desktop-ui/README.md`). | **Yes, optional desktop draft** — not a formal UI ship. | Visual pass is **done**: it found and fixed 6 issues (clipped detail pane, mid-token command wrap, centered headers, jumping divider, non-reproducible screenshots) and **removed a permanently-disabled "Attach — not available yet" button**. `:desktop-ui:test` passes. Remaining item is the JDK split — the module targets JDK 21 while the rest of `jvm/` targets JDK 17. This is an optional desktop draft, not a formal UI ship. |
+| **#9** | `cursor/opt-in-jvmti-live-attach-1155` | Code: opt-in live attach preview — export `Agent_OnAttach`, a `jdk.attach` **same-user** CLI (`--i-own-this-process` + required explicit `--pid`), lazy per-thread install, capability/gap/drop records over the existing agent; default `recover` (startup `-agentpath`) unchanged (`docs/reviews/jvm-attach.md`, `docs/jvm-attach.md`). | **Ship as a preview draft** — not default recover. | After must-fix + re-review: the three must-fixes (`jcmd` false success on load failure, coverage claims exceeding what a live attach obtains, and a dead `--log-all` switch) are resolved. Empirically on OpenJDK 21 a live attach is **often bind-only** (`native-method-bind`); entry/exit/locals/exception are `OnLoad`-only, so records and docs were corrected to say so. Full method-body recovery still needs the startup path. |
 
 ---
 
@@ -164,10 +168,11 @@ the **gap** an owner should keep in mind.
   `j2c` launchers, and a bilingual getting-started guide, and reframes both
   READMEs so **manual CLI use is the default** and assisted adaptation is
   optional.
-- **Gap.** Not merged, and its own review lists 7 must-fix items — most notably
-  that `doctor` can approve an unusable install (missing `capstone`) and reject a
-  usable one (warnings treated as blocking). The barrier is lowered on the branch
-  but not yet reliably.
+- **Gap.** Not merged. Its original 7 must-fix items are resolved; a **final nit
+  pass** remains (leftover `python -m` examples in the README, `doctor` on ARM not
+  OK-ing an ARM-labelled leftover agent, and a README intro that still over-claims
+  "real bytecode bodies"). The barrier is lowered on the branch and close to
+  merge-ready.
 
 ### 2.4 GUI
 
@@ -204,9 +209,10 @@ the **gap** an owner should keep in mind.
   keeps the recovery pipeline (`py/`, `jvm/`, `native/`, `ghidra/`) untouched. A
   future JVM adapter is documented as living *outside* this directory.
 - **Gap.** It is a **skeleton plus documentation** — no process observation or
-  instrumentation is implemented — and it has memory-safety and labeling must-fix
-  items (see §3.5). Some design docs overclaim ABI stability, lifecycle gating,
-  and out-of-process transport relative to what the skeleton enforces.
+  instrumentation is implemented. After re-review the earlier memory-safety and
+  labeling must-fix items are resolved (see §3.5); **ABI v0.1 remains explicitly
+  experimental and is not a product feature**, and the out-of-process transport /
+  wire schema is still future work rather than a property the skeleton enforces.
 
 ---
 
@@ -302,14 +308,13 @@ long-term maintenance.
   transport**. Decide trust explicitly rather than defaulting to in-process trust.
 - **Consequences.** A stable, long-lived extension point, but ABI compatibility
   becomes a maintenance obligation, so the freeze is deliberately evidence-gated.
-- **Work already proceeded?** **Partially, and it is not yet safe to rely on.** #7
-  publishes the C ABI design and a working skeleton, but the review found the
-  minor-version negotiation can **overwrite host memory** (both sides currently
-  reject `struct_size` mismatches instead of reading only the common prefix), the
-  event copy is shallow with process-local pointers (so "drop-in" out-of-process
-  transport is overclaimed), and the lifecycle "events only between start/stop" is
-  not enforced. These must be fixed before the ABI is treated as a versioned
-  extension mechanism. The trust model is explicitly left to a human.
+- **Work already proceeded?** **Partially.** #7 publishes the C ABI design and a
+  working skeleton, and after re-review the earlier defects (minor-version
+  negotiation memory overwrite, `process_id` mislabeling, and overclaimed
+  lifecycle/transport) are addressed. **ABI v0.1 is explicitly experimental — not
+  frozen, and not a product feature.** A real out-of-process wire schema and the
+  trust model (in-process trust versus isolation) remain open and are left to a
+  human; the freeze still waits for two real plugins.
 
 ### 3.6 Whether a privileged observer should ever be built
 
@@ -370,20 +375,23 @@ The order deliberately establishes **truthful docs and lowered setup friction
 before** adding more front ends or observers. Docs branches are mergeable now
 (owner sign-off aside); code branches merge only after their review gates clear.
 
-1. **Docs first — #2, #3, #5 (+ this report).** Docs-only; they change no runtime
-   behavior and set the contracts and honest labels everything else references.
-   Merge in any order among themselves.
-2. **#6 — doctor / setup / getting-started.** After its **7 must-fix items** are
-   resolved. It removes the largest usage barrier and is a prerequisite for a
-   good first-run experience.
+1. **Docs first — #2, #3, #5 (+ this report, #10).** Docs-only; they change no
+   runtime behavior and set the contracts and honest labels everything else
+   references. Merge in any order among themselves.
+2. **#6 — doctor / setup / getting-started.** After its **final nit pass** closes
+   (leftover `python -m` examples, ARM `doctor` not OK-ing an ARM-labelled leftover
+   agent, the "real bytecode bodies" README over-claim). It removes the largest
+   usage barrier and is a prerequisite for a good first-run experience.
 3. **#4 — generic-first discovery.** As a **draft / development merge**, not as
    the default release path. It proves the generic front door (ELF verified).
-4. **#8 — Swing desktop viewer.** After the CLI/event contracts it consumes are
-   stable; visual fixes are already applied.
-5. **#9 — live attach.** Kept an **opt-in preview**; the default `recover` path
-   stays on startup `-agentpath`.
-6. **#7 — native-x86 core + plugin ABI.** After its **must-fix items** are fixed,
-   and only as a **developer preview**.
+4. **#8 — Swing desktop viewer.** An **optional desktop draft** (not a formal UI
+   ship), after the CLI/event contracts it consumes are stable; visual fixes are
+   already applied.
+5. **#9 — live attach.** Kept a **preview draft**; the default `recover` path stays
+   on startup `-agentpath`.
+6. **#7 — native-x86 core + plugin ABI.** As a **documentation + experimental
+   skeleton** after its must-fix + re-review — ABI v0.1 is experimental and not a
+   product feature.
 
 ### What must not be merged / promoted until its review says so
 
@@ -391,14 +399,15 @@ before** adding more front ends or observers. Docs branches are mergeable now
   positional mis-binding** is closed (it silently binds a stack table to the first
   class with a matching native-method count); PE (`.dll`) and Mach-O loading paths
   should also be proven by committed fixtures.
-- **#6 must not merge** until the missing `capstone` dependency, the unnecessary
-  repo-wide JDK 17→21 bump, the native-artifact readiness/idempotence checks, the
-  warnings-as-blocking bug, the non-zero no-argument exit, the undocumented Windows
-  `bash` prerequisite, and the overstated readiness/output claims are addressed.
-- **#7 must not be treated as a stable ABI or shipped beyond a developer preview**
-  until the minor-version negotiation memory-overwrite and the `process_id`
-  mislabeling are fixed and the lifecycle/transport docs are narrowed to what is
-  enforced.
+- **#6 must not merge** until its final nit pass closes: the leftover `python -m`
+  examples in the README, `doctor` on ARM reporting an ARM-labelled leftover agent
+  as OK, and the README intro that still over-claims "real bytecode bodies." (The
+  original 7 must-fix items are already resolved.)
+- **#7's ABI v0.1 is experimental and must not be treated as a stable ABI or a
+  product feature.** The earlier defects (minor-version negotiation memory
+  overwrite, `process_id` mislabeling, overclaimed lifecycle/transport) are fixed;
+  it ships as a documentation + experimental skeleton, and a real out-of-process
+  wire schema plus the freeze (after two real plugins) remain future work.
 - **#9 must stay an opt-in preview**; it must not be promoted to the default
   `recover` path and must not claim entry/exit/locals/exception coverage unless the
   per-capability record reports it available.
