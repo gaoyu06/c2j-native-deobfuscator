@@ -90,10 +90,10 @@ class AttachPanel(
     private fun buildForm(): JComponent {
         val intro = JLabel(
             "<html><div style='width:460px'>" +
-                "The viewer runs the same <b>attach</b> CLI you would type — nothing more. " +
-                "It cannot attach without a PID and your confirmation. Attach is for a " +
-                "same-user JVM you own; coverage depends on what the JDK grants after attach, " +
-                "and the capability / gap rows in the trace say exactly what was obtained." +
+                "This runs the same <b>attach</b> command you would type — nothing more. " +
+                "It needs a PID and your confirmation first. Attach works on a same-user " +
+                "JVM you own; how much it can see depends on what the JDK grants, and the " +
+                "capability / gap rows in the trace show exactly what the attach obtained." +
                 "</div></html>"
         ).apply {
             font = Theme.sansSmall

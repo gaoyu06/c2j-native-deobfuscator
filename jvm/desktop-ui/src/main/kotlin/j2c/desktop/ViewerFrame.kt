@@ -25,6 +25,7 @@ import javax.swing.JTextField
 import javax.swing.ListSelectionModel
 import javax.swing.RowFilter
 import javax.swing.SwingConstants
+import javax.swing.SwingUtilities
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 import javax.swing.table.TableRowSorter
@@ -58,6 +59,7 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
 
     private val cards = CardLayout()
     private val centerCards = JPanel(cards)
+    private lateinit var sessionSplit: JSplitPane
 
     private val traceStateLabel = JLabel(" ")
     private val traceTailButton = JButton("Tail this trace")
@@ -163,6 +165,7 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         split.resizeWeight = 0.5
         split.border = null
         split.background = Theme.BG
+        sessionSplit = split
         return split
     }
 
@@ -216,6 +219,9 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         // pull the split over on first layout). The columns above sum to a
         // little under this, so nothing is clipped.
         p.preferredSize = Dimension(548, 640)
+        // Allow the pane to collapse to zero so a session-less live tail can
+        // hand the whole window to the trace (see startTail).
+        p.minimumSize = Dimension(0, 0)
         return p
     }
 
@@ -241,11 +247,25 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
             gridColor = Theme.LINE
             tableHeader.reorderingAllowed = false
             setDefaultRenderer(Any::class.java, TraceCellRenderer(traceModel))
+            // The detail column is the last one and soaks up all spare width so
+            // long capability / gap lines get the most room — critical when a
+            // live tail runs full width (no session) and a gap row explains why
+            // coverage is thin.
+            autoResizeMode = JTable.AUTO_RESIZE_LAST_COLUMN
         }
-        traceTable.columnModel.getColumn(0).preferredWidth = 44
-        traceTable.columnModel.getColumn(1).preferredWidth = 96
-        traceTable.columnModel.getColumn(2).preferredWidth = 56
+        // Hard-pin the three fixed columns so the flexible detail column keeps
+        // every spare pixel instead of the width bleeding into #/event/thread.
+        pinColumn(0, 34, 44, 60)
+        // Wide enough for the longest event label ("agent-attached").
+        pinColumn(1, 104, 128, 150)
+        pinColumn(2, 48, 58, 74)
         traceTable.columnModel.getColumn(3).preferredWidth = 360
+        // Wrap the detail so a long gap line stays fully readable rather than
+        // being clipped with an ellipsis.
+        traceTable.columnModel.getColumn(3).cellRenderer = TraceDetailRenderer(traceModel)
+        traceTable.addComponentListener(object : java.awt.event.ComponentAdapter() {
+            override fun componentResized(e: java.awt.event.ComponentEvent) = fitTraceRowHeights()
+        })
         Ui.leftAlignHeader(traceTable)
 
         tabs.font = Theme.sansSmall
@@ -255,6 +275,35 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         tabs.addTab("Trace", buildTracePanel())
         tabs.preferredSize = Dimension(556, 640)
         return tabs
+    }
+
+    private fun pinColumn(index: Int, min: Int, pref: Int, max: Int) {
+        traceTable.columnModel.getColumn(index).apply {
+            minWidth = min
+            preferredWidth = pref
+            maxWidth = max
+        }
+    }
+
+    /**
+     * Grow each trace row to fit its wrapped detail cell at the current column
+     * width. Called after the rows change and whenever the table is resized
+     * (the divider collapse for a session-less live tail resizes it), so a
+     * multi-line gap explanation is shown in full instead of being clipped.
+     */
+    private fun fitTraceRowHeights() {
+        val detailCol = 3
+        if (traceTable.columnCount <= detailCol) return
+        val width = traceTable.columnModel.getColumn(detailCol).width
+        if (width <= 1) return
+        val base = traceTable.rowHeight.coerceAtLeast(22)
+        for (r in 0 until traceTable.rowCount) {
+            val renderer = traceTable.getCellRenderer(r, detailCol)
+            val comp = traceTable.prepareRenderer(renderer, r, detailCol)
+            comp.setSize(width, Short.MAX_VALUE.toInt())
+            val h = comp.preferredSize.height.coerceAtLeast(base)
+            if (traceTable.getRowHeight(r) != h) traceTable.setRowHeight(r, h)
+        }
     }
 
     private fun buildTracePanel(): JComponent {
@@ -398,6 +447,7 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
 
         methodModel.setRows(session.methods)
         traceModel.setRows(session.traceEvents)
+        SwingUtilities.invokeLater { fitTraceRowHeights() }
         updateTraceState()
         renderArtifacts(session)
 
@@ -420,6 +470,10 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         }
         jsonArea.text = ""
         cards.show(centerCards, "session")
+        // A real session gets the balanced split back (a prior session-less
+        // live tail may have collapsed the methods pane to zero).
+        sessionSplit.resizeWeight = 0.5
+        SwingUtilities.invokeLater { sessionSplit.setDividerLocation(0.5) }
 
         if (session.methods.isNotEmpty()) {
             methodTable.rowSorter = methodSorter
@@ -456,11 +510,20 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         stopTail()
         traceModel.clear()
         cards.show(centerCards, "session")
+        // With no session open there are no methods to list, so give the whole
+        // window to the trace. This keeps long capability / gap detail readable
+        // instead of squeezing it beside an empty methods table.
+        if (current == null) {
+            methodModel.setRows(emptyList())
+            sessionSplit.resizeWeight = 0.0
+            SwingUtilities.invokeLater { sessionSplit.setDividerLocation(0) }
+        }
         selectTab("Trace")
         val tailer = TraceTailer(
             path = path,
             onEvents = { events ->
                 traceModel.addRows(events)
+                fitTraceRowHeights()
                 val last = traceTable.rowCount - 1
                 if (last >= 0) traceTable.scrollRectToVisible(traceTable.getCellRect(last, 0, true))
             },
