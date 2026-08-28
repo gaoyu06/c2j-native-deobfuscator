@@ -1,0 +1,48 @@
+# Recommended PR sequence
+
+This table turns the independent design review into reviewable increments.
+“Ship as-is?” means the PR can be merged and released for its stated scope
+without waiting for a later PR. It never means “skip review.”
+
+| PR | Scope | Ship as-is? | Review required? | Review preconditions | Docs shipped in the PR |
+|---:|---|---|---|---|---|
+| **0. Independent design review** | Add the skeptical architecture review, recovery-path scorecard, generic-first direction, desktop choice, observer boundaries, decisions, and this sequence. No product implementation. | **Yes, docs-only.** It changes no runtime behavior. | **Yes — maintainer/design review.** | Recheck every `file:line` link against the base commit; scan terminology; confirm the proposed contracts are recommendations rather than implemented claims. | `docs/design-theory-review.md`, `docs/pr-sequence.md` |
+| **1. Evidence/status contract and generated JNI catalogue** | Add versioned schemas for inventory, normalized events, gaps, unsupported operations, coverage, provenance, verification, and output kind. Create one machine-readable JNI/invocation-interface catalogue and generate slot/signature tables used by hooks and emulation. No behavior claim beyond schema validation. | **Yes, additive**, if old artifacts remain readable. | **Yes — schema, JNI, and compatibility review.** | Human approval of “restored,” “hybrid,” and “inspection-only”; golden schema fixtures; generated output reproducibility; cross-check catalogue against the chosen JNI specification versions. | `docs/artifact-contract.md`, `docs/jni-catalogue.md`, schema migration guide, generated-file policy |
+| **2. Generic method inventory** | Inventory native declarations from class files; exports/symbols from PE/ELF; `Java_*` names; emulated and live `RegisterNatives` records. Merge only on stable identity/evidence, not equal counts. Keep producer detectors as optional hints. | **Yes as a new command**, not yet as the default rebuild input. | **Yes — binary-format and false-binding review.** | PE/ELF fixtures with exports, static tables, stack-built tables, duplicate function addresses, overloads, malformed records, and unsupported architecture; zero silent class bindings. | `docs/method-inventory.md`, capability matrix, fixture provenance, unsupported-case guide |
+| **3. Modular emulation evidence backend** | Split the monolithic emulator into CPU/ABI, object-format, import, JNI-model, state, stop-reason, and result-decoder components. Consume PR 1's generated catalogue. Emit normalized events and explicit unsupported/gap records; preserve `recover`, `strings`, and `call` as CLI operations. | **No as a default restoration path; yes as an opt-in diagnostic backend.** | **Yes — emulator correctness and containment review.** | Differential fixtures for both x86-64 ABIs; deterministic stop reasons; unknown slot/import tests; no generic-success return on unsupported operations; bounded execution and memory. | `docs/emulation-model.md`, supported ABI/import/JNI matrix, state-supply guide, limitations |
+| **4. JVMTI startup/live attach and local transport** | Export `Agent_OnAttach`; share phase-aware initialization with `Agent_OnLoad`; add same-user Attach API CLI; install hooks lazily on existing threads; emit capability/gap/drop events over a bounded local transport; retain startup mode. | **No initially; opt-in preview only.** | **Yes — JVM, concurrency, privacy, and security review.** | Same-user ownership tests; explicit PID confirmation; supported-JDK startup/live-phase matrix; unavailable-capability tests; thread/table restoration tests; attach-disabled and dynamic-load-disabled errors; event backpressure tests. | `docs/jvm-attach.md`, consent/privacy model, capability matrix, troubleshooting and clean-stop guide |
+| **5. Evidence fusion and safe JAR outputs** | Preserve multiple path signatures, correlate dynamic/emulated/static evidence, build CFG-aware proposals, and gate outputs. Always emit evidence/report; default to a hybrid runnable JAR for partial recovery; reserve fully restored status for complete verified methods; name non-loadable output inspection-only. | **Yes after all gates pass;** this is the first candidate for a new default workflow. | **Yes — bytecode, behavior, and compatibility review.** | Approved completion contract from PR 1; verifier tests; mixed restored/unresolved classes; loader/blob retention tests; representative behavior tests; contradiction and partial-coverage tests; migration plan for old “clean JAR” wording. | `docs/evidence-fusion.md`, `docs/output-kinds.md`, validation checklist, migration/release notes |
+| **6. Swing + FlatLaf desktop viewer** | Add an optional Java desktop client that runs the CLI, renders pipeline status, method inventory, confidence/coverage, and live JVMTI/native events. It contains no recovery logic and no browser server. | **Yes, optional**, after CLI/event contracts are stable. | **Yes — UX, accessibility, packaging, and process-control review.** | Frozen event/schema minor version; recorded replay fixture; large-table/event-load test; event-dispatch-thread audit; keyboard/accessibility pass; Windows/Linux packaging smoke tests; no hidden CLI-only settings. | `docs/desktop-gui.md`, operator quick start, screenshots, accessibility/keyboard guide, packaging notes |
+| **7. Optional Ghidra adapter isolation** | Move pseudo-C rewriting, Ghidra identifiers, cache-layout rules, and producer message hints behind a versioned plugin adapter. Replace regex JSON parsing, retain duplicate bindings, report decompile/normalization failures, and emit normalized CFG/dataflow evidence. Mark old broad scripts experimental until covered. | **Yes as an optional plugin; no as a required path.** | **Yes — Ghidra-version, normalization, and false-inference review.** | At least two Ghidra versions/configurations; typed and untyped output fixtures; duplicate-address and decompile-failure cases; unsupported-node counts; comparison against dynamic/emulation evidence; no dependency from core to Ghidra classes or pseudo-C. | `docs/plugins/ghidra.md`, compatibility matrix, normalized-IR contract, migration guide for existing scripts |
+| **8. Neutral native-x86 core and plugin ABI** | Add a user-mode module for owned-process/module enumeration, PE/ELF symbol/export inspection, address resolution, scoped function entry/return instrumentation, bounded events, and reversible cleanup. Publish a versioned C ABI with no Java/JNI types. | **No initially; developer preview.** | **Yes — ABI, native safety, concurrency, and platform security review.** | Human approval of platform/attach policy; two independent sample plugins; ABI layout tests across compilers; API scan rejecting Java/JNI names/types; process-exit/unload/backpressure tests; explicit unsupported-platform behavior. | `docs/native-x86.md`, public ABI reference, plugin author guide, support matrix, event/privacy model |
+| **9. Well-known-library plugins and JVM bridge** | Add opt-in user-mode plugins for SSL/TLS, RSA, AES, Windows CNG, and OpenSSL function families. Metadata-only by default. Add a separate JVM bridge that converts neutral native events into restoration evidence without changing the native-x86 ABI. | **No until privacy and compatibility gates pass;** then optional. | **Yes — library-version, cryptography, privacy, and JVM-integration review.** | Approved sensitive-buffer policy; metadata-only default tests; explicit local content opt-in; redaction/retention tests; supported library/version fixtures; event correlation tests; bridge dependency points toward native-x86 only. | `docs/plugins/crypto-libraries.md`, `docs/jvm-bridge.md`, sensitive-data handling guide, compatibility matrix |
+| **10. Optional privileged-observer RFC, then prototype** | First PR is an RFC and measured gap report. A later prototype may adapt privileged observations to the same neutral event contract. The user enables OS debug/test-signing; the project supplies no signed driver; default workflows remain user mode. | **RFC: yes. Prototype: no, experimental only.** | **Yes — mandatory maintainer, OS-security, operations, and support review.** | Metrics proving a common user-mode visibility gap; approved threat/support model; OS build and security-feature matrix; installation/rollback and crash-safety plan; isolated test hosts; explicit non-foundation rule. | `docs/rfcs/privileged-observer.md`, enable/disable and rollback guide, support matrix, risk register; no claim of a provided signed driver |
+
+## Dependency order
+
+```text
+0 → 1 → 2 → 3
+        ├────→ 4
+        └────────→ 5 → 6
+             2 ───────→ 7
+             1 ───────→ 8 → 9
+                              └→ 10 (only after measured need)
+```
+
+PR 5 can consume PRs 3 and 4 incrementally, but it must not declare full
+restoration from only one evidence source. PR 6 waits for stable contracts. PR 7
+is deliberately off the critical path. PRs 8–10 are also optional to the JAR
+pipeline: method inventory, emulation, JVMTI, and bytecode restoration must work
+without native library instrumentation or privileged observation.
+
+## Release gates shared by all implementation PRs
+
+1. Supported and unsupported cases are both fixtures.
+2. Every inferred datum carries source and confidence.
+3. Unknown operations are observable failures, never silent success.
+4. A verifier-clean body containing synthetic defaults is still partial.
+5. The default path neither removes required native resources nor changes
+   target behavior when recovery is incomplete.
+6. New process observation is same-user, explicit, local, bounded, and
+   reversible.
+7. No GUI or plugin bypasses the CLI/schema contract.
