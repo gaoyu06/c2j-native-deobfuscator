@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "owner": "com/example/Crypto",
+  "name": "decrypt",
+  "desc": "(Ljava/lang/String;)Ljava/lang/String;",
+  "source": "dynamic",
+  "confidence": "medium",
+  "instructions": [
+    { "op": "ALOAD", "var": 1 },
+    { "op": "INVOKEVIRTUAL", "owner": "java/lang/String", "name": "length", "desc": "()I" },
+    { "op": "ISTORE", "var": 2 },
+    { "op": "LDC", "value": "key-7f3a", "dynamic": "str_computed" },
+    { "op": "ASTORE", "var": 3 },
+    { "op": "ALOAD", "var": 3 },
+    { "op": "ALOAD", "var": 1 },
+    { "op": "INVOKESTATIC", "owner": "com/example/Crypto", "name": "xor", "desc": "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;" },
+    { "op": "ARETURN" }
+  ],
+  "tryCatchBlocks": [],
+  "exceptionsObserved": []
+}

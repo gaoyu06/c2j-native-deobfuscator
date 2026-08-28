@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "input": {
+    "libPath": "native/app.dll",
+    "format": "PE",
+    "arch": "amd64",
+    "sha256": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0"
+  },
+  "stringPool": {
+    "base": "0x180040000",
+    "totalBytes": 48,
+    "strings": ["key-7f3a", "booting", "invalid length"]
+  },
+  "nativeRegistry": [
+    {
+      "classId": 1,
+      "className": "com/example/Crypto",
+      "registerFunction": { "addr": "0x180001100", "symbol": null },
+      "methods": [
+        { "name": "decrypt", "desc": "(Ljava/lang/String;)Ljava/lang/String;", "fnAddr": "0x180001240", "fnSymbol": "Java_com_example_Crypto_decrypt" },
+        { "name": "rounds", "desc": "()I", "fnAddr": "0x1800012f0", "fnSymbol": "Java_com_example_Crypto_rounds" }
+      ]
+    },
+    {
+      "classId": 2,
+      "className": "com/example/Main",
+      "registerFunction": { "addr": "0x180001360", "symbol": null },
+      "methods": [
+        { "name": "boot", "desc": "()V", "fnAddr": "0x180001380", "fnSymbol": "Java_com_example_Main_boot" }
+      ]
+    }
+  ],
+  "hiddenClasses": []
+}

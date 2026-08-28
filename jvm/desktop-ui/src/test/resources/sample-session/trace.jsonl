@@ -1,0 +1,9 @@
+{"ev":"enter","ts":1000,"thr":1,"fn":"Java_com_example_Main_boot","owner":"com/example/Main","name":"boot","desc":"()V"}
+{"ev":"jni","ts":1001,"thr":1,"call":"GetStaticFieldID","args":["0x7f01","out","Ljava/io/PrintStream;"],"ret":"0x7f02"}
+{"ev":"jni","ts":1002,"thr":1,"call":"NewStringUTF","args":["booting"],"ret":"0x7f03"}
+{"ev":"jni","ts":1003,"thr":1,"call":"CallVoidMethod","args":["0x7f04","0x7f05","0x7f03"],"midDesc":"(Ljava/lang/String;)V"}
+{"ev":"exit","ts":1004,"thr":1,"fn":"Java_com_example_Main_boot"}
+{"ev":"enter","ts":1100,"thr":1,"fn":"Java_com_example_Crypto_decrypt","owner":"com/example/Crypto","name":"decrypt","desc":"(Ljava/lang/String;)Ljava/lang/String;"}
+{"ev":"jni","ts":1101,"thr":1,"call":"GetStringUTFLength","args":["0x7f10"],"ret":8}
+{"ev":"jni","ts":1102,"thr":1,"call":"NewStringUTF","args":["key-7f3a"],"ret":"0x7f11"}
+{"ev":"exit","ts":1103,"thr":1,"fn":"Java_com_example_Crypto_decrypt"}
