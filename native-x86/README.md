@@ -15,7 +15,7 @@ What is here today:
 | `plugins/jni-natives/` | Observes JNI-convention `Java_*` / `JNI_OnLoad` exports by name/address (no `jni.h`). |
 | `plugins/crypto-cng/` | Observes Windows CNG `BCrypt*` exports; source-complete, needs a Windows host backend. |
 | `tests/abi_checks.c` | Prefix-negotiation, lifecycle-window, phase and watch-request checks. |
-| `tests/fixtures/` | A name-only fixture library + target process, so the observation path is testable with no OpenSSL / JVM / traffic. |
+| `tests/fixtures/` | A name-only fixture library + a single-threaded and a multithreaded target process, so the observation path (and the single-thread live policy) is testable with no OpenSSL / JVM / traffic. |
 | `CMakeLists.txt` | Build for the host, plugins, fixtures, and the checks. |
 | `smoke-test.sh` | Linux compile + run + observe check (skips when no C compiler). |
 | `bridge-notes.md` | Sketch of a future JVM-side adapter. No code, by design. |
@@ -34,11 +34,16 @@ bash native-x86/smoke-test.sh            # cmake if available
 bash native-x86/smoke-test.sh --no-cmake # direct cc invocation
 ```
 
-The smoke test exercises three paths: the synthetic script against the
-sample plugin, the ABI checks, and a live observation of a tiny fixture
-process (attaching with ptrace to confirm metadata-only module / symbol /
-call-site records). If ptrace attach is blocked in the environment, it
-falls back to the read-only module/symbol pass and says so.
+The smoke test exercises the synthetic script against the sample plugin,
+the ABI checks, and a live observation of a tiny fixture process (attaching
+with ptrace to confirm metadata-only module / symbol / call-site records).
+If ptrace attach is blocked in the environment, it falls back to the
+read-only module/symbol pass and says so. Further sections drive the strict
+CLI parsing and the deterministic failure seams — attach refusal, detach
+failure, live single-step failure, resume (`PTRACE_CONT`) failure, and
+breakpoint-arming failure must each fail the run rather than report a false
+success — and confirm that a multithreaded target is refused the live pass
+and falls back to the read-only pass (single-thread-only preview policy).
 
 The `abi checks` step ([`tests/abi_checks.c`](tests/abi_checks.c))
 exercises the contracts a plain run does not: minor-version prefix

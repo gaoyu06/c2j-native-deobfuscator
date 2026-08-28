@@ -147,9 +147,21 @@ The engine reads instruction words (to place and restore breakpoints) and
 the stack return address (a code address). It never reads the argument
 registers (`rdi`, `rsi`, …) or any buffer, and it never modifies program
 logic or control flow: a breakpoint is inserted, observed, and removed.
-If a technique is unavailable — attach refused, wrong architecture — the
-host says so honestly and falls back to the read-only pass rather than
-pretending the target was empty.
+If a technique is unavailable — attach refused, wrong architecture, or a
+multithreaded target (see below) — the host says so honestly and falls
+back to the read-only pass rather than pretending the target was empty.
+
+**Single-thread only for the live pass (preview).** A process-wide `INT3`
+is only safe to place and step when no other thread can run the patched
+entry while the engine restores the original byte and single-steps over
+it. This preview does **not** implement a thread-group tracer (no
+`PTRACE_O_TRACECLONE`, no attaching every thread). Instead, before it
+attaches or places any breakpoint the host counts the threads in
+`/proc/PID/task`; if the target has more than one thread it refuses the
+live pass outright — no attach, no breakpoints — and runs the read-only
+module/symbol pass with an honest note that live observation is
+single-thread only. A single-threaded target still gets the full live
+entry/return pass.
 
 ### What this is not
 
@@ -189,11 +201,18 @@ exists, the CNG plugin loads and stays idle on non-Windows hosts, and
   enumerate the modules loaded when the host attaches. A module the
   target `dlopen`s *after* attach is not (yet) picked up; re-run against
   a target that has already loaded the library of interest.
+- **Single-threaded targets only for the live pass.** The live pass places
+  process-wide software breakpoints and steps them, which is only safe in a
+  single-threaded target. A target with more than one thread (counted from
+  `/proc/PID/task` before any attach) is refused the live pass and gets the
+  read-only module/symbol pass instead, with an honest note. Tracing every
+  thread of a multithreaded process is out of scope for this preview.
 - **Return observation is best-effort.** A one-shot breakpoint at the
   captured return address reports the matching return for the common
   case of sequential, non-recursive calls (the fixture's shape). Deep
-  recursion or heavy multithreading through the same watched export can
-  miss or mis-pair a return in this preview; entries are always reported.
+  recursion can miss or mis-pair a return in this preview; entries are
+  always reported. (Multithreaded targets do not reach the live pass at
+  all — see above.)
 - **x86-64 only for the live pass.** Other architectures get the
   read-only module/symbol pass.
 - **ptrace must be permitted.** In some sandboxes attach is blocked
@@ -214,3 +233,15 @@ that calls them in a loop. The smoke test attaches to that fixture and
 asserts the expected module/symbol/call-site records appear — so CI never
 needs OpenSSL, a JVM, or any real traffic. If ptrace is blocked in the
 environment, the smoke test checks the read-only pass instead and says so.
+
+A second, multithreaded fixture
+([`tests/fixtures/fixture_target_mt.c`](../../native-x86/tests/fixtures/fixture_target_mt.c))
+spawns an idle worker thread before publishing its pid, so the smoke test
+can confirm the single-thread-only policy: the host counts the target's
+threads, refuses the live pass, and runs the read-only pass with the
+honest multithread note. That check needs no ptrace — the refusal happens
+before any attach — so it holds even where live attach is unavailable. The
+smoke test also drives the deterministic cleanup-failure seams
+(`NX86_TEST_INJECT`) for a resume (`PTRACE_CONT`) failure and a
+breakpoint-arming (`bp_insert`) failure, asserting each fails the run with
+"shutdown with errors" rather than a false "shutdown ok".

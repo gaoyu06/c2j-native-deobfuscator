@@ -144,6 +144,15 @@ Properties the host enforces:
   by the current user. A process owned by another user is rejected before
   any attach is attempted. Attachment is ordinary ptrace: not stealthy,
   and observable by the target.
+- **Single-thread only for the live pass (preview).** The live pass places
+  process-wide software breakpoints (`INT3`) and steps over them, which is
+  only safe when the target has a single thread. Before it attaches or
+  places any breakpoint, the host counts the threads in `/proc/PID/task`;
+  a target with more than one thread is refused the live pass — no attach,
+  no breakpoints — and falls back to the read-only module/symbol pass with
+  an honest note. This preview deliberately does not implement a
+  thread-group tracer (no `PTRACE_O_TRACECLONE`, no attaching every
+  thread); a single-threaded target still gets the full live pass.
 - **One process, no privilege escalation.** The host is an ordinary
   executable running with the invoking user's privileges. There is no
   service, no installer, no driver, no kernel component.
@@ -209,10 +218,15 @@ These record-model choices keep this honest:
 - `call-site` carries addresses and a resolved callee name, not a
   parameter list.
 - The one free-text field, a diagnostic note's `text`, is bounded and
-  policed rather than structurally safe: it is documented as host/status
-  text, must not carry keys, buffers or payloads, and the host rejects a
-  note whose text exceeds a fixed 512-byte cap (`NX86_NOTE_TEXT_MAX`) so
-  it cannot be used as a side channel.
+  policed rather than structurally safe. The fixed 512-byte cap
+  (`NX86_NOTE_TEXT_MAX`) only bounds the field's *length*; it does not make
+  it safe by construction. What keeps `text` from becoming a data channel
+  is policy, not the cap: it is documented as host/status text only,
+  plugins and the host must not place keys, buffers or payloads in it, and
+  the host never parses `note.text` as data and rejects any note whose text
+  exceeds the cap. A determined plugin can still put up to 512 bytes of
+  arbitrary text there — the cap limits *how much*, not *what* — so this is
+  a policed bound, not an impossibility.
 
 ---
 
