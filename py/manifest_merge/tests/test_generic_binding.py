@@ -116,3 +116,54 @@ def test_ambiguous_named_table_is_not_rebound_by_position() -> None:
         for cls in manifest["classes"]
         for method in cls["methods"]
     )
+
+
+def test_ambiguous_unnamed_count_only_table_is_left_unbound_with_gap() -> None:
+    classes = {
+        "input": {"jarPath": "input.jar"},
+        "classes": [
+            {
+                "name": owner,
+                "methods": [
+                    {
+                        "name": method_name,
+                        "desc": "()V",
+                        "access": 0x0100,
+                        "isObfuscatedNative": True,
+                    }
+                ],
+            }
+            for owner, method_name in (
+                ("sample/First", "first"),
+                ("sample/Second", "second"),
+            )
+        ],
+    }
+    site = {
+        "source": "register-natives-stack",
+        "registerNativesCallSite": "0x5000",
+        "fnAddrs": ["0x401000"],
+    }
+
+    manifest = merge(classes, {"nativeRegistry": [site]})
+
+    assert "boundTo" not in site
+    assert all(
+        "fnAddr" not in method
+        for cls in manifest["classes"]
+        for method in cls["methods"]
+    )
+    assert manifest["bindingGaps"] == [
+        {
+            "kind": "ambiguous-count-only-table",
+            "nMethods": 1,
+            "candidateClasses": ["sample/First", "sample/Second"],
+            "message": (
+                "Native table at 0x5000 has 1 method address and matches "
+                "multiple classes by count (sample/First, sample/Second); "
+                "left unbound"
+            ),
+            "source": "register-natives-stack",
+            "registerNativesCallSite": "0x5000",
+        }
+    ]

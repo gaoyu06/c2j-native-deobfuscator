@@ -23,6 +23,27 @@
         "methodDiscovery": { "type": "string" }
       }
     },
+    "bindingGaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "nMethods", "candidateClasses", "message"],
+        "properties": {
+          "kind": { "const": "ambiguous-count-only-table" },
+          "nMethods": { "type": "integer", "minimum": 1 },
+          "candidateClasses": {
+            "type": "array",
+            "minItems": 2,
+            "items": { "type": "string" }
+          },
+          "message": { "type": "string" },
+          "source": { "type": "string" },
+          "registerNativesCallSite": { "type": "string" },
+          "callSite": { "type": "string" },
+          "tableAddress": { "type": "string" }
+        }
+      }
+    },
     "classes": {
       "type": "array",
       "items": {

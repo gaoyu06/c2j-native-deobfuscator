@@ -322,3 +322,12 @@ common case — see below.
 
 None. Both must-fixes were already satisfied by `f686fd9`, `488a19d`, and
 `2638079`; no additional code changes were required on this branch.
+
+## Follow-up — count-only ambiguity closed
+
+The unnamed count-only residual described above is now closed. Positional
+binding proceeds only when exactly one unbound class has the recovered native
+method count. Multiple candidates remain unbound and produce a structured
+`bindingGaps` entry plus a CLI warning. The regression test uses two classes
+with the same native-method count and verifies that neither receives the
+table's address.
