@@ -419,8 +419,7 @@ def check_native_agent(root: Path) -> Check:
                 name="Native JVMTI agent",
                 status=STATUS_MISSING,
                 detail=f"{target} is built for {built} but this host is {host}; "
-                       "native/build.sh targets x86-64 and its output cannot be "
-                       "loaded here",
+                       "an agent for another CPU cannot be loaded here",
                 fix="rebuild for this architecture: " + fix,
             )
         return Check(

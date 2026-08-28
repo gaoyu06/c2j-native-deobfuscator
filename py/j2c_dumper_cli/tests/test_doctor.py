@@ -287,6 +287,18 @@ def test_build_report_not_ready_on_arm_with_arm_agent(tmp_path, arm_host,
     assert "Native JVMTI agent" in {c.name for c in report.blocking}
 
 
+def test_check_native_agent_rejects_foreign_arch_on_supported_host(tmp_path,
+                                                                   x86_host):
+    # Host-matching name, wrong machine code: the JVM here cannot load it.
+    libdir = tmp_path / "native" / "build" / "lib"
+    libdir.mkdir(parents=True)
+    _write_elf(libdir / "j2c_agent.so", _ELF_AARCH64)
+    c = doctor.check_native_agent(tmp_path)
+    assert c.status == doctor.STATUS_MISSING
+    assert "arm64" in c.detail   # names what it was built for
+    assert "x86_64" in c.detail  # names this host
+
+
 def test_check_native_agent_ok_when_arch_matches(tmp_path, x86_host):
     libdir = tmp_path / "native" / "build" / "lib"
     libdir.mkdir(parents=True)
