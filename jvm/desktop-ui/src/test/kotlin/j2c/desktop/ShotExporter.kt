@@ -4,6 +4,8 @@ import java.awt.image.BufferedImage
 import java.nio.file.Files
 import java.nio.file.Path
 import javax.imageio.ImageIO
+import javax.swing.JComponent
+import javax.swing.JFrame
 import javax.swing.SwingUtilities
 
 /**
@@ -51,6 +53,31 @@ fun main(args: Array<String>) {
         println("wrote $name.png")
     }
 
+    fun componentShot(name: String, w: Int, h: Int, build: () -> JComponent) {
+        var frame: JFrame? = null
+        SwingUtilities.invokeAndWait {
+            val f = JFrame(name)
+            f.contentPane = build()
+            f.setSize(w, h)
+            f.isVisible = true
+            frame = f
+        }
+        Thread.sleep(500)
+        SwingUtilities.invokeAndWait {
+            val f = frame!!
+            val content = f.contentPane
+            val cw = content.width.coerceAtLeast(1)
+            val ch = content.height.coerceAtLeast(1)
+            val img = BufferedImage(cw, ch, BufferedImage.TYPE_INT_RGB)
+            val g = img.createGraphics()
+            content.printAll(g)
+            g.dispose()
+            ImageIO.write(img, "png", outDir.resolve("$name.png").toFile())
+            f.dispose()
+        }
+        println("wrote $name.png")
+    }
+
     val sample = sampleSessionDir()
 
     shot("01-empty") { /* opens with no session */ }
@@ -85,6 +112,39 @@ fun main(args: Array<String>) {
         f.selectTab("Trace")
     }
 
+    // The honest attach form: a PID and the ownership box are set so the shown
+    // command carries --i-own-this-process and the Run button is live.
+    componentShot("07-attach-form", 560, 560) {
+        AttachPanel(
+            defaultOutput = "trace.jsonl",
+            onStartTail = {},
+            onClose = {},
+        ).apply {
+            applyRequest(
+                AttachRequest(
+                    pid = "48213",
+                    output = "trace.jsonl",
+                    iOwnThisProcess = true,
+                    logAll = false,
+                    mechanism = "auto",
+                    agentPath = "",
+                )
+            )
+        }
+    }
+
+    // A live tail: reduced-live-capabilities (bind only) with honest capability
+    // and gap rows, then the bind events themselves.
+    shot("08-live-tail") { f ->
+        f.startTail(resourceDir("sample-live").resolve("trace.jsonl"))
+    }
+
+    // The empty/gap case: no core capabilities, nothing usable captured — shown
+    // plainly rather than hidden.
+    shot("09-capability-gap") { f ->
+        f.startTail(resourceDir("sample-live-nocaps").resolve("trace.jsonl"))
+    }
+
     println("done -> ${outDir.toAbsolutePath()}")
     // Swing keeps AWT threads alive; exit explicitly.
     System.exit(0)
@@ -107,10 +167,13 @@ private fun freshDir(name: String): Path {
  * Locate the bundled sample session. When run from test runtime the
  * resource is on the classpath; fall back to the source tree.
  */
-private fun sampleSessionDir(): Path {
-    val url = object {}.javaClass.getResource("/sample-session")
+private fun sampleSessionDir(): Path = resourceDir("sample-session")
+
+/** Locate a bundled test resource directory (classpath first, then source). */
+private fun resourceDir(name: String): Path {
+    val url = object {}.javaClass.getResource("/$name")
     if (url != null) return Path.of(url.toURI())
-    val fromSource = Path.of("src/test/resources/sample-session")
+    val fromSource = Path.of("src/test/resources/$name")
     if (Files.isDirectory(fromSource)) return fromSource
-    error("sample-session not found")
+    error("$name not found")
 }

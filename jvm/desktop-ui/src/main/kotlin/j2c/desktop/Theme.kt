@@ -96,4 +96,14 @@ object Theme {
         RecoveryStatus.STUB -> WARN
         RecoveryStatus.MISSING -> BAD
     }
+
+    fun inkFor(kind: TraceKind): Color = when (kind) {
+        TraceKind.NORMAL -> TEXT
+        TraceKind.BIND -> ACCENT
+        TraceKind.CAPABILITY_OK -> OK
+        TraceKind.CAPABILITY_UNAVAILABLE -> BAD
+        TraceKind.GAP -> WARN
+        TraceKind.LIFECYCLE -> DIM
+        TraceKind.MALFORMED -> BAD
+    }
 }

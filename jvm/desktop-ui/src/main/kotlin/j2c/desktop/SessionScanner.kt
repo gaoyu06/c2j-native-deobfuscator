@@ -209,23 +209,8 @@ object SessionScanner {
             Files.newBufferedReader(path).use { r ->
                 var i = 0
                 r.lineSequence().forEach { line ->
-                    val l = line.trim()
-                    if (l.isEmpty()) return@forEach
-                    val node = try {
-                        JsonIO.mapper.readTree(l)
-                    } catch (e: Exception) {
-                        null
-                    }
-                    if (node == null) {
-                        out += TraceEvent(i, "?", "?", "malformed line")
-                    } else {
-                        out += TraceEvent(
-                            index = i,
-                            ev = node["ev"]?.asText() ?: "?",
-                            thread = node["thr"]?.asText() ?: "",
-                            summary = summarizeEvent(node),
-                        )
-                    }
+                    val event = TraceParser.parse(i, line) ?: return@forEach
+                    out += event
                     i++
                 }
             }
@@ -233,13 +218,6 @@ object SessionScanner {
             notes += "could not read ${path.name}: ${e.message}"
         }
         return out
-    }
-
-    private fun summarizeEvent(node: JsonNode): String = when (node["ev"]?.asText()) {
-        "enter", "exit" -> node["fn"]?.asText() ?: ""
-        "jni" -> node["call"]?.asText() ?: ""
-        "slot" -> "${node["kind"]?.asText()} slot ${node["slot"]?.asText()}"
-        else -> ""
     }
 
     // ---------------------------------------------------------------

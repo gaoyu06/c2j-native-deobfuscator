@@ -57,12 +57,41 @@ data class ArtifactState(
     val detail: String,
 )
 
+/**
+ * How a trace line should be read at a glance. The live-attach path writes
+ * lifecycle, capability and gap records alongside ordinary trace events; the
+ * viewer keeps them honest instead of flattening them into "just events".
+ */
+enum class TraceKind {
+    /** enter / exit / jni / slot — ordinary instrumentation output. */
+    NORMAL,
+
+    /** A native-method-bind record (fn pointer -> Java method). */
+    BIND,
+
+    /** A JVMTI capability that was granted in this phase. */
+    CAPABILITY_OK,
+
+    /** A JVMTI capability the phase could not grant — coverage is reduced. */
+    CAPABILITY_UNAVAILABLE,
+
+    /** A gap record: the agent stating, plainly, what it could not observe. */
+    GAP,
+
+    /** agent-attached / agent-loaded lifecycle marker. */
+    LIFECYCLE,
+
+    /** A line that could not be parsed as JSON. */
+    MALFORMED,
+}
+
 /** A single trace.jsonl line, kept light for the event list. */
 data class TraceEvent(
     val index: Int,
     val ev: String,
     val thread: String,
     val summary: String,
+    val kind: TraceKind = TraceKind.NORMAL,
 )
 
 /** Everything the viewer knows about one opened session directory. */
@@ -85,4 +114,21 @@ data class Session(
 data class NextCommand(
     val reason: String,
     val command: String,
+)
+
+/**
+ * The inputs a user fills in on the attach form. These map one-to-one to the
+ * flags of the `attach` CLI subcommand; the GUI never invents its own attach
+ * mechanism, it only assembles (and optionally runs) that command.
+ */
+data class AttachRequest(
+    val pid: String,
+    val output: String,
+    /** Mirrors the required `--i-own-this-process` confirmation flag. */
+    val iOwnThisProcess: Boolean,
+    val logAll: Boolean = false,
+    /** auto | jcmd | vm — mirrors `--mechanism`. */
+    val mechanism: String = "auto",
+    /** Optional `--agent` override; blank means the CLI's default. */
+    val agentPath: String = "",
 )

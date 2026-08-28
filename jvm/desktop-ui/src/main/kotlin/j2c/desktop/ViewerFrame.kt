@@ -4,11 +4,14 @@ import java.awt.BorderLayout
 import java.awt.CardLayout
 import java.awt.Dimension
 import java.nio.file.Path
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JButton
 import javax.swing.JComponent
+import javax.swing.JDialog
 import javax.swing.JFileChooser
 import javax.swing.JFrame
 import javax.swing.JLabel
@@ -56,7 +59,14 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
     private val cards = CardLayout()
     private val centerCards = JPanel(cards)
 
+    private val traceStateLabel = JLabel(" ")
+    private val traceTailButton = JButton("Tail this trace")
+    private val traceStopButton = JButton("Stop")
+    private var traceTailer: TraceTailer? = null
+
     private var current: Session? = null
+
+    private val clock = DateTimeFormatter.ofPattern("HH:mm:ss")
 
     init {
         defaultCloseOperation = EXIT_ON_CLOSE
@@ -69,6 +79,7 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         add(buildStatusBar(), BorderLayout.SOUTH)
 
         showEmpty()
+        updateTraceState()
         pack()
         setLocationRelativeTo(null)
     }
@@ -99,11 +110,17 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
 
         val open = JButton("Open session…").apply { addActionListener { chooseDirectory() } }
         val reload = JButton("Reload").apply { addActionListener { reload() } }
+        val attach = JButton("Attach / Listen…").apply {
+            toolTipText = "Show the attach CLI, or tail a live trace"
+            addActionListener { openAttachDialog() }
+        }
 
         val right = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.X_AXIS)
             background = Theme.PANEL
             border = BorderFactory.createEmptyBorder(6, 8, 6, 8)
+            add(attach)
+            add(Box.createHorizontalStrut(6))
             add(open)
             add(Box.createHorizontalStrut(6))
             add(reload)
@@ -223,10 +240,11 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
             background = Theme.BG
             gridColor = Theme.LINE
             tableHeader.reorderingAllowed = false
+            setDefaultRenderer(Any::class.java, TraceCellRenderer(traceModel))
         }
-        traceTable.columnModel.getColumn(0).preferredWidth = 50
-        traceTable.columnModel.getColumn(1).preferredWidth = 70
-        traceTable.columnModel.getColumn(2).preferredWidth = 90
+        traceTable.columnModel.getColumn(0).preferredWidth = 44
+        traceTable.columnModel.getColumn(1).preferredWidth = 96
+        traceTable.columnModel.getColumn(2).preferredWidth = 56
         traceTable.columnModel.getColumn(3).preferredWidth = 360
         Ui.leftAlignHeader(traceTable)
 
@@ -234,9 +252,43 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         tabs.addTab("Detail", Ui.scroll(detailArea))
         tabs.addTab("Pipeline", buildPipelinePanel())
         tabs.addTab("Artifact JSON", Ui.scroll(jsonArea))
-        tabs.addTab("Trace", Ui.scroll(traceTable))
+        tabs.addTab("Trace", buildTracePanel())
         tabs.preferredSize = Dimension(556, 640)
         return tabs
+    }
+
+    private fun buildTracePanel(): JComponent {
+        traceStateLabel.font = Theme.monoSmall
+        traceStateLabel.foreground = Theme.DIM
+        traceStateLabel.border = BorderFactory.createEmptyBorder(0, 8, 0, 8)
+
+        traceTailButton.apply {
+            toolTipText = "Follow this session's trace.jsonl as it grows"
+            addActionListener { current?.let { startTail(it.dir.resolve("trace.jsonl")) } }
+        }
+        traceStopButton.apply {
+            isEnabled = false
+            addActionListener { stopTail() }
+        }
+
+        val head = JPanel(BorderLayout()).apply {
+            background = Theme.PANEL
+            border = BorderFactory.createMatteBorder(0, 0, 1, 0, Theme.LINE)
+            add(traceStateLabel, BorderLayout.CENTER)
+            add(JPanel().apply {
+                layout = BoxLayout(this, BoxLayout.X_AXIS)
+                background = Theme.PANEL
+                border = BorderFactory.createEmptyBorder(4, 4, 4, 6)
+                add(traceTailButton)
+                add(Box.createHorizontalStrut(6))
+                add(traceStopButton)
+            }, BorderLayout.EAST)
+        }
+
+        val p = JPanel(BorderLayout()).apply { background = Theme.BG }
+        p.add(head, BorderLayout.NORTH)
+        p.add(Ui.scroll(traceTable), BorderLayout.CENTER)
+        return p
     }
 
     private fun buildPipelinePanel(): JComponent {
@@ -339,11 +391,14 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
     }
 
     fun openSession(session: Session) {
+        // Opening a different session ends any live tail from the previous one.
+        stopTail()
         current = session
         pathLabel.text = session.dir.toString()
 
         methodModel.setRows(session.methods)
         traceModel.setRows(session.traceEvents)
+        updateTraceState()
         renderArtifacts(session)
 
         val c = session.counts
@@ -352,10 +407,6 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
             "missing ${c[RecoveryStatus.MISSING] ?: 0}   ·   " +
             "${session.methods.size} methods   ·   ${session.traceEvents.size} trace events"
         notesLabel.text = if (session.notes.isEmpty()) "" else "${session.notes.size} read problem(s)"
-
-        // Trace tab only makes sense with data; keep it but hint when empty.
-        val traceIdx = tabs.indexOfTab("Trace")
-        if (traceIdx >= 0) tabs.setEnabledAt(traceIdx, session.traceEvents.isNotEmpty())
 
         if (!session.hasAnyArtifact) {
             detailArea.text = "This folder has no pipeline artifacts.\n\n" +
@@ -379,6 +430,82 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         cards.show(centerCards, "empty")
         statusLabel.text = " "
         notesLabel.text = ""
+    }
+
+    // ---------------------------------------------------------------
+    // Attach / live tail
+    // ---------------------------------------------------------------
+
+    private fun openAttachDialog() {
+        val defaultOutput = current?.dir?.resolve("trace.jsonl")?.toString() ?: "trace.jsonl"
+        val dialog = JDialog(this, "Attach / Listen", true)
+        val panel = AttachPanel(
+            defaultOutput = defaultOutput,
+            onStartTail = { path -> startTail(path) },
+            onClose = { dialog.dispose() },
+        )
+        dialog.contentPane = panel
+        dialog.pack()
+        dialog.setLocationRelativeTo(this)
+        dialog.isVisible = true
+    }
+
+    /** Begin following a trace file live. Works with or without an open
+     *  session — the events land in the Trace tab as the target writes them. */
+    fun startTail(path: Path) {
+        stopTail()
+        traceModel.clear()
+        cards.show(centerCards, "session")
+        selectTab("Trace")
+        val tailer = TraceTailer(
+            path = path,
+            onEvents = { events ->
+                traceModel.addRows(events)
+                val last = traceTable.rowCount - 1
+                if (last >= 0) traceTable.scrollRectToVisible(traceTable.getCellRect(last, 0, true))
+            },
+            onStatus = { status -> renderTailStatus(path, status) },
+        )
+        traceTailer = tailer
+        traceTailButton.isEnabled = false
+        traceStopButton.isEnabled = true
+        tailer.start()
+    }
+
+    fun stopTail() {
+        traceTailer?.stop()
+        val wasTailing = traceTailer != null
+        traceTailer = null
+        traceStopButton.isEnabled = false
+        if (wasTailing) updateTraceState()
+    }
+
+    private fun renderTailStatus(path: Path, status: TraceTailer.TailStatus) {
+        val updated = if (status.lastUpdateMillis > 0)
+            "  ·  updated ${LocalTime.now().format(clock)}" else ""
+        traceStateLabel.foreground = if (status.fileExists) Theme.OK else Theme.WARN
+        traceStateLabel.text = if (status.fileExists) {
+            "tailing $path  ·  ${status.totalEvents} events$updated"
+        } else {
+            "waiting for $path — not created yet (the agent writes it once attached)"
+        }
+    }
+
+    /** Refresh the static (not-tailing) Trace tab header for the open session. */
+    private fun updateTraceState() {
+        val session = current
+        val hasTrace = session != null && session.dir.resolve("trace.jsonl").let {
+            it.toFile().exists()
+        }
+        traceTailButton.isEnabled = hasTrace && traceTailer == null
+        traceStateLabel.foreground = Theme.DIM
+        traceStateLabel.text = when {
+            session == null -> "no session — use Attach / Listen to tail a trace"
+            session.traceEvents.isNotEmpty() ->
+                "static: ${session.traceEvents.size} events${if (hasTrace) "  ·  Tail to follow live" else ""}"
+            hasTrace -> "trace.jsonl present but empty — Tail to follow live"
+            else -> "no trace in this session — use Attach / Listen to capture one"
+        }
     }
 
     /** Select the first method whose name matches (test / screenshot hook). */

@@ -1,0 +1,11 @@
+{"ev":"agent-attached","ts":1000,"thr":22,"mode":"live-attach","phase":"live","logAll":false,"trace":"trace.jsonl"}
+{"ev":"capability","ts":1001,"thr":22,"name":"can_generate_native_method_bind_events","available":true,"phase":"live"}
+{"ev":"capability","ts":1002,"thr":22,"name":"can_generate_method_entry_events","available":false,"phase":"live","jvmtiError":98}
+{"ev":"capability","ts":1003,"thr":22,"name":"can_generate_method_exit_events","available":false,"phase":"live","jvmtiError":98}
+{"ev":"capability","ts":1004,"thr":22,"name":"can_access_local_variables","available":false,"phase":"live","jvmtiError":98}
+{"ev":"capability","ts":1005,"thr":22,"name":"can_generate_exception_events","available":false,"phase":"live","jvmtiError":98}
+{"ev":"gap","ts":1006,"thr":22,"kind":"reduced-live-capabilities","phase":"live","nativeMethodBind":true,"methodEntry":false,"methodExit":false,"localVariables":false,"exceptions":false,"enabledEvents":"native-method-bind","detail":"live attach obtained only a subset of JVMTI capabilities; entry/exit, local-variable, and exception events unavailable in this phase are not enabled and will not appear in the trace. For full method-body recovery use the startup -agentpath path."}
+{"ev":"gap","ts":1007,"thr":22,"kind":"jni-table-running-threads","phase":"live","tableInstalled":true,"runningThreads":6,"enabledEvents":"native-method-bind","detail":"threads already running at attach keep their original JNIEnv table; per-JNI-call argument capture is unavailable for them"}
+{"ev":"bind","ts":1200,"thr":1,"owner":"com/example/Main","name":"boot","desc":"()V","fnAddr":"0x7f9c14001240"}
+{"ev":"bind","ts":1201,"thr":1,"owner":"com/example/Crypto","name":"decrypt","desc":"(Ljava/lang/String;)Ljava/lang/String;","fnAddr":"0x7f9c14001450"}
+{"ev":"bind","ts":1202,"thr":1,"owner":"com/example/Crypto","name":"rounds","desc":"()I","fnAddr":"0x7f9c14001600"}

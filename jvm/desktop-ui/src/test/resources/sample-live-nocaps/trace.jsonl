@@ -1,0 +1,5 @@
+{"ev":"agent-attached","ts":1000,"thr":22,"mode":"live-attach","phase":"live","logAll":false,"trace":"trace.jsonl"}
+{"ev":"capability","ts":1001,"thr":22,"name":"can_generate_native_method_bind_events","available":false,"phase":"live","jvmtiError":98}
+{"ev":"capability","ts":1002,"thr":22,"name":"can_generate_method_entry_events","available":false,"phase":"live","jvmtiError":98}
+{"ev":"capability","ts":1003,"thr":22,"name":"can_generate_method_exit_events","available":false,"phase":"live","jvmtiError":98}
+{"ev":"gap","ts":1004,"thr":22,"kind":"no-core-capabilities","phase":"live","detail":"neither native-method-bind nor method entry/exit capabilities are available in this phase; the recovery trace will be empty"}

@@ -1,9 +1,12 @@
 # desktop-ui
 
-A read-only desktop viewer for recovery-pipeline artifacts. It opens a
-session directory (the folder a pipeline run wrote its JSON into), lists
-the methods, shows a recovered method body, and reports where the run
-stands. It does not run recovery — that stays in the CLI.
+A desktop viewer for recovery-pipeline artifacts and live JVM sessions. It
+opens a session directory (the folder a pipeline run wrote its JSON into),
+lists the methods, shows a recovered method body, and reports where the run
+stands. It can also follow a live `trace.jsonl` as a target JVM writes it, and
+it will show — plainly — which JVMTI capabilities an attach obtained and which
+it could not. It never runs recovery and never invents its own attach
+mechanism: recovery and attach both stay in the CLI.
 
 Built with Swing and [FlatLaf](https://www.formdev.com/flatlaf/). No web
 UI, no browser, no JavaFX.
@@ -59,7 +62,12 @@ window.
 - **Pipeline** — which artifacts are present or missing, and the single
   CLI command to run next. The command is shown, never run.
 - **Artifact JSON** — the raw recovered JSON for the selected method.
-- **Trace** — the trace events, when a `trace.jsonl` is present.
+- **Trace** — the trace events. A static `trace.jsonl` is loaded when the
+  session has one; **Tail this trace** follows it live as it grows. Rows are
+  tinted by kind: native-method **bind** in the accent colour, a granted
+  **capability** in green, an **unavailable** capability (with its JVMTI
+  error code) in red, and **gap** records — the agent stating what it could
+  not observe — in amber.
 
 Empty, missing-artifact, and "folder has no artifacts" states are all
 handled and point at the first command to run.
@@ -67,6 +75,35 @@ handled and point at the first command to run.
 The viewer never runs a recovery step. Capturing a trace, reading the
 native library, and rebuilding all happen through the CLI; the Pipeline
 tab shows the exact command for the next step.
+
+## Attach / Listen (live session, preview)
+
+**Attach / Listen…** in the toolbar opens a form for a live JVM session. It is
+an honest front end to the `attach` CLI (see
+[`docs/jvm-attach.md`](../../docs/jvm-attach.md)), not a separate mechanism:
+
+- It shows the exact command it would run, e.g.
+
+  ```
+  python -m j2c_dumper_cli.main attach --pid <pid> --i-own-this-process -o trace.jsonl
+  ```
+
+  and updates it live as you edit the form. **Copy command** puts it on the
+  clipboard so you can run it yourself.
+- **Run attach** stays disabled until you enter a PID and tick *I own or may
+  inspect this process*. That box adds the required `--i-own-this-process`
+  flag; without it the CLI refuses before touching the target, and so does the
+  GUI. Attach is for a same-user JVM you are authorized to inspect.
+- On a successful attach the viewer starts tailing the trace. **Listen (tail
+  only)** skips running anything and just follows a trace file — useful when
+  you started the attach from a terminal.
+- Coverage is not promised. On many JDKs a live attach can only add
+  native-method-bind; method entry/exit, locals, and exceptions come back
+  unavailable. The viewer shows the `capability` / `gap` records verbatim so
+  reduced coverage is obvious. It does not hide the agent or patch the
+  target's inspection checks; if the target refuses attach, the CLI output is
+  shown as-is. For full method-body recovery, use the startup `-agentpath`
+  path (`recover` / `dynamic-trace`), which remains the default.
 
 ## Visual style (keep it this way)
 
@@ -99,9 +136,16 @@ whole app.
 
 ## Layout of the code
 
-- `Model.kt` — plain data types (`Session`, `MethodRow`, statuses).
+- `Model.kt` — plain data types (`Session`, `MethodRow`, statuses,
+  `TraceKind`, `AttachRequest`).
 - `SessionScanner.kt` — reads a directory into a `Session`. Pure I/O, no
   Swing, so it can be tested headless.
+- `TraceParser.kt` — classifies one `trace.jsonl` line (event / bind /
+  capability / gap / lifecycle). Shared by the scanner and the tailer.
+- `TraceTailer.kt` — follows a trace file as it grows, on a Swing timer.
+- `AttachController.kt` — builds (and, on confirmation, runs) the `attach`
+  CLI command. Command building and validation are Swing-free and tested.
+- `AttachPanel.kt` — the attach / listen form.
 - `NextCommandPlanner.kt` — picks the next CLI step from which artifacts
   exist.
 - `Listing.kt` — turns a recovered method into a readable listing.
@@ -122,7 +166,17 @@ cd jvm
 
 ## Screenshots
 
-`screenshots/` holds rendered images of each state. Regenerate them with:
+`screenshots/` holds rendered images of each state:
+
+- `01-empty` … `06-trace` — the artifact-session states (empty, missing
+  artifacts, pipeline, method detail, static trace).
+- `07-attach-form` — the attach / listen form, with the exact CLI shown.
+- `08-live-tail` — a live tail: bind events plus honest capability / gap rows
+  (a reduced-capability live attach: bind only).
+- `09-capability-gap` — the empty case shown plainly: no core capabilities
+  granted, nothing usable captured.
+
+Regenerate them with:
 
 ```bash
 cd jvm

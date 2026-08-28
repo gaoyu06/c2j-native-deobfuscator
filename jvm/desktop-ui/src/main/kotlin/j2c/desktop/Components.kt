@@ -66,10 +66,34 @@ class MethodCellRenderer(private val model: MethodTableModel) : DefaultTableCell
     }
 }
 
-/** Trace event table model. */
-class TraceTableModel(private var rows: List<TraceEvent> = emptyList()) : AbstractTableModel() {
+/** Trace event table model. Supports both a static set and live appends. */
+class TraceTableModel(rows: List<TraceEvent> = emptyList()) : AbstractTableModel() {
+    private val rows = rows.toMutableList()
     private val cols = listOf("#", "event", "thread", "detail")
-    fun setRows(newRows: List<TraceEvent>) { rows = newRows; fireTableDataChanged() }
+
+    fun setRows(newRows: List<TraceEvent>) {
+        rows.clear()
+        rows.addAll(newRows)
+        fireTableDataChanged()
+    }
+
+    fun clear() {
+        val n = rows.size
+        if (n == 0) return
+        rows.clear()
+        fireTableRowsDeleted(0, n - 1)
+    }
+
+    /** Append tailed events, keeping the incremental fire cheap. */
+    fun addRows(newRows: List<TraceEvent>) {
+        if (newRows.isEmpty()) return
+        val first = rows.size
+        rows.addAll(newRows)
+        fireTableRowsInserted(first, rows.size - 1)
+    }
+
+    fun kindAt(r: Int): TraceKind = rows[r].kind
+
     override fun getRowCount() = rows.size
     override fun getColumnCount() = cols.size
     override fun getColumnName(c: Int) = cols[c]
@@ -82,6 +106,30 @@ class TraceTableModel(private var rows: List<TraceEvent> = emptyList()) : Abstra
             3 -> e.summary
             else -> ""
         }
+    }
+}
+
+/**
+ * Tints a trace row by its kind: capability-unavailable and gap rows are
+ * called out so reduced coverage is obvious, binds get the accent, lifecycle
+ * markers stay dim. Ordinary events read as plain text.
+ */
+class TraceCellRenderer(private val model: TraceTableModel) : DefaultTableCellRenderer() {
+    override fun getTableCellRendererComponent(
+        table: JTable, value: Any?, isSelected: Boolean,
+        hasFocus: Boolean, row: Int, column: Int,
+    ): Component {
+        val c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
+        font = Theme.monoSmall
+        border = BorderFactory.createEmptyBorder(0, 8, 0, 8)
+        toolTipText = value?.toString()
+        val kind = model.kindAt(table.convertRowIndexToModel(row))
+        foreground = when (column) {
+            0, 2 -> Theme.DIM
+            else -> Theme.inkFor(kind)
+        }
+        horizontalAlignment = SwingConstants.LEFT
+        return c
     }
 }
 
