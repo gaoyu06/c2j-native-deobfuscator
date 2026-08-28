@@ -1,9 +1,13 @@
 # native-x86 module
 
-Status: **experimental skeleton**. The code under
-[`native-x86/`](../native-x86/) compiles and loads a plugin; it does not
-observe anything yet. Nothing in the JAR-recovery pipeline depends on
-it, and no recovery workflow requires it.
+Status: **experimental / preview**. The code under
+[`native-x86/`](../native-x86/) compiles, loads plugins, and — as of the
+first observation plugins — can attach to a process the invoking user
+owns and report *metadata-only* records about well-known library
+exports. It remains outside the JAR-recovery pipeline: nothing in that
+pipeline depends on it, and no recovery workflow requires it. The first
+plugins and the technique they use are documented in
+[plugins/crypto-libraries.md](plugins/crypto-libraries.md).
 
 This document defines the boundary: what the module is for, what it will
 never do, how it is structured as a process, what it reports, and how a
@@ -78,11 +82,24 @@ These are boundaries, not a backlog.
   `jni.h` include, ever, under `native-x86/`. See
   [`native-x86/bridge-notes.md`](../native-x86/bridge-notes.md).
 
-On cryptographic library entry points: a future observer may find it
-useful to *name* well-known functions (OpenSSL's EVP interface, Windows
-CNG, AES primitives) as points of interest in a symbol map. Naming an
-API in a design note is in scope. Implementing hooks on it is not, and
-no hooking code belongs in this module.
+On cryptographic and JNI library entry points: the observation plugins
+([plugins/crypto-libraries.md](plugins/crypto-libraries.md)) *name*
+well-known exports (OpenSSL `SSL_*`/`RSA_*`/`AES_*`/`EVP_*`, Windows CNG
+`BCrypt*`, and JNI-convention `Java_*`) and observe *when* they are
+entered and returned. That observation is deliberately bounded:
+
+- **In scope:** reporting the module, symbol name, address, and the
+  control-flow edge (which call site reached which callee, at entry and
+  return). This is the map and the timing, not the traffic.
+- **Out of scope, permanently:** capturing the bytes those functions
+  move. No plaintext, ciphertext, key, IV, argument value or return
+  value is read or reported, and the ABI has no field that could carry
+  them. Observation never intercepts, rewrites, decrypts or alters what
+  the target computes — a breakpoint is inserted, the entry/return is
+  noted, and the original code is restored, changing no program logic.
+
+Naming and *observing* an export is in scope; interception, alteration
+and content capture are not, at any privilege level.
 
 ---
 
@@ -97,7 +114,7 @@ privileges the invoking user already has, and it does not ask for more.
   │                                                     │
   │   ┌───────────────┐        ┌──────────────────────┐ │
   │   │ record sources│ ──────▶│ event bus            │ │
-  │   │ (none today)  │        │  - assigns seq       │ │
+  │   │ ptrace observe│        │  - assigns seq       │ │
   │   └───────────────┘        │  - stamps timestamps │ │
   │                            │  - fans out by kind  │ │
   │                            └──────────┬───────────┘ │
@@ -113,10 +130,17 @@ privileges the invoking user already has, and it does not ask for more.
         consumers: JVM bridge, analysis scripts, humans
 ```
 
-Properties that the skeleton already enforces:
+Properties the host enforces:
 
+- **Same-user, opt-in, and visible.** The host observes a process only
+  when the invoking user passes an explicit `--pid` *and* the
+  `--i-own-this-process` confirmation, and only when `/proc/PID` is owned
+  by the current user. A process owned by another user is rejected before
+  any attach is attempted. Attachment is ordinary ptrace: not stealthy,
+  and observable by the target.
 - **One process, no privilege escalation.** The host is an ordinary
-  executable. There is no service, no installer, no driver.
+  executable running with the invoking user's privileges. There is no
+  service, no installer, no driver, no kernel component.
 - **Plugins are ordinary shared libraries** loaded with the platform
   loader (`dlopen` / `LoadLibrary`) from a path the user passes in.
   Plugin discovery is explicit; the host never scans directories or
@@ -138,11 +162,17 @@ Properties that the skeleton already enforces:
   future work that still needs deep copying, serialization, and a wire
   schema (see below).
 
-What a future observation source would and would not be allowed to do,
-staying inside the non-goals above: enumerate the modules of a process
-the user is entitled to inspect, read symbol tables from files on disk,
-and decode instructions from an image. Reconstructing user data from a
-target's memory is not part of the record model.
+What the observation source does, staying inside the non-goals above:
+enumerate the modules of a process the user is entitled to inspect
+(`/proc/PID/maps`), read symbol tables from the module files on disk, and
+— on an opt-in live pass — place a debugger-style software breakpoint at
+a watched export to note its entry and return. The only target memory it
+reads is instruction words (to place and restore breakpoints) and the
+return address at the top of the stack (a code address). It never reads
+argument registers or buffers, and reconstructing user data from a
+target's memory is not part of the record model. The engine and its
+exact reads are described in
+[plugins/crypto-libraries.md](plugins/crypto-libraries.md).
 
 ---
 
@@ -157,7 +187,7 @@ Summarised by intent:
 | `module-load` | which image, at which base, how large, which machine | image contents |
 | `module-unload` | which base stopped being valid | — |
 | `symbol` | which name maps to which address in which module | anything about what the symbol computes |
-| `call-site` | which address calls which target, and how (direct / indirect / thunk) | argument values, buffer contents, return values |
+| `call-site` | which address calls which target, how (direct / indirect / thunk), and — when observed live — whether at `enter` or `return` (the `phase` field, ABI 0.2) | argument values, buffer contents, return values |
 
 The distinction in the last column is the safety property that matters:
 every record describes **program structure**, and none describes
@@ -221,21 +251,32 @@ today, and any change to this module should keep them holding.
 
 ## Current state and what review must settle
 
-Shipped in this skeleton:
+Shipped:
 
-- `include/nativex86/plugin.h` — ABI v0.1
-- `src/host/` — host stub: plugin loading, observer registry, event
-  dispatch, a console sink, and a hard-coded script of synthetic
-  records
+- `include/nativex86/plugin.h` — ABI v0.2 (adds a generic `request_watch`
+  callback and a `call-site` `phase`; still no Java/JNI/TLS vocabulary)
+- `src/host/` — host: plugin loading (one or more), observer registry,
+  event dispatch, a console sink, a synthetic script for the no-target
+  case, and a Linux observation engine (`observe_linux.c`) that attaches
+  with ptrace and reports module/symbol/call-site records
 - `plugins/hello/` — sample plugin
-- `CMakeLists.txt`, `smoke-test.sh` — build and a Linux compile+run
-  check
+- `plugins/crypto-openssl/`, `plugins/jni-natives/`,
+  `plugins/crypto-cng/` — the first observation plugins
+  ([plugins/crypto-libraries.md](plugins/crypto-libraries.md))
+- `tests/fixtures/` — a name-only fixture library and target process, so
+  the observation path is testable without OpenSSL, a JVM, or real
+  traffic
+- `CMakeLists.txt`, `smoke-test.sh` — build and a Linux compile + run +
+  observe check
 
-Not shipped, on purpose: any observation source. The synthetic records
-in `src/host/main.c` are literals.
+Not shipped, on purpose: a Windows host observation backend (the CNG
+plugin is source-complete but matches nothing without it), a
+cross-process transport for the record stream, and anything that would
+capture the content a watched function moves.
 
-Open questions that a human should answer before observation code is
-written: which platforms are in scope first, which transport the record
-stream uses, whether plugins are trusted or sandboxed, and whether the
-privileged path in [privileged-observer.md](privileged-observer.md) is
-worth its support burden at all.
+Open questions that a human should still settle: which additional
+platforms are in scope, which transport an out-of-process consumer uses
+(see [the bridge sketch](../native-x86/bridge-notes.md)), whether plugins
+are trusted or sandboxed, and whether the privileged path in
+[privileged-observer.md](privileged-observer.md) is worth its support
+burden at all.

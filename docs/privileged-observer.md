@@ -93,10 +93,14 @@ propose them under this heading:
   persistence, no packing or obfuscation of the component itself, and no
   loading of code the user did not name.
 - **No interception or modification.** No TLS interception, no traffic
-  capture or rewriting, no credential or key capture, no patching of the
-  target. Well-known cryptographic library entry points (OpenSSL, CNG,
-  AES primitives) may be *named* in a symbol map as points of interest;
-  hooking them is not in scope at any privilege level.
+  capture or rewriting, no credential or key capture, no alteration of
+  what the target computes. Well-known cryptographic library entry points
+  (OpenSSL, CNG, AES primitives) may be *named* and *observed* at
+  entry/return as points of interest — the same metadata-only way the
+  user-mode host does (see
+  [plugins/crypto-libraries.md](plugins/crypto-libraries.md)). Capturing
+  the content those functions move, or altering their behaviour, is not
+  in scope at any privilege level.
 - **No data exfiltration.** Records stay on the machine that produced
   them; the component has no network behaviour.
 
