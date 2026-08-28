@@ -81,5 +81,19 @@ target_include_directories(nx86_abi_checks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(nx86_abi_checks PRIVATE nativex86_abi ${CMAKE_DL_LIBS})
 target_compile_options(nx86_abi_checks PRIVATE ${NX86_WARNINGS})
 
+# White-box unit checks for live-engine internals (the unique-address
+# restore planner and the entry/return alias guard). It compiles the engine
+# source directly to reach its static helpers without a live target, so it
+# only needs the event bus and platform shim to link.
+add_executable(nx86_observe_unit
+    tests/observe_unit.c
+    src/host/event_bus.c
+    src/host/platform.c
+)
+target_include_directories(nx86_observe_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/host)
+target_link_libraries(nx86_observe_unit PRIVATE nativex86_abi ${CMAKE_DL_LIBS})
+target_compile_options(nx86_observe_unit PRIVATE ${NX86_WARNINGS})
+
 enable_testing()
 add_test(NAME abi_checks COMMAND nx86_abi_checks)
+add_test(NAME observe_unit COMMAND nx86_observe_unit)

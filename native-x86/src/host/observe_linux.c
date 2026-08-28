@@ -641,6 +641,20 @@ static int poke_user(pid_t pid, size_t off, unsigned long value)
  *                     error, so the run must restore any placed breakpoint,
  *                     detach, and fail rather than leave the target stopped
  *                     with a breakpoint in place and still report success
+ *   return-insert-fail - fail the bp_insert() that arms a one-shot return
+ *                     breakpoint as a non-ESRCH ptrace error, after an entry
+ *                     has already been observed, so the run must restore,
+ *                     detach, and fail rather than ignore the failure and
+ *                     report a clean live pass (entry arming is unaffected)
+ *   step-trap-lost  - make a single-step over a breakpoint appear to stop
+ *                     for something other than the expected SIGTRAP, so the
+ *                     step helper must treat it as an unexpected stop and
+ *                     fail rather than assume the step succeeded
+ *   unexpected-trap - once at least one call-site record has been emitted,
+ *                     treat the next breakpoint stop as a trap the engine
+ *                     did not place, so the run must fail the unexpected
+ *                     stop honestly instead of resuming with a suppressed
+ *                     signal
  */
 static int test_inject(const char *what)
 {
@@ -763,6 +777,16 @@ static int bp_step_over(pid_t pid, unsigned long addr, unsigned char saved)
     if (WIFEXITED(st) || WIFSIGNALED(st)) {
         return 1;
     }
+    /* The single step must land on the expected trap. A stop for anything
+     * other than SIGTRAP is an unexpected event this preview does not
+     * model: do not treat it as a clean step (which would leave the byte
+     * un-re-armed and the run reported as success). Signal a non-ESRCH
+     * failure so the caller restores and detaches, and fails the run. */
+    if (test_inject("step-trap-lost") ||
+        !WIFSTOPPED(st) || WSTOPSIG(st) != SIGTRAP) {
+        errno = EIO;
+        return -1;
+    }
     return bp_insert(pid, addr, &tmp);
 }
 
@@ -782,6 +806,14 @@ static int bp_step_off(pid_t pid, unsigned long addr, unsigned char saved)
     }
     if (WIFEXITED(st) || WIFSIGNALED(st)) {
         return 1;
+    }
+    /* As in bp_step_over: the step must land on SIGTRAP. Any other stop is
+     * an unexpected event; fail with a non-ESRCH marker so the caller
+     * restores, detaches, and fails the run rather than assume success. */
+    if (test_inject("step-trap-lost") ||
+        !WIFSTOPPED(st) || WSTOPSIG(st) != SIGTRAP) {
+        errno = EIO;
+        return -1;
     }
     return 0;
 }
@@ -808,6 +840,73 @@ static int find_return_bp(const return_bp *rbs, int n, uint64_t addr)
     return -1;
 }
 
+/* One address to restore, with the original non-INT3 byte to write back. */
+typedef struct restore_site {
+    uint64_t      address;
+    unsigned char saved;
+} restore_site;
+
+/*
+ * Collect the set of *unique* addresses that must be restored, from the
+ * armed entry breakpoints and the active return breakpoints, together with
+ * the original byte saved for each. Each address appears exactly once even
+ * when an entry and a return breakpoint name it (an entry's saved byte
+ * wins, since it captured the true pre-INT3 byte). This is a pure function
+ * of the breakpoint tables — it touches no process — so it can be checked
+ * directly without ptrace.
+ *
+ * The invariant it enforces matters for correctness: entry and return
+ * breakpoints can alias the same address, and restoring such an address
+ * twice could write back a stale 0xcc and leave an INT3 in place while the
+ * cleanup still reported success. run_live() also refuses to *place* a
+ * return breakpoint on an address an entry breakpoint already patched (see
+ * the return-arming block), so a saved return byte is never a captured
+ * 0xcc; this de-duplication is the second line of defence.
+ *
+ * Returns the number of sites written to `out` (capped at `out_cap`).
+ */
+static int plan_restores(const breakpoint *bps, int n_bps,
+                         const return_bp *rbs, int n_rbs,
+                         restore_site *out, int out_cap)
+{
+    int n = 0;
+    int i, j;
+
+    for (i = 0; i < n_bps && n < out_cap; ++i) {
+        if (!bps[i].armed) {
+            continue;
+        }
+        for (j = 0; j < n; ++j) {
+            if (out[j].address == bps[i].address) {
+                break;
+            }
+        }
+        if (j < n) {
+            continue; /* already scheduled by an earlier record */
+        }
+        out[n].address = bps[i].address;
+        out[n].saved = bps[i].saved;
+        ++n;
+    }
+    for (i = 0; i < n_rbs && n < out_cap; ++i) {
+        if (!rbs[i].active) {
+            continue;
+        }
+        for (j = 0; j < n; ++j) {
+            if (out[j].address == rbs[i].address) {
+                break;
+            }
+        }
+        if (j < n) {
+            continue; /* an entry (or earlier return) already covers it */
+        }
+        out[n].address = rbs[i].address;
+        out[n].saved = rbs[i].saved;
+        ++n;
+    }
+    return n;
+}
+
 /*
  * Remove every breakpoint we placed and detach, restoring the target's
  * code byte-for-byte. Returns 0 when the target is provably clean
@@ -818,35 +917,35 @@ static int find_return_bp(const return_bp *rbs, int n, uint64_t addr)
  *
  * A ptrace op that fails with ESRCH means the tracee is already gone, so
  * nothing it once held can still be active; that is treated as clean.
+ *
+ * Restoration goes through plan_restores() so each unique patched address
+ * is written back exactly once: an address covered by both an entry and a
+ * return breakpoint must not be restored twice.
  */
 static int remove_breakpoints_and_detach(pid_t pid,
                                          breakpoint *bps, int n_bps,
                                          return_bp *rbs, int n_rbs)
 {
     int leaked = 0;
-    int i;
+    int i, n_sites;
+    restore_site sites[NX86_MAX_BREAKPOINTS + NX86_MAX_RETURNS];
 
-    for (i = 0; i < n_bps; ++i) {
-        if (!bps[i].armed) {
-            continue;
-        }
-        if (bp_restore(pid, (unsigned long)bps[i].address, bps[i].saved) != 0 &&
+    n_sites = plan_restores(bps, n_bps, rbs, n_rbs, sites,
+                            (int)(sizeof(sites) / sizeof(sites[0])));
+    for (i = 0; i < n_sites; ++i) {
+        if (bp_restore(pid, (unsigned long)sites[i].address,
+                       sites[i].saved) != 0 &&
             errno != ESRCH) {
             leaked = 1;
-        } else {
-            bps[i].armed = 0;
         }
     }
+    /* Every placed breakpoint has now been restored (or the tracee is
+     * gone); clear the flags so no record is mistaken for still-armed. */
+    for (i = 0; i < n_bps; ++i) {
+        bps[i].armed = 0;
+    }
     for (i = 0; i < n_rbs; ++i) {
-        if (!rbs[i].active) {
-            continue;
-        }
-        if (bp_restore(pid, (unsigned long)rbs[i].address, rbs[i].saved) != 0 &&
-            errno != ESRCH) {
-            leaked = 1;
-        } else {
-            rbs[i].active = 0;
-        }
+        rbs[i].active = 0;
     }
     /* Test seam: pretend the detach failed so the caller must fail the
      * command. Skipping the real detach leaves the tracee stopped and
@@ -1125,6 +1224,7 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
             unsigned long rsp;
             uint64_t hit_addr;
             int ei, ri;
+            int force_unexpected;
             /* Read only RIP — one register word — to learn which
              * breakpoint was hit. The argument and return-value registers
              * are never fetched. */
@@ -1139,7 +1239,14 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
             }
             hit_addr = (uint64_t)rip - 1u;
 
-            ei = find_entry_bp(bps, n_bps, hit_addr);
+            /* Test seam: once a real call-site record has been emitted,
+             * treat the next breakpoint stop as if it were a trap we did
+             * not place, to exercise the unexpected-stop policy below
+             * deterministically. Inert unless the exact token is set. */
+            force_unexpected = (test_inject("unexpected-trap") &&
+                                call_events > 0);
+
+            ei = force_unexpected ? -1 : find_entry_bp(bps, n_bps, hit_addr);
             if (ei >= 0) {
                 /* Read only RSP (one more register word), then read ONLY
                  * the return address it points at — a code address.
@@ -1201,12 +1308,36 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                     }
                 }
 
-                /* Arm a one-shot return breakpoint if not already present. */
+                /* Arm a one-shot return breakpoint if not already present.
+                 *
+                 * Skip an address that an entry breakpoint already patches:
+                 * peeking there would read our own 0xcc and save it as the
+                 * "original" byte, and cleanup would then restore that 0xcc
+                 * and leave an INT3 while still reporting success. The entry
+                 * breakpoint already covers that address (find_entry_bp wins
+                 * when it is hit), so no second byte is placed and none is
+                 * saved for it.
+                 *
+                 * A failed insert is not silently ignored: like entry
+                 * arming, any non-ESRCH ptrace failure means the return site
+                 * could not be armed, so restore what is in place, detach,
+                 * and fail the run rather than continue and report a clean
+                 * live pass. ESRCH means the tracee is already gone. */
                 if (ret_addr != 0u && ret_ok &&
                     find_return_bp(rbs, n_rbs, ret_addr) < 0 &&
+                    find_entry_bp(bps, n_bps, ret_addr) < 0 &&
                     n_rbs < NX86_MAX_RETURNS) {
                     unsigned char saved;
-                    if (bp_insert(pid, (unsigned long)ret_addr, &saved) == 0) {
+                    int ins;
+                    if (test_inject("return-insert-fail")) {
+                        /* Simulate a non-ESRCH ptrace failure while arming a
+                         * return-site breakpoint (see test_inject docs). */
+                        errno = EIO;
+                        ins = -1;
+                    } else {
+                        ins = bp_insert(pid, (unsigned long)ret_addr, &saved);
+                    }
+                    if (ins == 0) {
                         return_bp *rb = &rbs[n_rbs++];
                         rb->address = ret_addr;
                         rb->target_addr = bps[ei].address;
@@ -1217,6 +1348,16 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                                        bps[ei].name);
                         (void)snprintf(rb->module, sizeof(rb->module), "%s",
                                        bps[ei].module);
+                    } else if (errno == ESRCH) {
+                        target_alive = 0;
+                        break;
+                    } else {
+                        emit_note(bus, cfg->pid, NX86_LOG_ERROR,
+                                  "could not arm a return-site breakpoint; "
+                                  "restoring and detaching without completing "
+                                  "the live pass");
+                        run_status = NX86_ERR_INTERNAL;
+                        break;
                     }
                 }
 
@@ -1231,7 +1372,7 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                 continue;
             }
 
-            ri = find_return_bp(rbs, n_rbs, hit_addr);
+            ri = force_unexpected ? -1 : find_return_bp(rbs, n_rbs, hit_addr);
             if (ri >= 0) {
                 uint32_t tid = (uint32_t)pid;
                 emit_call_site(bus, cfg->pid, tid, rbs[ri].module,
@@ -1285,13 +1426,20 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                 continue;
             }
 
-            /* A trap we did not set: hand it back and continue. A CONT
-             * failure here is surfaced the same way, never silently
-             * ignored. */
-            if (cont_or_fail(pid, 0, &target_alive) != 0) {
-                run_status = NX86_ERR_INTERNAL;
-                break;
-            }
+            /* A SIGTRAP at an address we did not patch is an unexpected
+             * stop. Preview policy is not to swallow or forge signals for
+             * a trap we do not understand: resuming with signal 0 would
+             * suppress it and let the run report a clean success, and
+             * resuming with a re-forged SIGTRAP would be inventing a
+             * signal-faithful debugger this preview is not. Instead,
+             * restore every breakpoint, detach, and fail the run honestly.
+             * The cleanup at the end of the loop handles restore+detach. */
+            emit_note(bus, cfg->pid, NX86_LOG_ERROR,
+                      "unexpected stop (SIGTRAP not from a placed "
+                      "breakpoint); restoring and detaching without "
+                      "completing the live pass");
+            run_status = NX86_ERR_INTERNAL;
+            break;
         }
     }
 

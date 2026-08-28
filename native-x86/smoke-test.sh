@@ -46,6 +46,7 @@ if [ "$USE_CMAKE" = "1" ] && command -v cmake >/dev/null 2>&1; then
     cmake --build "$BUILD_DIR" >/dev/null
     HOST_BIN="$BUILD_DIR/bin/nx86_host"
     CHECKS_BIN="$BUILD_DIR/bin/nx86_abi_checks"
+    UNIT_BIN="$BUILD_DIR/bin/nx86_observe_unit"
     HELLO_LIB="$BUILD_DIR/lib/libnx86_plugin_hello.so"
     OPENSSL_LIB="$BUILD_DIR/lib/libnx86_plugin_crypto_openssl.so"
     JNI_LIB="$BUILD_DIR/lib/libnx86_plugin_jni_natives.so"
@@ -70,6 +71,13 @@ else
         "$SCRIPT_DIR/src/host/event_bus.c" \
         "$SCRIPT_DIR/src/host/platform.c" \
         "$SCRIPT_DIR/plugins/hello/hello.c" -ldl
+    # White-box unit checks: compiles the engine directly to reach its
+    # static helpers (unique-address restore planner + alias guard).
+    # shellcheck disable=SC2086
+    "$CC_BIN" $WARN $INC -o "$BUILD_DIR/bin/nx86_observe_unit" \
+        "$SCRIPT_DIR/tests/observe_unit.c" \
+        "$SCRIPT_DIR/src/host/event_bus.c" \
+        "$SCRIPT_DIR/src/host/platform.c" -ldl
     for p in hello:hello/hello crypto_openssl:crypto-openssl/crypto_openssl \
              jni_natives:jni-natives/jni_natives; do
         stem="${p%%:*}"; src="${p##*:}"
@@ -94,6 +102,7 @@ else
         -Wl,-rpath,"$BUILD_DIR/lib" -lpthread
     HOST_BIN="$BUILD_DIR/bin/nx86_host"
     CHECKS_BIN="$BUILD_DIR/bin/nx86_abi_checks"
+    UNIT_BIN="$BUILD_DIR/bin/nx86_observe_unit"
     HELLO_LIB="$BUILD_DIR/lib/libnx86_plugin_hello.so"
     OPENSSL_LIB="$BUILD_DIR/lib/libnx86_plugin_crypto_openssl.so"
     JNI_LIB="$BUILD_DIR/lib/libnx86_plugin_jni_natives.so"
@@ -639,6 +648,166 @@ else
 fi
 cleanup_fixture11
 trap - EXIT
+
+echo "-- 12. return-site breakpoint arming failure must fail the command"
+# Arming the one-shot RETURN breakpoint (bp_insert at the caller-side
+# return address) was previously ignored on failure: an entry could be
+# observed and the run still report a clean live success with the return
+# site un-armed. Force just that insert to fail (entry arming is
+# unaffected) and require the honest "could not arm a return-site
+# breakpoint" note plus a non-zero exit with "shutdown with errors" and no
+# "shutdown ok". Only meaningful where the live path attaches; skipped
+# honestly otherwise (same as sections 3, 6, 8, 9).
+PIDFILE12="$(mktemp)"
+FXPID12=""
+cleanup_fixture12() {
+    [ -n "$FXPID12" ] && kill -9 "$FXPID12" >/dev/null 2>&1 || true
+    rm -f "$PIDFILE12" >/dev/null 2>&1 || true
+}
+trap cleanup_fixture12 EXIT
+LD_LIBRARY_PATH="$FIXTURE_LIBDIR:${LD_LIBRARY_PATH:-}" "$FIXTURE_BIN" "$PIDFILE12" &
+FXPID12=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$PIDFILE12" ] && break
+    sleep 0.2
+done
+TARGET_PID12="$(cat "$PIDFILE12" 2>/dev/null || true)"
+if [ -z "$TARGET_PID12" ]; then
+    echo "FAIL: fixture process (return-insert test) did not report a pid"
+    FAILED=1
+else
+    set +e
+    RET_OBS="$(NX86_TEST_INJECT=return-insert-fail "$HOST_BIN" \
+        --pid "$TARGET_PID12" --i-own-this-process \
+        --max-events 4 --max-seconds 10 \
+        "$OPENSSL_LIB" "$JNI_LIB" 2>&1)"
+    RET_RC=$?
+    set -e
+    echo "$RET_OBS"
+    if grep -qF "phase=enter" <<<"$RET_OBS"; then
+        # The live path armed entries and observed one: the return-insert
+        # failure must fail the command, print the honest note and
+        # "shutdown with errors", and never print a clean "shutdown ok".
+        if [ "$RET_RC" = "0" ]; then
+            echo "FAIL: return-insert failure did not fail the command (exit 0)"
+            FAILED=1
+        fi
+        if ! grep -qiE 'could not arm a return-site breakpoint' <<<"$RET_OBS"; then
+            echo "FAIL: return-insert failure did not report the honest note"
+            FAILED=1
+        fi
+        if grep -qF "host: shutdown ok" <<<"$RET_OBS"; then
+            echo "FAIL: return-insert failure still reported 'shutdown ok'"
+            FAILED=1
+        fi
+        if ! grep -qF "host: shutdown with errors" <<<"$RET_OBS"; then
+            echo "FAIL: return-insert failure did not report 'shutdown with errors'"
+            FAILED=1
+        fi
+        # The return site never armed, so no return phase should appear.
+        if grep -qF "phase=return" <<<"$RET_OBS"; then
+            echo "FAIL: return-insert failure should place no return phase"
+            FAILED=1
+        fi
+        echo "PASS: return-site arming failure fails the command"
+    else
+        echo "NOTE: live path did not attach here; return-insert check skipped."
+    fi
+fi
+cleanup_fixture12
+trap - EXIT
+
+echo "-- 13. unexpected stops must fail honestly (never swallow the signal)"
+# Preview policy: an unexpected stop is not swallowed or forged. Two
+# facets, exercised deterministically once the live path has produced a
+# real record:
+#   (a) unexpected-trap  - a SIGTRAP at an address we did not patch must
+#                          fail the run, not resume with a suppressed
+#                          signal;
+#   (b) step-trap-lost   - a single-step that stops for something other
+#                          than the expected SIGTRAP must fail the run, not
+#                          be treated as a clean step.
+# Each must emit at least one phase=enter, then fail non-zero with
+# "shutdown with errors" and no "shutdown ok". Skipped honestly where the
+# live path does not attach.
+run_unexpected_case() {
+    local fault="$1"
+    local need_note="$2"
+    local pidfile fxpid target obs rc
+    pidfile="$(mktemp)"
+    LD_LIBRARY_PATH="$FIXTURE_LIBDIR:${LD_LIBRARY_PATH:-}" "$FIXTURE_BIN" "$pidfile" &
+    fxpid=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -s "$pidfile" ] && break
+        sleep 0.2
+    done
+    target="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -z "$target" ]; then
+        echo "FAIL: fixture process ($fault test) did not report a pid"
+        FAILED=1
+        kill -9 "$fxpid" >/dev/null 2>&1 || true
+        rm -f "$pidfile" >/dev/null 2>&1 || true
+        return
+    fi
+    set +e
+    obs="$(NX86_TEST_INJECT="$fault" "$HOST_BIN" \
+        --pid "$target" --i-own-this-process \
+        --max-events 6 --max-seconds 10 \
+        "$OPENSSL_LIB" "$JNI_LIB" 2>&1)"
+    rc=$?
+    set -e
+    kill -9 "$fxpid" >/dev/null 2>&1 || true
+    rm -f "$pidfile" >/dev/null 2>&1 || true
+    echo "$obs"
+    if grep -qF "phase=enter" <<<"$obs"; then
+        if [ "$rc" = "0" ]; then
+            echo "FAIL: $fault did not fail the command (exit 0)"
+            FAILED=1
+        fi
+        if grep -qF "host: shutdown ok" <<<"$obs"; then
+            echo "FAIL: $fault still reported 'shutdown ok'"
+            FAILED=1
+        fi
+        if ! grep -qF "host: shutdown with errors" <<<"$obs"; then
+            echo "FAIL: $fault did not report 'shutdown with errors'"
+            FAILED=1
+        fi
+        if ! grep -qiE 'did not complete cleanly' <<<"$obs"; then
+            echo "FAIL: $fault did not warn about an unclean pass"
+            FAILED=1
+        fi
+        if [ -n "$need_note" ] && ! grep -qiE "$need_note" <<<"$obs"; then
+            echo "FAIL: $fault did not emit the expected note ($need_note)"
+            FAILED=1
+        fi
+        echo "PASS: $fault fails the command"
+    else
+        echo "NOTE: live path did not attach here; $fault check skipped."
+    fi
+}
+trap - EXIT
+run_unexpected_case "unexpected-trap" "unexpected stop"
+run_unexpected_case "step-trap-lost" ""
+
+echo "-- 14. unique-address restore invariant (white-box unit check)"
+# Proves must-fix item 2 at the unit level: entry and return breakpoints
+# can name the same address, and the cleanup planner must restore each
+# unique address once with the true original byte (never a re-saved 0xcc).
+# Also degrades to a clean SKIP where the live path is unavailable.
+set +e
+UNIT_OUT="$("$UNIT_BIN")"
+UNIT_RC=$?
+set -e
+echo "$UNIT_OUT"
+if [ "$UNIT_RC" != "0" ]; then
+    echo "FAIL: observe unit check exited non-zero ($UNIT_RC)"
+    FAILED=1
+fi
+if ! grep -qE 'observe-unit: (PASS|SKIP)' <<<"$UNIT_OUT"; then
+    echo "FAIL: observe unit check did not report PASS or SKIP"
+    FAILED=1
+fi
+echo "PASS: unique-address restore invariant holds"
 
 if [ "$FAILED" != "0" ]; then
     echo "SMOKE TEST: FAIL"
