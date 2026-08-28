@@ -67,8 +67,11 @@ Not ready. Missing: ... Run scripts/setup.sh (or scripts/setup.ps1) to fix.
 脚本做前置门槛。`WARN`（例如 Java 版本够新但 `JAVA_HOME` 未设）只是提醒，不算失败，
 也不会翻转就绪标志。可选工具（Ghidra、unicorn、zig）永远不会导致阻塞。在本机上
 `doctor` 只接受它真正能加载的 agent 文件名（Linux 上是 `j2c_agent.so`，macOS 上是
-`.dylib`，Windows 上是 `.dll`）；为其他操作系统遗留、或为其他 CPU 架构构建的产物
-都会被报告为 missing。
+`.dylib`，Windows 上是 `.dll`），并且文件头必须表明它是为本机 CPU 构建的；为其他
+操作系统遗留、为其他 CPU 架构构建、或格式无法识别的产物都会被报告为 missing。由于
+`native/build.sh` 只面向 x86-64，非 x86-64 主机（例如 ARM）无论 `native/build/lib`
+里放着什么，agent 都会被报告为 missing —— 动态路径在那里不可用，请改用模拟兜底或
+静态路径，两者都不需要 agent。
 
 ## 3. 恢复 —— 约 1–2 分钟
 
@@ -139,9 +142,11 @@ Java 版本够新，但 `JAVA_HOME` 没设；native agent 构建需要它。这�
 native 代码，因此能列出 native 方法、dump 解密后的常量，并把方法当纯函数 oracle
 来调用：
 
+把 `unicorn` 装进 setup 所用的那个解释器，并用它来跑 harness（启动器只包装 CLI 子命令）：
+
 ```bash
-pip install unicorn
-python3 py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+(cd py && uv pip install unicorn)    # pip 兜底时用 python3 -m pip install unicorn
+py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 ```
 
 完整步骤见 [`emulation-recovery.md`](emulation-recovery.md)。

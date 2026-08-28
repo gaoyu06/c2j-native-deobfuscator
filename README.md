@@ -16,10 +16,14 @@ Three complementary recovery paths:
 | **Static** | obfuscated jar + Ghidra | Locate the JNI method tables in the native blob, decompile each function, lift pseudo-C to JVM bytecode |
 | **Emulation** | obfuscated blob (no run, no Ghidra) | Run the native code under a CPU emulator + mock JNI; recover the method table, dump decrypted constants, and call methods as pure-function oracles |
 
-The dynamic/static paths emit a clean `out.jar` whose native methods now have
-real bytecode bodies and whose loader / native-blob entries are stripped. The
-emulation path recovers the C-only secrets the other two can't see (inlined
-comparisons, the `<clinit>` string tables) and gives you an executable oracle.
+The dynamic/static paths emit an `out.jar` whose native-method stubs are
+replaced with *best-effort recovered bodies* and whose loader / native-blob
+entries are stripped. Coverage is per method: the dynamic path recovers the
+paths a run actually executes, the static path what the decompile lifts
+cleanly — so unobserved or unlifted methods may keep a stub or a partial body.
+Inspect the output and expect manual completion on hard targets. The emulation
+path recovers the C-only secrets the other two can't see (inlined comparisons,
+the `<clinit>` string tables) and gives you an executable oracle.
 
 License: **GPLv3**.
 
@@ -158,7 +162,7 @@ All three target the same input but trade off coverage versus accuracy:
 | | Dynamic | Static | Emulation |
 |---|---|---|---|
 | **Best fit** | Binary is packed / VM-protected / has anti-debug — the JVMTI agent sits at the Java side of the wall so the native protection layer doesn't matter. | Binary is unprotected (e.g. straight native-obfuscator + zig c++ output). Ghidra can decompile each `fnAddr` directly. | Logic is rewritten to pure C (comparisons / crypto / string tables), or the jar won't run **and** Ghidra can't structure the code, or you need the decrypted constants. |
-| **Requires** | A runnable command line (`java -jar ...`) that exercises the obfuscated classes. | Ghidra 11.x installed. | Just the blob + `pip install unicorn`. No JVM, no Ghidra. |
+| **Requires** | A runnable command line (`java -jar ...`) that exercises the obfuscated classes. | Ghidra 11.x installed. | Just the blob + the `unicorn` package. No JVM, no Ghidra. |
 | **Coverage** | Only branches you actually run. | Every method registered through `RegisterNatives`. | Method list + decrypted constants always; per-method behaviour via the oracle. |
 | **Accuracy** | High — every opcode maps to an observed JNI call. | Best-effort — pattern matching on decompiled C, stubs on stack imbalance. | Exact (it executes the real code), but you reverse the algorithm from oracle I/O — it does **not** auto-emit bytecode. |
 | **Speed** | Target run time + agent overhead. | Ghidra auto-analysis (minutes for ~1 MB blobs). | Fast — no Ghidra, no live JVM. |
@@ -305,7 +309,9 @@ agent, plus the optional tools (Ghidra, unicorn, zig), and prints the next
 command for anything missing. It verifies tool versions and artifact presence —
 it does not launch the JVM modules or load the agent. It exits non-zero only
 when a required piece is *missing*; a `WARN` (e.g. `JAVA_HOME` unset) is a
-caveat, not a blocker.
+caveat, not a blocker. The agent must match this host in both name and CPU: on a
+non-x86-64 host, where `native/build.sh` cannot produce a loadable agent, it is
+always reported missing and the dynamic path is not ready.
 
 ### 3. Recover (default path — dynamic)
 
@@ -334,11 +340,13 @@ during the run*. Dynamic tracing only covers executed paths, so unobserved
 methods may keep a stub or a partial body; inspect the result and expect manual
 completion on hard targets (see the human-pass note above).
 
-> `scripts/j2c ...` runs the CLI through the interpreter setup installed the
-> packages into (the `uv` venv under `py/.venv`, or the `pip`-fallback
-> interpreter). If you activate that environment yourself, the equivalent
-> `python3 -m j2c_dumper_cli ...` (or `python3 -m j2c_dumper_cli.main ...`) works
-> too — the launcher just saves you from picking the wrong interpreter.
+> **One interpreter.** `scripts/j2c ...` runs the CLI through the interpreter
+> setup installed the packages into (the `uv` venv at `py/.venv`, or the
+> `pip`-fallback interpreter), so you never have to pick one. The few things the
+> CLI does not wrap — the emulation harness and the lifter's feature flags below
+> — run under that same interpreter, written here as `py/.venv/bin/python`
+> (`py\.venv\Scripts\python` on Windows). If setup fell back to `pip`, use the
+> interpreter it installed into instead.
 
 ### Fallback: emulation (no live run, no Ghidra)
 
@@ -347,16 +355,17 @@ blob, or you need the decrypted C-only constants. It runs the native code under
 a CPU emulator with a mock JNI; no JVM and no Ghidra required:
 
 ```bash
-pip install unicorn
+# add unicorn to the workspace interpreter (pip fallback: python3 -m pip install unicorn)
+(cd py && uv pip install unicorn)
 
 # list native methods (entry points auto-discovered)
-python3 py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 
 # dump a function's decrypted string constants (alphabet, secret, messages)
-python3 py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+py/.venv/bin/python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
 
 # call a native method as a pure function (oracle)
-python3 py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+py/.venv/bin/python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
     --arg-bytes "input" --static "v=@alphabet.txt"
 ```
 
@@ -389,7 +398,7 @@ scripts/j2c merge-manifest classes.json binary.json -o manifest.json
     -postScript DumpFromManifest.java manifest.json ghidra-dump.json
 
 # 3. Lift the pseudo-C to bytecode + rebuild
-python3 -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
+scripts/j2c static-reverse ghidra-dump.json --manifest manifest.json -o recovered/
 scripts/j2c rebuild --input in.jar --recovered recovered/ \
     --manifest manifest.json -o out.jar
 ```
@@ -412,11 +421,14 @@ feature flag (throw-reason hint parsing, ExceptionCheck-guard skipping,
 symbol-table tracking, lookup-table resolution, etc.). Disable a flag
 when it misbehaves on a specific binary:
 
+The flags are not exposed by `scripts/j2c static-reverse`, so drive the lifter
+directly with the workspace interpreter:
+
 ```bash
-python3 -m ast_matcher.cli ghidra-dump.json -o recovered/ \
+py/.venv/bin/python -m ast_matcher.cli ghidra-dump.json -o recovered/ \
     --disable use_throw_reason_invoke_hints \
     --disable skip_native_exception_guards
-python3 -m ast_matcher.cli --list-flags
+py/.venv/bin/python -m ast_matcher.cli --list-flags
 ```
 
 ---

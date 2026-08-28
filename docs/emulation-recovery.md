@@ -75,14 +75,18 @@ this adaptation well; running the scripts blind will not.
 
 ## Prerequisites
 
+`unicorn` goes into the same interpreter `scripts/setup.sh` installed the
+workspace into — the `uv` venv at `py/.venv` (`py\.venv\Scripts\python` on
+Windows), or the interpreter the `pip` fallback used:
+
 ```bash
-python -m pip install unicorn        # into the j2c-dumper py venv
+(cd py && uv pip install unicorn)    # pip fallback: python3 -m pip install unicorn
 ```
 
 Get a registrar address for j2cc-style dispatch (not needed for native-
 obfuscator `Java_*` / `JNI_OnLoad`):
 
 ```bash
-python -m j2c_dumper_cli.main inspect-binary natives.bin -o binary.json
-python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 ```

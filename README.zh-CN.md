@@ -15,7 +15,7 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 | **静态** | 混淆后的 JAR + Ghidra | 在 native blob 里定位 JNI method table，逐函数反编译，把 pseudo-C 抬升回 JVM 字节码 |
 | **模拟** | 混淆后的 blob（不需运行、不需 Ghidra） | 用 CPU 模拟器 + mock JNI 直接跑 native 代码：恢复方法表、dump 解密后的常量、把方法当纯函数来调用 |
 
-动态/静态路径会输出一个干净的 `out.jar`：原先的 native 方法现在拥有真实的字节码方法体，loader / native blob 资源条目被剥离。模拟路径则负责挖出另外两条路看不到的"纯 C 秘密"（被内联的比较、`<clinit>` 字符串表），并给你一个可执行的 oracle。
+动态/静态路径会输出一个 `out.jar`：原先的 native 方法桩被替换成*尽力恢复出的方法体*，loader / native blob 资源条目被剥离。覆盖度是按方法计的 —— 动态路径只能恢复本次运行真正执行到的分支，静态路径只能恢复反编译结果能干净抬升的部分，因此未被观察到或未能抬升的方法可能仍是桩或只有部分方法体。请检查产物，难度较大的目标要预期人工补齐。模拟路径则负责挖出另外两条路看不到的"纯 C 秘密"（被内联的比较、`<clinit>` 字符串表），并给你一个可执行的 oracle。
 
 协议：**GPLv3**。
 
@@ -188,7 +188,7 @@ scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 | | 动态 | 静态 | 模拟 |
 |---|---|---|---|
 | **适合的场景** | 二进制被加壳 / 虚拟机保护 / 反调试 —— JVMTI agent 工作在 Java 侧，native 层的保护不影响它的可见性。 | 二进制未经额外保护（例如直接 native-obfuscator + zig c++ 输出），Ghidra 能直接反编译每个 `fnAddr`。 | 逻辑被改写成纯 C（比较 / 加密 / 字符串表），或者 jar 跑不起来**且** Ghidra 结构化不了，或者你需要解密后的常量。 |
-| **要求** | 一条可执行的命令（`java -jar ...`），并且能跑到目标类。 | 安装了 Ghidra 11.x。 | 只要 blob + `pip install unicorn`。不需要 JVM，不需要 Ghidra。 |
+| **要求** | 一条可执行的命令（`java -jar ...`），并且能跑到目标类。 | 安装了 Ghidra 11.x。 | 只要 blob + `unicorn` 包。不需要 JVM，不需要 Ghidra。 |
 | **覆盖率** | 只覆盖实际被执行到的分支；从未被调用的方法完全采集不到。 | 通过 `RegisterNatives` 注册的所有方法，无论运行时是否被触发。 | 方法表 + 解密常量总能拿到；单个方法的行为通过 oracle 探测。 |
 | **准确性** | 高 —— 每条 opcode 都对应 JVM 实际观察到的 JNI 调用。 | best-effort —— 抬升器靠模式匹配，无法保持栈平衡时退化为 stub。 | 精确（它执行真实代码），但算法要你从 oracle 的输入/输出去逆 —— 它**不会**自动产出字节码。 |
 | **耗时** | 受目标本身执行时长 + agent 开销限制。 | 受 Ghidra 自动分析限制（1 MB 量级的 blob 通常需要数分钟）。 | 快 —— 无 Ghidra、无活 JVM。 |
@@ -253,7 +253,9 @@ scripts/j2c doctor       # Windows：scripts\j2c.ps1 doctor
 `lief`）、已构建的 JVM 模块与本机匹配的 native agent，以及可选工具（Ghidra、
 unicorn、zig），并为每个缺失项打印下一步命令。它只校验工具版本与产物是否存在，
 不会启动 JVM 模块或加载 agent。只有当某个必需项**缺失**时它才以非零码退出；
-`WARN`（例如 `JAVA_HOME` 未设）只是提醒，不是阻塞。
+`WARN`（例如 `JAVA_HOME` 未设）只是提醒，不是阻塞。agent 必须在文件名和 CPU 架构
+两方面都与本机匹配：在非 x86-64 主机上，`native/build.sh` 无法产出可加载的 agent，
+因此它始终被报告为 missing，动态路径不算就绪。
 
 ### 3. 恢复（默认路径 —— 动态）
 
@@ -280,10 +282,11 @@ scripts/j2c recover \
 覆盖实际执行到的路径，因此未观察到的方法可能仍是桩或只有部分方法体；请检查结果，
 难度较大的目标要预期需要人工补全（见上文的"人工过一遍"说明）。
 
-> `scripts/j2c ...` 会用 setup 安装这些包的解释器来运行 CLI（`py/.venv` 下的
-> `uv` venv，或 `pip` 兜底所用的解释器）。如果你自己激活了那个环境，等价的
-> `python3 -m j2c_dumper_cli ...`（或 `python3 -m j2c_dumper_cli.main ...`）也能用
-> —— 启动器只是帮你免于挑错解释器。
+> **只用一个解释器。** `scripts/j2c ...` 会用 setup 安装这些包的解释器来运行 CLI
+> （`py/.venv` 下的 `uv` venv，或 `pip` 兜底所用的解释器），你不必自己挑。少数
+> CLI 没有包装的用法（下面的模拟 harness、抬升器的 feature flag）也走同一个解释器，
+> 本文写作 `py/.venv/bin/python`（Windows 上为 `py\.venv\Scripts\python`）。如果
+> setup 走的是 `pip` 兜底，就换成它安装到的那个解释器。
 
 ### 兜底：模拟恢复（无需运行、无需 Ghidra）
 
@@ -292,16 +295,17 @@ scripts/j2c recover \
 也不需要 Ghidra：
 
 ```bash
-pip install unicorn
+# 把 unicorn 装进工作区解释器（pip 兜底时用 python3 -m pip install unicorn）
+(cd py && uv pip install unicorn)
 
 # 列出 native 方法（入口自动发现）
-python3 py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 
 # dump 某个函数解密后的字符串常量（字母表、密文、提示语）
-python3 py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+py/.venv/bin/python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
 
 # 把 native 方法当纯函数调用（oracle）
-python3 py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+py/.venv/bin/python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
     --arg-bytes "input" --static "v=@alphabet.txt"
 ```
 
@@ -333,7 +337,7 @@ scripts/j2c merge-manifest classes.json binary.json -o manifest.json
     -postScript DumpFromManifest.java manifest.json ghidra-dump.json
 
 # 3. pseudo-C 抬升到字节码 + 重建 JAR
-python3 -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
+scripts/j2c static-reverse ghidra-dump.json --manifest manifest.json -o recovered/
 scripts/j2c rebuild --input in.jar --recovered recovered/ \
     --manifest manifest.json -o out.jar
 ```
@@ -355,11 +359,13 @@ scripts/j2c rebuild --input in.jar --recovered recovered/ \
 hint、ExceptionCheck-guard 跳过、符号表跟踪、查表解析等等）。哪个 flag
 对当前二进制误判，就把它关掉：
 
+这些 flag 没有暴露在 `scripts/j2c static-reverse` 上，因此用工作区解释器直接跑抬升器：
+
 ```bash
-python3 -m ast_matcher.cli ghidra-dump.json -o recovered/ \
+py/.venv/bin/python -m ast_matcher.cli ghidra-dump.json -o recovered/ \
     --disable use_throw_reason_invoke_hints \
     --disable skip_native_exception_guards
-python3 -m ast_matcher.cli --list-flags
+py/.venv/bin/python -m ast_matcher.cli --list-flags
 ```
 
 ---

@@ -75,8 +75,12 @@ on it. A `WARN` (for example, Java is new enough but `JAVA_HOME` is unset) is a
 caveat, not a failure, and does not flip the ready bit. The optional tools
 (Ghidra, unicorn, zig) never block. On this host `doctor` only accepts the agent
 name it can actually load (`j2c_agent.so` on Linux, `.dylib` on macOS, `.dll` on
-Windows); a leftover build for another OS, or one built for a different CPU
-architecture, is reported as missing.
+Windows) *and* a file whose header says it was built for this CPU; a leftover
+build for another OS, a different architecture, or an unreadable file is
+reported as missing. Because `native/build.sh` only targets x86-64, a non-x86-64
+host (ARM, for example) always reports the agent as missing — the dynamic path
+is unavailable there, whatever sits in `native/build/lib`. Use the emulation
+fallback or the static path instead; neither needs the agent.
 
 ## 3. Recover — ~1–2 min
 
@@ -155,9 +159,12 @@ Use the **emulation fallback** — no JVM and no Ghidra. It runs the native code
 under a CPU emulator with a mock JNI, so it can list the native methods, dump
 decrypted constants, and call methods as pure-function oracles:
 
+Install `unicorn` into the interpreter setup used, and run the harness with it
+(the launcher only wraps the CLI subcommands):
+
 ```bash
-pip install unicorn
-python3 py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+(cd py && uv pip install unicorn)    # pip fallback: python3 -m pip install unicorn
+py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 ```
 
 Full walkthrough: [`emulation-recovery.md`](emulation-recovery.md).
