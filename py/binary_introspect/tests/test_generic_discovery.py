@@ -11,6 +11,7 @@ from binary_introspect.arch.amd64_windows import AMD64_WINDOWS
 from binary_introspect.jni_tables import (
     _find_register_natives_calls,
     _harvest_call,
+    _harvest_dispatch,
 )
 from binary_introspect.profile import detect_profile, get_profile
 
@@ -62,6 +63,70 @@ def test_generic_decodes_static_jni_table_for_both_abis(
     assert result["methods"] == [
         {"name": "alpha", "desc": "()V", "fnAddr": 0x1100},
         {"name": "beta", "desc": "(I)I", "fnAddr": 0x1120},
+    ]
+
+
+def test_harvest_rejects_static_table_with_invalid_entries() -> None:
+    """A candidate table whose entries fail the JNI name/descriptor checks
+    must not be emitted as a (wrong) static method table — generic stays
+    conservative and yields no methods rather than false ones."""
+    code_va = 0x1000
+    table_va = 0x3000
+    code = _lea(b"\x48\x8d\x15", code_va, table_va)   # lea rdx, [rip+table]
+    code += b"\xb9\x02\x00\x00\x00"                     # mov ecx, 2
+    call_va = code_va + len(code)
+    code += b"\xff\x90\xb8\x06\x00\x00"                 # call [rax + 215*8]
+    code += b"\x90" * (0x300 - len(code))
+
+    data = bytearray(0x300)
+    struct.pack_into("<QQQ", data, 0, table_va + 0x100, table_va + 0x110, 0x1100)
+    struct.pack_into("<QQQ", data, 24, table_va + 0x120, table_va + 0x130, 0x1120)
+    data[0x100:0x106] = b"alpha\0"
+    data[0x110:0x114] = b"()V\0"
+    # Second entry has a bogus name and descriptor.
+    data[0x120:0x130] = b"\xff\xfe not/valid"
+
+    exec_ranges = [(code_va, code_va + len(code), bytes(code))]
+    mapped_ranges = exec_ranges + [(table_va, table_va + len(data), bytes(data))]
+    cs = AMD64_SYSV.disassembler()
+
+    result = _harvest_call(
+        cs, AMD64_SYSV, call_va, exec_ranges, mapped_ranges, image_base=0
+    )
+    assert result["methods"] == []
+    # No stack stores either, so no ordered fnAddr fallback: the call site
+    # produces nothing rather than a fabricated table.
+    assert result["fnAddrs"] == []
+
+
+def test_shared_dispatch_splits_branches_on_nmethods_boundaries() -> None:
+    """One shared RegisterNatives call site fed by several per-class tables
+    must be split into one branch per ``mov <nMethods>, imm`` boundary."""
+    code_va = 0x2000
+    buf = bytearray()
+
+    def emit_lea_store(target: int, stack_disp: int) -> None:
+        addr = code_va + len(buf)
+        buf.extend(_lea(b"\x48\x8d\x05", addr, target))   # lea rax, [rip+tgt]
+        buf.extend(bytes((0x48, 0x89, 0x44, 0x24, stack_disp)))  # mov [rsp+d], rax
+
+    emit_lea_store(0x2100, 0x10)
+    emit_lea_store(0x2110, 0x18)
+    buf += b"\xb9\x02\x00\x00\x00"   # mov ecx, 2  -> branch boundary A
+    emit_lea_store(0x2120, 0x10)
+    emit_lea_store(0x2130, 0x18)
+    buf += b"\xb9\x02\x00\x00\x00"   # mov ecx, 2  -> branch boundary B
+    call_va = code_va + len(buf)
+    buf += b"\xff\x90\xb8\x06\x00\x00"
+    buf += b"\x90" * (0x400 - len(buf))
+
+    exec_ranges = [(code_va, code_va + len(buf), bytes(buf))]
+    branches = _harvest_dispatch(
+        AMD64_SYSV.disassembler(), AMD64_SYSV, call_va, exec_ranges
+    )
+    assert [(b["nMethods"], b["fnAddrs"]) for b in branches] == [
+        (2, [0x2100, 0x2110]),
+        (2, [0x2120, 0x2130]),
     ]
 
 
