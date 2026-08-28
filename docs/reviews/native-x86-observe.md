@@ -283,3 +283,139 @@ left untouched.
 - `gcc` (13.3.0) and `clang` (18.1.3), `-std=c99 -Wall -Wextra -Wpedantic
   -Werror` — the changed `observe_linux.c` and `main.c`, and a full host
   link, compile without diagnostics.
+
+---
+
+## Re-review of `9a7b0bd` — remaining must-fix items
+
+A second independent re-review of head `9a7b0bd` confirmed the eight items
+above stayed closed and did not regress (attach-refusal still falls back to
+the read-only `/proc/PID/maps` + on-disk ELF pass and reports it honestly;
+no `GETREGS`, only RIP/RSP via `PEEKUSER`/`POKEUSER`; the 512-byte
+plugin-note cap is present; strict `--pid` and `--max-events` /
+`--max-seconds` parsing; module-scan failure surfaced in the live pass;
+step-over failure fails the run; the `NX86_TEST_INJECT` seam matches by
+exact token and is inert unless set). It then found four further leftovers,
+all fixed on this branch.
+
+### S1. In-loop `PTRACE_CONT` failures were discarded
+
+**Finding.** Four `PTRACE_CONT` calls inside `run_live()`'s event loop —
+the signal-forward resume, the resume after an entry breakpoint, the resume
+after a return breakpoint, and the resume for a trap the engine did not set
+— were all issued as `(void)ptrace(PTRACE_CONT, …)`. A resume that fails
+for anything other than `ESRCH` can leave the target stopped with a
+breakpoint byte still in place, yet the run continued and could still report
+a clean success.
+
+**Fix.** All four now go through a single `cont_or_fail()` helper. A
+non-`ESRCH` failure returns `-1`; the caller sets `run_status =
+NX86_ERR_INTERNAL` and breaks out of the loop, so control falls through to
+`remove_breakpoints_and_detach()` (restoring every placed breakpoint and
+detaching) and the closing note reads "live pass did not complete cleanly
+…". An `ESRCH` failure — the tracee is already gone — clears the alive flag
+and ends the loop cleanly, since nothing it held can still be active. The
+initial pre-loop `PTRACE_CONT` already checked its result and is unchanged.
+
+**Evidence.** Smoke-test section 9 injects a resume failure
+(`NX86_TEST_INJECT=cont-fail`, exact-token, inert unless set) on the live
+path: the run emits one `phase=enter`, then the "did not complete cleanly"
+note, `observation ended with status -6`, and `shutdown with errors`, and
+never prints `shutdown ok`. The clean live run (section 3) still returns
+`NX86_OK` and `shutdown ok`.
+
+### S2. Breakpoint-arming (`bp_insert`) failures were ignored
+
+**Finding.** The entry-arming loop inserted one `INT3` per resolved watched
+export but ignored `bp_insert()`'s result: only successful inserts set
+`armed`. If every insert failed the loop still fell through and the run
+could later report a clean live success with nothing actually armed; if
+some failed, the pass proceeded partially armed with the failures unrecorded.
+
+**Fix.** The loop now counts failures. Any non-`ESRCH` insert failure makes
+the run restore whatever did arm, detach through
+`remove_breakpoints_and_detach()`, emit an honest "could not arm one or more
+watched-export breakpoints …" note, and return `NX86_ERR_INTERNAL` rather
+than continue. This covers both "some watches failed to arm" and "every
+watch failed to arm". An `ESRCH` mid-arming (the tracee exited) ends the
+pass cleanly because nothing it held is active. The pre-existing
+"no watched export resolved" case (`n_bps == 0`) is still a clean read-only
+outcome and is checked before the arming loop.
+
+**Evidence.** Smoke-test section 10 injects an arming failure
+(`NX86_TEST_INJECT=insert-fail`, exact-token, inert unless set): the run
+resolves symbols, then prints the "could not arm" note, `observation ended
+with status -6`, and `shutdown with errors`, with no `phase=enter` and no
+`shutdown ok`.
+
+### S3. Multithreaded targets must refuse the live pass
+
+**Finding.** The live pass places process-wide `INT3` breakpoints and steps
+over them, which is only safe in a single-threaded target: a second thread
+could execute a patched entry while the engine has restored the byte to
+single-step another. The engine placed breakpoints without checking the
+thread count.
+
+**Fix (preview policy, not a thread-group tracer).** Before it attaches or
+places any breakpoint, `run_live()` counts the entries in `/proc/PID/task`
+via `count_task_threads()`. A target with more than one thread is refused
+the live pass entirely — no `PTRACE_ATTACH`, no breakpoints — and runs the
+documented read-only module/symbol fallback with an honest note that live
+observation is single-thread only. A single-threaded target is unaffected
+and still gets the full live entry/return pass. No `PTRACE_O_TRACECLONE`,
+no attaching every thread, and no new debugger feature was added.
+
+**Evidence.** A second fixture, `tests/fixtures/fixture_target_mt.c`, spawns
+an idle worker thread and only then publishes its pid, so `/proc/PID/task`
+reliably shows two threads. Smoke-test section 11 runs the host against it
+and asserts: exit 0, the "more than one thread … single-thread only" note,
+module-load and symbol records from the read-only pass, no `phase=enter`,
+no content-like field, and a clean `shutdown ok`. Because the refusal
+happens before any attach, this section is environment-independent (it does
+not need ptrace to be permitted). The single-thread fixture still reports
+`PASS(live)` in section 3.
+
+### S4. Docs overstated the note cap as a side-channel defence
+
+**Finding.** `docs/native-x86-module.md` still said the 512-byte
+`NX86_NOTE_TEXT_MAX` cap meant `note.text` "cannot be used as a side
+channel." That is false: the cap bounds only the length, not the content,
+and a determined plugin can put arbitrary text in 512 bytes.
+
+**Fix.** That passage now states the actual rule: the cap only bounds the
+field's *length*; what keeps `text` from becoming a data channel is policy
+(host/status text only; no keys, buffers or payloads; the host never parses
+`note.text` as data and rejects over-long notes); and a determined plugin
+can still place up to 512 bytes of arbitrary text — the cap limits *how
+much*, not *what*. `docs/plugin-abi.md` and `docs/plugins/crypto-libraries.md`
+already framed the cap honestly ("policy plus a bound, not a structural
+impossibility") and were left as-is. `docs/privileged-observer.md` is
+untouched.
+
+### Second re-review boundary notes
+
+- Still metadata-only: module/symbol/call-site names and addresses only.
+  No keys, buffers, payloads, interception, or kernel/driver source was
+  added, and the public ABI grew no Java/JNI types.
+- The single-thread policy is a refusal-and-fallback gate, not a new
+  tracing capability. Multithreaded targets get strictly less (read-only),
+  never more.
+- The `NX86_TEST_INJECT` seam gains `cont-fail` and `insert-fail`, matched
+  by exact token and inert unless the environment variable is set; they
+  inject nothing into production runs. The multithread refusal is exercised
+  by a real two-thread fixture, not an inject.
+
+### Second re-review verification
+
+- `bash native-x86/smoke-test.sh` — pass (exit 0), CMake build. Sections
+  1–11 all pass: 1 synthetic, 2 ABI checks, 3 live observation
+  (`PASS(live)`), 4 attach-refusal fallback, 5 strict `--pid`, 6
+  detach-failure, 7 malformed safety bounds, 8 live step failure, 9 live
+  `PTRACE_CONT` failure, 10 breakpoint-arming failure, 11 multithreaded
+  refusal + read-only fallback.
+- `bash native-x86/smoke-test.sh --no-cmake` — pass (exit 0), direct build;
+  same sections 1–11.
+- `gcc` (13.3.0) and `clang` (18.1.3), `-std=c99 -Wall -Wextra -Wpedantic
+  -Werror` — the changed `observe_linux.c`, the new
+  `tests/fixtures/fixture_target_mt.c`, and a full host link compile
+  without diagnostics.
