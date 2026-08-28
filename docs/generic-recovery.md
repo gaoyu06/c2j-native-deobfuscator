@@ -16,6 +16,48 @@ The current binary introspection and emulation backends support:
 | ELF or Mach-O x86-64 | System V | `rdx` | `ecx` / `rcx` |
 
 `RegisterNatives` is identified as JNI vtable index 215. The scanner reads
+
+## Proven object formats and registration families
+
+Generic discovery started as an ELF-only, single-table proof. It is now
+exercised by committed fixtures across all three x86-64 object formats and both
+registration families, so the path is no longer tied to one workflow. Each row
+below is backed by a real binary in `py/binary_introspect/tests/fixtures/`
+(source `.c` + built binary) and an assertion in
+`test_generic_discovery.py`:
+
+| Object format | ABI | What is proven | Fixture |
+|---|---|---|---|
+| ELF x86-64 | System V | `RegisterNatives` static table decoded to names/descriptors/addresses via relocations | `libjni_registrar.so` |
+| ELF x86-64 (symbols stripped) | System V | Same table still recovered after `strip --strip-all` (no `.symtab`); no silent empty result | `libjni_registrar.stripped.so` |
+| ELF x86-64 (exports only) | System V | Second registration family: methods registered purely by `Java_*` export names, **no** table | `libjni_exports_only.so` |
+| PE x86-64 | Microsoft x64 | Static table (r8/r9d) decoded to names/addresses **and** a `Java_*` export recorded | `jni_registrar.dll` |
+| Mach-O x86-64 | System V | Static table decoded to names/addresses **and** a `_Java_*` export normalized to the spec name | `libjni_registrar.dylib` |
+
+The fixtures rebuild from source with `bash
+py/binary_introspect/tests/fixtures/build.sh` when the cross toolchains are
+present (`x86_64-w64-mingw32-gcc` for PE, `clang` + `ld64.lld` for Mach-O, the
+host `cc` + `strip` for ELF). The built binaries are committed so the suite runs
+without any toolchain; the base ELF is a committed input and is not rebuilt by
+default because its exact addresses are asserted.
+
+### Still unproven / out of scope
+
+These are acknowledged gaps, not silent successes — the code either records an
+honest gap or returns nothing observable rather than a fabricated binding:
+
+- Non-x86-64 architectures (aarch64/arm ELF or Mach-O). `detect_abi` returns
+  `None`, so discovery yields an empty registry with no fabricated methods.
+- Section-header-removed ELF (only `PT_LOAD` segments, section table deleted),
+  as opposed to the symbol-stripped case above which **is** proven. There is no
+  segment fallback yet, so such a binary yields an empty registry.
+- Encrypted or runtime-decrypted method tables that emulation cannot reach.
+- Custom dispatch that does not preserve `JNINativeMethod[]` order.
+
+Whenever a `RegisterNatives` table is count-only or matches multiple classes by
+count, `manifest-merge` records it in `bindingGaps` instead of guessing a bind.
+
+
 Capstone operands, not rendered instruction text. It then requires supporting
 facts near the call: an immediate table length in the ABI's fourth argument,
 function-address LEAs into executable ranges, or a third-argument pointer to a

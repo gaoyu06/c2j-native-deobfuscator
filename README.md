@@ -365,6 +365,14 @@ Matching variant profiles can opt into those features. Ghidra scripts are
 optional plugins for method-body lifting and are not part of generic method
 discovery.
 
+Generic discovery is proven by committed fixtures across all three x86-64
+object formats (ELF, PE, Mach-O) and both registration families (a
+`RegisterNatives` static table and `Java_*` export names), including a
+symbol-stripped ELF. See the proven/unproven matrix in
+[`docs/generic-recovery.md`](docs/generic-recovery.md). This remains a
+development path: it is not promoted to the default `recover` flow, and it does
+not claim to restore method bytecode.
+
 Generic recovery is intentionally bounded: unsupported ABIs, nonstandard or
 encrypted registration that emulation cannot reach, and custom method-body
 layouts still need a profile/backend extension. See
