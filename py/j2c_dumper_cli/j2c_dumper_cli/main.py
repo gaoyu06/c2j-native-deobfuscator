@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -17,20 +18,39 @@ from rich.console import Console
 
 from j2c_dumper_cli import doctor as doctor_mod
 
-# The interpreter name setup selects and that is present on each platform:
-# a minimal POSIX environment ships `python3` (not `python`); Windows ships
-# `python`. Runtime messages echo the one that will actually work here.
-PYCMD = "python" if os.name == "nt" else "python3"
+
+def _cli_invocation() -> str:
+    """How to re-invoke this CLI in a way that actually works here.
+
+    `scripts/setup.sh` installs the packages into `py/.venv` (via uv), so a
+    bare ``python3 -m j2c_dumper_cli`` on a *system* interpreter would not find
+    them. Every hint the CLI prints must therefore point at an interpreter that
+    has the packages:
+
+    * when launched through ``scripts/j2c`` (or ``scripts/j2c.ps1``), echo that
+      launcher — it resolves the venv/pip interpreter itself;
+    * otherwise echo :data:`sys.executable`, which by definition already
+      imported this module, so the command is guaranteed to run.
+    """
+    launcher = os.environ.get("J2C_CMD")
+    if launcher:
+        return launcher
+    exe = sys.executable or ("python" if os.name == "nt" else "python3")
+    return f"{shlex.quote(exe)} -m j2c_dumper_cli"
+
+
+CLI = _cli_invocation()
 
 HELP = f"""\
 Recover JNI-native transpiled JARs back to readable JVM bytecode.
 
 DEFAULT PATH (dynamic): if the JAR can be launched, run
 
-    {PYCMD} -m j2c_dumper_cli recover IN.jar -o OUT.jar --run-cmd "java -jar IN.jar"
+    scripts/j2c recover IN.jar -o OUT.jar --run-cmd "java -jar IN.jar"
 
-FIRST TIME? run `doctor` to check your toolchain, then `scripts/setup.sh`
-(or `scripts/setup.ps1` on Windows) to build everything.
+FIRST TIME? run `scripts/setup.sh` (or `scripts/setup.ps1` on Windows) to build
+everything, then `scripts/j2c doctor` to check your toolchain. The `scripts/j2c`
+launcher runs the interpreter the setup step installed the packages into.
 
 FALLBACK (no live run): the emulation path needs no JVM and no Ghidra.
 ADVANCED (offline, needs Ghidra): the static path — see `--help` of the
@@ -77,7 +97,7 @@ def jvm_bin(name: str) -> Path:
             f"JVM module '{name}' is not built.\n"
             f"  Fix: run scripts/setup.sh (or scripts/setup.ps1 on Windows),\n"
             f"       or `cd jvm && ./gradlew :{name}:installDist`.\n"
-            f"  Diagnose: {PYCMD} -m j2c_dumper_cli doctor"
+            f"  Diagnose: {CLI} doctor"
         )
     return candidate
 
@@ -89,7 +109,7 @@ def native_lib() -> Path:
     hint = (
         "  Fix: run scripts/setup.sh (or scripts/setup.ps1 on Windows),\n"
         "       or `cd native && JDK_HOME=\"$JAVA_HOME\" bash build.sh`.\n"
-        f"  Diagnose: {PYCMD} -m j2c_dumper_cli doctor"
+        f"  Diagnose: {CLI} doctor"
     )
     if not libdir.exists():
         raise FileNotFoundError(
@@ -208,7 +228,7 @@ def _preflight_recover(run_cmd: Optional[str], no_dynamic: bool) -> None:
                       "artifacts are missing.")
         for p in problems:
             console.print(f"  - {p}")
-        console.print(f"Run [bold]{PYCMD} -m j2c_dumper_cli doctor[/] for a full "
+        console.print(f"Run [bold]{CLI} doctor[/] for a full "
                       "report, then [bold]scripts/setup.sh[/] "
                       "(or scripts/setup.ps1 on Windows).")
         raise typer.Exit(code=2)
@@ -332,7 +352,7 @@ def doctor() -> None:
                       "in place.")
         for c in report.warnings:
             console.print(f"[yellow]note:[/] {c.name}: {c.detail}")
-        console.print(f"Try: {PYCMD} -m j2c_dumper_cli recover IN.jar -o OUT.jar "
+        console.print(f"Try: {CLI} recover IN.jar -o OUT.jar "
                       "--run-cmd \"java -jar IN.jar\"")
     else:
         missing = ", ".join(c.name for c in report.blocking)

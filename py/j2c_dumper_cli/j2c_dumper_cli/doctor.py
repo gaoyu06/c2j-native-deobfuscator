@@ -8,6 +8,7 @@ returns a :class:`Check`; the CLI layer renders them.
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -184,24 +185,52 @@ def check_python() -> Check:
     )
 
 
-def check_python_recover_deps() -> Check:
+def venv_python(root: Optional[Path]) -> Optional[Path]:
+    """The uv-managed interpreter under ``py/.venv``, if it exists.
+
+    ``scripts/setup.sh`` runs ``uv sync``, which installs the packages into this
+    interpreter — not the system ``python3``. Probes point users at it (via the
+    ``scripts/j2c`` launcher) when the current interpreter lacks the packages.
+    """
+    if root is None:
+        return None
+    if os.name == "nt":
+        candidate = root / "py" / ".venv" / "Scripts" / "python.exe"
+    else:
+        candidate = root / "py" / ".venv" / "bin" / "python"
+    return candidate if candidate.exists() else None
+
+
+def check_python_recover_deps(root: Optional[Path] = None) -> Check:
     """Import the Python stage the default path runs (binary introspection).
 
     Importing ``binary_introspect.cli`` pulls in its architecture backends,
     which require ``capstone`` and ``lief``. Probing it here catches a
     half-installed workspace before ``recover`` fails mid-pipeline.
+
+    When the import fails but a uv-managed ``py/.venv`` exists (and is not the
+    interpreter running this probe), the packages are almost certainly installed
+    there: the real fix is to run the *right* interpreter, so the message says
+    so instead of only suggesting a reinstall.
     """
     name = "Python recover deps (capstone, lief)"
     try:
         import binary_introspect.cli  # noqa: F401
     except Exception as exc:
         missing = getattr(exc, "name", "") or str(exc)
+        venv = venv_python(root)
+        if venv is not None and Path(sys.executable).resolve() != venv.resolve():
+            fix = (f"the workspace is installed in {venv.parent.parent}; run it "
+                   "through that interpreter — use `scripts/j2c doctor` "
+                   "(or `scripts\\j2c.ps1 doctor` on Windows), which selects it")
+        else:
+            fix = ("run scripts/setup.sh (or scripts/setup.ps1), or "
+                   "`pip install -e py/binary_introspect` (installs capstone + lief)")
         return Check(
             name=name,
             status=STATUS_MISSING,
-            detail=f"cannot import binary_introspect.cli: {missing}",
-            fix="run scripts/setup.sh (or scripts/setup.ps1), or "
-                "`pip install -e py/binary_introspect` (installs capstone + lief)",
+            detail=f"cannot import binary_introspect.cli under {sys.executable}: {missing}",
+            fix=fix,
         )
     return Check(
         name=name,
@@ -257,6 +286,74 @@ _MIN_AGENT_BYTES = 4096
 _ALL_AGENT_NAMES = ("j2c_agent.so", "j2c_agent.dylib", "j2c_agent.dll")
 
 
+def host_machine(machine: Optional[str] = None) -> str:
+    """Normalise the host CPU architecture to a small, comparable label.
+
+    ``platform.machine()`` reports many spellings for the same ISA
+    (``x86_64``/``amd64``/``AMD64``, ``aarch64``/``arm64``). Collapsing them
+    lets the native-agent probe compare the host against what the artifact was
+    actually built for.
+    """
+    m = (machine if machine is not None else platform.machine()).lower()
+    if m in ("x86_64", "amd64", "x64", "em64t"):
+        return "x86_64"
+    if m in ("aarch64", "arm64", "armv8", "armv8l"):
+        return "arm64"
+    if m in ("i386", "i486", "i586", "i686", "x86"):
+        return "x86"
+    if m.startswith("arm"):
+        return "arm"
+    return m or "unknown"
+
+
+# ELF e_machine / Mach-O cputype / PE machine values, mapped to the same
+# normalised labels host_machine() returns. Only the architectures the build
+# can plausibly emit are listed; anything else stays unknown (and unenforced).
+_ELF_MACHINES = {0x03: "x86", 0x3E: "x86_64", 0x28: "arm", 0xB7: "arm64"}
+_MACHO_CPUS = {0x00000007: "x86", 0x01000007: "x86_64",
+               0x0000000C: "arm", 0x0100000C: "arm64"}
+_PE_MACHINES = {0x014C: "x86", 0x8664: "x86_64", 0x01C0: "arm",
+                0x01C4: "arm", 0xAA64: "arm64"}
+
+
+def agent_arch(path: Path) -> Optional[str]:
+    """Read a shared library's target CPU from its header (ELF/Mach-O/PE).
+
+    Returns a :func:`host_machine`-style label, or ``None`` when the format or
+    architecture is unrecognised (in which case the caller does not enforce an
+    architecture match — it only blocks on a *known* mismatch).
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+    if len(head) < 6:
+        return None
+
+    if head[:4] == b"\x7fELF":  # ELF (Linux, etc.)
+        endian = "little" if head[5] == 1 else "big"
+        if len(head) < 20:
+            return None
+        return _ELF_MACHINES.get(int.from_bytes(head[18:20], endian))
+
+    magic = head[:4]
+    if magic in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):  # Mach-O little-endian
+        return _MACHO_CPUS.get(int.from_bytes(head[4:8], "little"))
+    if magic in (b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce"):  # Mach-O big-endian
+        return _MACHO_CPUS.get(int.from_bytes(head[4:8], "big"))
+
+    if head[:2] == b"MZ":  # PE / COFF (Windows DLL)
+        if len(head) < 0x40:
+            return None
+        pe_off = int.from_bytes(head[0x3C:0x40], "little")
+        if pe_off + 6 > len(head) or head[pe_off:pe_off + 4] != b"PE\x00\x00":
+            return None
+        return _PE_MACHINES.get(int.from_bytes(head[pe_off + 4:pe_off + 6], "little"))
+
+    return None
+
+
 def check_native_agent(root: Path) -> Check:
     libdir = root / "native" / "build" / "lib"
     want = host_agent_name()
@@ -273,10 +370,24 @@ def check_native_agent(root: Path) -> Check:
                 detail=f"{target} is only {size} bytes; looks empty or truncated",
                 fix="delete it and rebuild: " + fix,
             )
+        # native/build.sh targets x86-64 only. On another host CPU it emits an
+        # artifact with the right *name* but the wrong machine code, which the
+        # JVM here cannot load — so a known architecture mismatch is not ready.
+        host = host_machine()
+        built = agent_arch(target)
+        if built is not None and built != host:
+            return Check(
+                name="Native JVMTI agent",
+                status=STATUS_MISSING,
+                detail=f"{target} is built for {built} but this host is {host}; "
+                       "native/build.sh targets x86-64 and its output cannot be "
+                       "loaded here",
+                fix="rebuild for this architecture: " + fix,
+            )
         return Check(
             name="Native JVMTI agent",
             status=STATUS_OK,
-            detail=f"found {target}",
+            detail=f"found {target}" + (f" ({built})" if built else ""),
         )
 
     # A leftover build for another OS must not read as ready.
@@ -375,7 +486,7 @@ def build_report(root: Path) -> Report:
     report = Report()
     report.add(check_java())
     report.add(check_python())
-    report.add(check_python_recover_deps())
+    report.add(check_python_recover_deps(root))
     report.add(check_jvm_modules(root))
     report.add(check_native_agent(root))
     report.add(check_ghidra())
