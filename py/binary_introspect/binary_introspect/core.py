@@ -321,6 +321,18 @@ def extract_hidden_classes(b: lief.Binary) -> list[dict[str, Any]]:
     return result
 
 
+def _canonical_jni_symbol(name: str, fmt: str) -> str:
+    """Return the JNI lookup name for an exported symbol.
+
+    Mach-O emits C symbols with a leading underscore in the symbol table
+    (``_Java_...``) but the JVM resolves the unprefixed spec name via
+    ``dlsym``. ELF and PE keep the spec name verbatim.
+    """
+    if fmt == "MachO" and name.startswith("_"):
+        return name[1:]
+    return name
+
+
 def extract_exported_functions(b: lief.Binary) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     if b.format == lief.Binary.FORMATS.PE and b.has_exports:
@@ -401,15 +413,21 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
     # JNI name-based exports are a second specification-defined registration
     # mechanism. Keep the encoded symbol intact; manifest-merge resolves it
     # exactly against classes.json, avoiding ambiguous best-effort demangling.
-    jni_exports = [
-        {
-            "source": "jni-export",
-            "fnSymbol": export["name"],
-            "fnAddr": export["addr"],
-        }
-        for export in exports
-        if export.get("name", "").startswith("Java_")
-    ]
+    # Mach-O (and other platforms) prefix C symbols with a leading underscore
+    # in the symbol table; dlsym and the JVM look the method up by its
+    # unprefixed spec name, so normalize before recording so the exact
+    # manifest match still succeeds.
+    jni_exports = []
+    for export in exports:
+        symbol = _canonical_jni_symbol(export.get("name", ""), fmt)
+        if symbol.startswith("Java_"):
+            jni_exports.append(
+                {
+                    "source": "jni-export",
+                    "fnSymbol": symbol,
+                    "fnAddr": export["addr"],
+                }
+            )
     native_registry: list[dict[str, Any]] = [
         {"classNameCandidate": name} for name in classes_in_pool
     ] + jni_exports + flat_methods

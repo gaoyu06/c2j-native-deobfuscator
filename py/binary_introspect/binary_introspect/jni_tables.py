@@ -75,11 +75,25 @@ def _in_any_range(va: int, ranges: list[tuple[int, int, bytes]]) -> bool:
 
 
 def _mapped_ranges(b: lief.Binary, image_base: int) -> list[tuple[int, int, bytes]]:
-    """Return addressable bytes for every non-empty section."""
+    """Return addressable bytes for every section that is actually mapped.
+
+    ELF non-allocated sections (``.symtab``, ``.comment``, debug info, …)
+    report a virtual address of ``0``; including them would make address ``0``
+    look mapped and let a zeroed, relocation-backed pointer slot resolve to a
+    spurious in-range value instead of following its relocation. Only sections
+    with ``SHF_ALLOC`` are load-addressable, so restrict ELF to those.
+    """
     out: list[tuple[int, int, bytes]] = []
     for sec in b.sections:
         if sec.size == 0:
             continue
+        if b.format == lief.Binary.FORMATS.ELF:
+            try:
+                flags = int(sec.flags)
+            except Exception:
+                flags = 0
+            if (flags & 0x2) == 0:  # SHF_ALLOC
+                continue
         raw = bytes(sec.content)
         if not raw:
             continue
@@ -152,14 +166,27 @@ def _read_pointer(
     image_base: int,
     relocations: dict[int, int] | None = None,
 ) -> int | None:
+    """Resolve the pointer stored at ``va``.
+
+    An already-linked in-image pointer is trusted first: when the on-disk
+    value resolves into a mapped range it is returned as-is. A relocation is
+    consulted only to fill a slot the on-disk image left unresolved (e.g. the
+    ``0x0`` function-pointer slots of a PIC ELF ``JNINativeMethod[]``). This
+    ordering is format-agnostic: it keeps ELF relocation resolution working
+    while ignoring the spurious rebase relocations LIEF attaches to Mach-O
+    ``__const`` pointer tables, whose inline values are already correct.
+    """
+    raw = _read_at(ranges, va, pointer_size)
+    inline: int | None = None
+    if raw is not None:
+        inline = _resolve_pointer(
+            int.from_bytes(raw, "little", signed=False), ranges, image_base
+        )
+        if _in_any_range(inline, ranges):
+            return inline
     if relocations and va in relocations:
         return relocations[va]
-    raw = _read_at(ranges, va, pointer_size)
-    if raw is None:
-        return None
-    return _resolve_pointer(
-        int.from_bytes(raw, "little", signed=False), ranges, image_base
-    )
+    return inline
 
 
 def _read_cstring(
