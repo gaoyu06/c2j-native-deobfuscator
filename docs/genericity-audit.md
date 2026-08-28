@@ -191,7 +191,6 @@ Ordered by how early they stop a previously-unseen target, not by size.
    Mach-O input it returns an empty table without complaint, so every
    `DAT_<hex>` reference in the decompile stays unresolved and recovered
    field and method accesses degrade to `?.?`.
-
 4. **RegisterNatives harvesting recognises two dispatch shapes** (R07, R08). A
    third shape needs both a new `harvest_strategy` value and a new harvester
    function; the profile alone cannot express it.
