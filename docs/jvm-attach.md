@@ -11,6 +11,18 @@ JVM that is **already running**, instead of instrumenting it from startup with
 > work that happens *after* the attach, and — for per-JNI-call argument
 > capture — only on threads started after the attach. Use it when you cannot
 > restart the target, or to take a quick diagnostic look at a running JVM.
+>
+> **Coverage caveat (important).** Several JVMTI capabilities can only be added
+> during the `OnLoad` phase. On many JDKs — **observed on OpenJDK 21** — a live
+> attach can add only `can_generate_native_method_bind_events`; method
+> entry/exit, local-variable access, and exception capabilities return
+> `JVMTI_ERROR_NOT_AVAILABLE` (98). When that happens the live-attach trace
+> contains **only `bind` events** (plus limited `jni-init` records on the attach
+> thread), which is **not** enough for full method-body recovery. The agent
+> records exactly which capabilities it obtained (see
+> [Capability and gap records](#capability-and-gap-records)); do not assume
+> entry/exit/locals/exception coverage unless the matching `capability` record
+> says `available:true`.
 
 ## Authorized, same-user use only
 
@@ -32,15 +44,21 @@ phase-aware initializer:
 - **Live attach (`Agent_OnAttach`)** — the VM is already initialized, so
   `VMInit` never fires. The agent bootstraps the function-table swap on the
   attach (listener) thread and picks up every thread started *after* attach via
-  `ThreadStart`. JVMTI event subscriptions (`NativeMethodBind`, `MethodEntry`,
-  `MethodExit`, `Exception`, `ExceptionCatch`) apply process-wide immediately.
+  `ThreadStart`. It then *attempts* to add each JVMTI capability
+  (`can_generate_native_method_bind_events`, `..._method_entry_events`,
+  `..._method_exit_events`, `can_access_local_variables`,
+  `..._exception_events`) and subscribes only to the events whose capability was
+  actually granted in the live phase. On JDKs where the entry/exit/locals/
+  exception capabilities are `OnLoad`-only (e.g. OpenJDK 21), only
+  `NativeMethodBind` is subscribed.
 
 Because a JNIEnv function table is per-thread and the agent can only reach the
 attach thread directly, threads that were **already running** at attach time
-keep their original table until they exit. Those threads still produce
-`bind` / `enter` / `exit` / `exception` events (JVMTI, thread-independent) but
-**not** per-JNI-call argument events. The agent records this honestly as a
-capability/coverage gap rather than implying full coverage (see
+keep their original table until they exit. Those threads still produce whichever
+of the `bind` / `enter` / `exit` / `exception` events the agent could enable
+(thread-independent JVMTI events) — **typically only `bind` on a live attach** —
+but **not** per-JNI-call argument events. The agent records this honestly as
+`capability` and `gap` records rather than implying full coverage (see
 [Capability and gap records](#capability-and-gap-records)).
 
 ## Usage
@@ -123,28 +141,58 @@ as in the README, if you don't already have one.)
 Both mechanisms use the platform's documented JVM attach facility and invoke
 `Agent_OnAttach`:
 
-- **`jcmd`** (default in `auto`): `jcmd <pid> JVMTI.agent_load <lib> "<opts>"`.
-  Ships with the JDK, needs no compilation.
+- **`jcmd`** (default in `auto`): `jcmd <pid> JVMTI.agent_load <lib> '<opts>'`.
+  Ships with the JDK, needs no compilation. **The option string must be
+  single-quoted.** `jcmd JVMTI.agent_load` routes the option string through the
+  diagnostic-command argument parser, which treats a `key=value` token as one of
+  its *own* named arguments and, for a positional argument, keeps only the part
+  before `=`. A bare `trace=out.jsonl` therefore reaches the agent as an empty
+  trace path; single-quoting makes the parser take the whole string as one
+  literal positional value so the agent receives it intact. The CLI does this
+  for you.
 - **`vm`** (`com.sun.tools.attach`): a tiny helper compiled on demand that calls
   `VirtualMachine.attach(pid).loadAgentPath(lib, opts)`. Selected with
   `--mechanism vm`, or used as the `auto` fallback if `jcmd` is unavailable.
+  `loadAgentPath` passes the option string verbatim (no quoting needed).
+
+**Failure reporting.** `jcmd JVMTI.agent_load` prints `return code: <N>` (the
+value `Agent_OnAttach` returned) but the `jcmd` process itself exits 0 *even when
+the agent failed*. The CLI parses that line and treats any non-zero agent return
+(or a non-zero `jcmd` exit) as a hard failure: it exits non-zero and does **not**
+print `attached`. The `vm` helper surfaces the same failure as an
+`AgentInitializationException`, which likewise fails the CLI.
 
 ## Capability and gap records
 
 On attach the agent writes structured records to the trace before normal events:
 
-- `{"ev":"agent-attached","mode":"live-attach","phase":"live", ...}` — lifecycle
-  marker (the startup path emits `agent-loaded` with `mode":"startup"`).
+- `{"ev":"agent-attached","mode":"live-attach","phase":"live","logAll":true|false,"trace":"..."}`
+  — lifecycle marker (the startup path emits `agent-loaded` with
+  `"mode":"startup"`). `logAll` reflects the `--log-all` / `log-all=true` option.
 - `{"ev":"capability","name":"can_generate_method_entry_events","available":true|false,"phase":"live"}`
   — one per capability. If a capability is unavailable in the live phase, it is
-  reported `false` (with the JVMTI error code) and the corresponding events are
-  not enabled — coverage is reduced, not faked.
-- `{"ev":"gap","kind":"jni-table-running-threads","tableInstalled":...,"runningThreads":N, ...}`
+  reported `false` with the JVMTI error code (`98` =
+  `JVMTI_ERROR_NOT_AVAILABLE`) and the corresponding events are not enabled —
+  coverage is reduced, not faked.
+- `{"ev":"gap","kind":"reduced-live-capabilities","nativeMethodBind":true,"methodEntry":false,"methodExit":false,"localVariables":false,"exceptions":false,"enabledEvents":"native-method-bind", ...}`
+  — emitted on a live attach whenever entry/exit, local-variable, or exception
+  capabilities could **not** be added. It states precisely which events are
+  active; the missing ones will never appear in the trace. This is the common
+  case on OpenJDK 21.
+- `{"ev":"gap","kind":"jni-table-running-threads","tableInstalled":...,"runningThreads":N,"enabledEvents":"...", ...}`
   — quantifies the JNI-interception coverage gap for threads already running at
-  attach time.
+  attach time. `enabledEvents` names only the process-wide events actually
+  enabled for the phase (so it does not imply enter/exit/exception when those
+  capabilities were denied).
 - `{"ev":"gap","kind":"no-core-capabilities", ...}` — emitted if neither
   native-method-bind nor method entry/exit capabilities could be enabled (the
   trace will be effectively empty).
+
+Together these records let a reader reconstruct exactly what the attach obtained.
+For example, a typical OpenJDK 21 live attach yields `native-method-bind`
+`available:true` and `method-entry` / `method-exit` / `can_access_local_variables`
+/ `exception` all `available:false` with `jvmtiError:98`, plus a
+`reduced-live-capabilities` gap — i.e. `bind` events only.
 
 If the target probes for common inspection flags, the agent continues to use
 only documented JVMTI capabilities and records "capability unavailable" where
@@ -156,10 +204,16 @@ applicable. It does **not** attempt to hide itself or patch the target's checks.
 
 - Loading the agent into a live, same-user JVM via `jcmd` or
   `com.sun.tools.attach`.
-- Full JVMTI event coverage (`bind` / `enter` / `exit` / `exception`) for work
-  that runs after attach, process-wide.
-- Per-JNI-call argument capture on the attach thread and threads started after
-  attach.
+- `NativeMethodBind` events (the `[native fn pointer -> Java method]` table) for
+  work that runs after attach, process-wide — this capability is the one that
+  reliably survives a live attach.
+- Method `enter` / `exit` / `exception` events **and** per-JNI-call argument
+  capture (on the attach thread and threads started after attach) **only when
+  the JDK grants those capabilities after attach.** On JDKs where they are
+  `OnLoad`-only (e.g. OpenJDK 21) these are **not** available on a live attach —
+  the `capability` / `reduced-live-capabilities` records will say so, and the
+  trace will hold `bind` events only. For full method-body recovery, use the
+  startup `-agentpath` path.
 
 **Unsupported / known gaps:**
 

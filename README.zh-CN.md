@@ -245,10 +245,13 @@ python -m j2c_dumper_cli.main attach --pid <pid> --i-own-this-process -o trace.j
 ```
 
 这是**预览**级诊断路径，**不是**默认路径 —— `recover` 仍走启动期 `-agentpath`
-注入（观测更完整）。进程附加只能看到附加之后发生的行为，且逐次 JNI 调用的
-参数捕获只覆盖附加后新建的线程（已在运行的线程仍会产生方法/异常事件）。
-必须显式提供 `--pid` 和 `--i-own-this-process` 确认标志，并且拒绝跨用户目标。
-支持/不支持的情况、干净停止与 trace 输出说明详见
+注入（观测更完整）。进程附加只能看到附加之后发生的行为，且能获得多少覆盖取决于
+JDK 在附加*之后*还允许申请哪些 JVMTI 能力。在不少 JDK 上（**已在 OpenJDK 21
+上实测**），活动附加只能拿到 native-method-bind，因此 trace 只有 `bind` 事件，
+方法进入/退出、局部变量、异常等事件**不会**被捕获；agent 的 `capability` /
+`gap` 记录会如实说明实际获得了什么。要完整恢复方法体请改用启动期路径。
+进程附加必须显式提供 `--pid` 和 `--i-own-this-process` 确认标志，并且拒绝跨用户
+目标。支持/不支持的情况、干净停止与 trace 输出说明详见
 [`docs/jvm-attach.md`](docs/jvm-attach.md)。
 
 ### 静态恢复（目标跑不起来时使用 —— 需要 Ghidra）
