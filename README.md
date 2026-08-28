@@ -47,8 +47,11 @@ agent the skill and the target, and let it adapt the tools to the binary.
 
 ### Dynamic path
 
-- **JVMTI agent** (`native/`, C++). Loaded via `-agentpath:`. Subscribes
-  to `NativeMethodBind`, `MethodEntry`, `MethodExit`, `Exception`,
+- **JVMTI agent** (`native/`, C++). Loaded via `-agentpath:` at startup
+  (default), or — as an opt-in preview — attached to an already-running,
+  same-user JVM via `Agent_OnAttach` (see
+  [`docs/jvm-attach.md`](docs/jvm-attach.md)). Subscribes to
+  `NativeMethodBind`, `MethodEntry`, `MethodExit`, `Exception`,
   `ExceptionCatch` JVMTI events.
 - **JNI function table swap**. On `VMInit` and every `ThreadStart`, the
   agent overwrites the `JNIEnv->functions` pointer with a copy whose
@@ -286,6 +289,24 @@ This chains:
 4. `dynamic-trace`     runs the target with the JVMTI agent → `trace.jsonl`
 5. `trace-to-bc`       lifts to `recovered/*.json`
 6. `rebuild`           emits the loader-stripped output jar
+
+### Live process attach (preview — opt-in, same-user)
+
+For a JVM you own that is **already running** and can't be restarted, you can
+attach the same JVMTI agent to the live process instead of using `-agentpath`:
+
+```bash
+python -m j2c_dumper_cli.main attach --pid <pid> --i-own-this-process -o trace.jsonl
+```
+
+This is a **preview** diagnostic path, **not** the default — `recover` still
+uses startup `-agentpath` instrumentation, which observes more. Live attach only
+sees work after attach, and per-JNI-call argument capture is limited to threads
+started after attach (already-running threads still emit method/exception
+events). It requires an explicit `--pid` and the `--i-own-this-process`
+confirmation, and refuses cross-user targets. Full details, supported vs
+unsupported cases, and clean-stop / trace-output notes:
+[`docs/jvm-attach.md`](docs/jvm-attach.md).
 
 ### Static recovery (when you can't run the jar — needs Ghidra)
 

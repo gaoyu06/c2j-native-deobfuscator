@@ -235,6 +235,22 @@ python -m j2c_dumper_cli.main recover \
 5. `trace-to-bc`       抬升到 `recovered/*.json`
 6. `rebuild`           输出 loader 已剥离的最终 JAR
 
+### 进程附加（预览 —— 可选、仅限同一用户）
+
+如果目标 JVM 是你自己的、且已经在运行、无法重启，可以把同一个 JVMTI agent
+附加到活动进程上，而不必用 `-agentpath`：
+
+```bash
+python -m j2c_dumper_cli.main attach --pid <pid> --i-own-this-process -o trace.jsonl
+```
+
+这是**预览**级诊断路径，**不是**默认路径 —— `recover` 仍走启动期 `-agentpath`
+注入（观测更完整）。进程附加只能看到附加之后发生的行为，且逐次 JNI 调用的
+参数捕获只覆盖附加后新建的线程（已在运行的线程仍会产生方法/异常事件）。
+必须显式提供 `--pid` 和 `--i-own-this-process` 确认标志，并且拒绝跨用户目标。
+支持/不支持的情况、干净停止与 trace 输出说明详见
+[`docs/jvm-attach.md`](docs/jvm-attach.md)。
+
 ### 静态恢复（目标跑不起来时使用 —— 需要 Ghidra）
 
 ```bash
