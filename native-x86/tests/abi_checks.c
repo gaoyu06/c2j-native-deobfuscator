@@ -248,6 +248,69 @@ static void check_stamp_leaves_process_id_zero(void)
     CHECK(note.header.seq == 1u, "stamp should assign the first seq");
 }
 
+/* ------------------------------------------------------------------ */
+/* 4. ABI 0.2: call-site phase reuses the former reserved slot, so a    */
+/*    record from 0.1 (phase == 0) reads as NX86_CALL_PHASE_NONE and    */
+/*    the struct size is unchanged.                                     */
+/* ------------------------------------------------------------------ */
+
+static void check_call_site_phase(void)
+{
+    nx86_event_call_site cs;
+
+    CHECK(NX86_ABI_VERSION_MINOR == 2u, "this build should be ABI minor 2");
+    /* Phase occupies the tail word where 0.1 kept `reserved`; the record
+     * size therefore did not change, so a 0.1 receiver reads the same
+     * prefix and a zero there means NONE. */
+    CHECK(sizeof(nx86_event_call_site) ==
+              offsetof(nx86_event_call_site, phase) + sizeof(uint32_t),
+          "phase should be the final field of the call-site record");
+    CHECK(NX86_CALL_PHASE_NONE == 0u,
+          "an all-zero (0.1) call-site must read as phase NONE");
+
+    memset(&cs, 0, sizeof(cs));
+    CHECK(cs.phase == NX86_CALL_PHASE_NONE,
+          "zeroed call-site should default to phase NONE");
+    cs.phase = NX86_CALL_PHASE_ENTER;
+    CHECK(cs.phase == 1u, "enter phase should be 1");
+}
+
+/* ------------------------------------------------------------------ */
+/* 5. ABI 0.2: watch-request prefix negotiation. A host reads a         */
+/*    request's fields only when the caller's struct_size covers them,  */
+/*    exactly as for every other versioned record.                      */
+/* ------------------------------------------------------------------ */
+
+static void check_watch_request_negotiation(void)
+{
+    nx86_watch_request req;
+
+    memset(&req, 0, sizeof(req));
+    req.struct_size = (uint32_t)sizeof(req);
+    req.match_kind = NX86_MATCH_PREFIX;
+    req.flags = NX86_WATCH_SYMBOL | NX86_WATCH_CALL_SITE;
+
+    CHECK(NX86_HAS_FIELD(req.struct_size, nx86_watch_request, flags),
+          "a full-size request should expose the flags field");
+    CHECK(NX86_HAS_FIELD(req.struct_size, nx86_watch_request, name),
+          "a full-size request should expose the name field");
+
+    /* A caller that only filled up to `name` (a hypothetical older minor
+     * that predates `flags`) must be detected as not carrying flags. */
+    {
+        uint32_t short_size = (uint32_t)(offsetof(nx86_watch_request, flags));
+        CHECK(!NX86_HAS_FIELD(short_size, nx86_watch_request, flags),
+              "a request truncated before flags must not expose flags");
+        CHECK(NX86_HAS_FIELD(short_size, nx86_watch_request, name),
+              "a request truncated before flags still exposes name");
+    }
+
+    CHECK(NX86_MATCH_EXACT != NX86_MATCH_PREFIX,
+          "match kinds must be distinct");
+    CHECK((NX86_WATCH_SYMBOL & NX86_WATCH_CALL_SITE) == 0u,
+          "watch flag bits must not overlap");
+}
+
 int main(void)
 {
     g_failures = 0;
@@ -257,6 +320,8 @@ int main(void)
     check_sample_plugin_respects_capacity();
     check_lifecycle_gate();
     check_stamp_leaves_process_id_zero();
+    check_call_site_phase();
+    check_watch_request_negotiation();
 
     if (g_failures != 0) {
         printf("abi-checks: FAIL (%d checks failed)\n", g_failures);

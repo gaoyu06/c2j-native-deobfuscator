@@ -26,14 +26,38 @@ add_executable(nx86_host
     src/host/main.c
     src/host/event_bus.c
     src/host/platform.c
+    src/host/observe_linux.c
+    src/host/observe_stub.c
 )
 target_include_directories(nx86_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/host)
 target_link_libraries(nx86_host PRIVATE nativex86_abi ${CMAKE_DL_LIBS})
 target_compile_options(nx86_host PRIVATE ${NX86_WARNINGS})
 
-add_library(nx86_plugin_hello MODULE plugins/hello/hello.c)
-target_link_libraries(nx86_plugin_hello PRIVATE nativex86_abi)
-target_compile_options(nx86_plugin_hello PRIVATE ${NX86_WARNINGS})
+# Observation plugins. Each exports exactly one symbol; all knowledge of
+# a library's export names lives here, never in the host.
+function(nx86_add_plugin name source)
+    add_library(${name} MODULE ${source})
+    target_link_libraries(${name} PRIVATE nativex86_abi)
+    target_compile_options(${name} PRIVATE ${NX86_WARNINGS})
+endfunction()
+
+nx86_add_plugin(nx86_plugin_hello          plugins/hello/hello.c)
+nx86_add_plugin(nx86_plugin_crypto_openssl plugins/crypto-openssl/crypto_openssl.c)
+nx86_add_plugin(nx86_plugin_jni_natives    plugins/jni-natives/jni_natives.c)
+nx86_add_plugin(nx86_plugin_crypto_cng     plugins/crypto-cng/crypto_cng.c)
+
+# Smoke-test fixture: a shared library whose exports are named like
+# well-known crypto / JNI entries, and a tiny process that calls them in
+# a loop. No real OpenSSL, no JVM, no jni.h. Exports must stay visible
+# despite the project-wide hidden visibility preset.
+add_library(nx86_fixture_exports SHARED tests/fixtures/fake_exports.c)
+set_target_properties(nx86_fixture_exports PROPERTIES
+    C_VISIBILITY_PRESET default)
+target_compile_options(nx86_fixture_exports PRIVATE ${NX86_WARNINGS})
+
+add_executable(nx86_fixture_target tests/fixtures/fixture_target.c)
+target_link_libraries(nx86_fixture_target PRIVATE nx86_fixture_exports)
+target_compile_options(nx86_fixture_target PRIVATE ${NX86_WARNINGS})
 
 # ABI contract checks: prefix negotiation and the lifecycle delivery
 # window. Compiles the host event bus and the sample plugin directly so
