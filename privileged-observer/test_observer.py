@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -66,7 +67,7 @@ class ObserverTest(unittest.TestCase):
             "--pid",
             str(os.getpid()),
             "--plugin",
-            str(self.plugin_path),
+            str(self.build_dir / "must-not-load.so"),
             "--i-own-this-process",
         )
 
@@ -168,6 +169,15 @@ class ObserverTest(unittest.TestCase):
 
         self.assertEqual(plugin.name, "linux-proc-maps")
         self.assertEqual(plugin.capability_names, ("maps-read",))
+
+    def test_linux_plugin_refuses_unsupported_host_abi(self) -> None:
+        library = ctypes.CDLL(str(self.plugin_path))
+        query = library.po_plugin_query
+        query.argtypes = [ctypes.c_uint32]
+        query.restype = ctypes.c_void_p
+
+        self.assertIsNotNone(query(observer.ABI_VERSION))
+        self.assertIsNone(query(observer.ABI_VERSION + 1))
 
     def test_reads_self_maps_as_metadata_only(self) -> None:
         result = self.run_host(
