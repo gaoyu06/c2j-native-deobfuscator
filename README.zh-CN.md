@@ -27,10 +27,13 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 
 ```bash
 git clone <本仓库> && cd c2j-native-deobfuscator
-bash scripts/setup.sh                     # 构建 JVM + Python + native agent
-python -m j2c_dumper_cli doctor           # 确认工具链就绪
-python -m j2c_dumper_cli recover in.jar -o out.jar --run-cmd "java -jar in.jar"
+bash scripts/setup.sh                      # 构建 JVM + Python + native agent
+python3 -m j2c_dumper_cli doctor           # 确认工具链就绪
+python3 -m j2c_dumper_cli recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 ```
+
+> POSIX 示例使用 `python3`（最小化系统自带、也是 `scripts/setup.sh` 选用的解释器）。
+> 在 Windows 上请改用 `python`。
 
 详见下方的 [Quick start](#quick-start) 以及
 [10 分钟上手指南](docs/getting-started.zh-CN.md)
@@ -217,7 +220,9 @@ python -m j2c_dumper_cli recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 
 ## Quick start
 
-前置条件：**JDK 21+**（并设置 `JAVA_HOME`）与 **Python 3.11+**。
+前置条件：**JDK 17+**（并设置 `JAVA_HOME`）与 **Python 3.11+**。在 Windows 上
+构建 native agent 还需要 **Git Bash**（随 Git for Windows 提供）；WSL 会构建出
+Linux 的 `.so`，而不是这里 JVM 加载的 Windows `.dll`。
 第一次上手？请按
 [10 分钟上手指南](docs/getting-started.zh-CN.md)（[English](docs/getting-started.md)）操作。
 
@@ -238,12 +243,14 @@ bash scripts/setup.sh            # Linux / macOS
 ### 2. 检查工具链
 
 ```bash
-python -m j2c_dumper_cli doctor
+python3 -m j2c_dumper_cli doctor
 ```
 
-`doctor` 会报告 Java/JDK、Python、已构建的 JVM 模块与 native agent，以及可选
-工具（Ghidra、unicorn、zig），并为每个缺失项打印下一步命令。默认路径未就绪
-时它会以非零码退出。
+`doctor` 会报告 Java/JDK、Python、Python 恢复阶段是否可 import（`capstone` +
+`lief`）、已构建的 JVM 模块与本机匹配的 native agent，以及可选工具（Ghidra、
+unicorn、zig），并为每个缺失项打印下一步命令。它只校验工具版本与产物是否存在，
+不会启动 JVM 模块或加载 agent。只有当某个必需项**缺失**时它才以非零码退出；
+`WARN`（例如 `JAVA_HOME` 未设）只是提醒，不是阻塞。
 
 ### 3. 恢复（默认路径 —— 动态）
 
@@ -251,7 +258,7 @@ python -m j2c_dumper_cli doctor
 观察 JNI 调用流，再抬升回字节码：
 
 ```bash
-python -m j2c_dumper_cli recover \
+python3 -m j2c_dumper_cli recover \
     path/to/obfuscated.jar \
     -o path/to/clean.jar \
     --run-cmd "java -jar path/to/obfuscated.jar"
@@ -266,8 +273,12 @@ python -m j2c_dumper_cli recover \
 5. `trace-to-bc`       抬升到 `recovered/*.json`
 6. `rebuild`           输出 loader 已剥离的最终 JAR
 
-> `python -m j2c_dumper_cli ...` 是更友好的入口；
-> `python -m j2c_dumper_cli.main ...` 仍然可用。
+输出包含的是**针对本次运行中观察到的行为、尽力恢复出的方法体**。动态 trace 只
+覆盖实际执行到的路径，因此未观察到的方法可能仍是桩或只有部分方法体；请检查结果，
+难度较大的目标要预期需要人工补全（见上文的"人工过一遍"说明）。
+
+> `python3 -m j2c_dumper_cli ...` 是更友好的入口；
+> `python3 -m j2c_dumper_cli.main ...` 仍然可用。
 
 ### 兜底：模拟恢复（无需运行、无需 Ghidra）
 
@@ -279,13 +290,13 @@ python -m j2c_dumper_cli recover \
 pip install unicorn
 
 # 列出 native 方法（入口自动发现）
-python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+python3 py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 
 # dump 某个函数解密后的字符串常量（字母表、密文、提示语）
-python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+python3 py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
 
 # 把 native 方法当纯函数调用（oracle）
-python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+python3 py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
     --arg-bytes "input" --static "v=@alphabet.txt"
 ```
 
@@ -295,7 +306,7 @@ python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
 ### 分阶段执行
 
 每个阶段都有独立的子命令，详见
-`python -m j2c_dumper_cli --help`。
+`python3 -m j2c_dumper_cli --help`。
 
 ---
 
@@ -306,9 +317,9 @@ python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
 
 ```bash
 # 1. 解析 jar + 内省二进制（不需要 --run-cmd）
-python -m j2c_dumper_cli parse-jar      in.jar      -o classes.json
-python -m j2c_dumper_cli inspect-binary natives.bin -o binary.json
-python -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.json
+python3 -m j2c_dumper_cli parse-jar      in.jar      -o classes.json
+python3 -m j2c_dumper_cli inspect-binary natives.bin -o binary.json
+python3 -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.json
 
 # 2. 用 Ghidra Headless 跑 native blob
 <GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
@@ -317,8 +328,8 @@ python -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.jso
     -postScript DumpFromManifest.java manifest.json ghidra-dump.json
 
 # 3. pseudo-C 抬升到字节码 + 重建 JAR
-python -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
-python -m j2c_dumper_cli rebuild --input in.jar --recovered recovered/ \
+python3 -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
+python3 -m j2c_dumper_cli rebuild --input in.jar --recovered recovered/ \
     --manifest manifest.json -o out.jar
 ```
 
@@ -340,10 +351,10 @@ hint、ExceptionCheck-guard 跳过、符号表跟踪、查表解析等等）。�
 对当前二进制误判，就把它关掉：
 
 ```bash
-python -m ast_matcher.cli ghidra-dump.json -o recovered/ \
+python3 -m ast_matcher.cli ghidra-dump.json -o recovered/ \
     --disable use_throw_reason_invoke_hints \
     --disable skip_native_exception_guards
-python -m ast_matcher.cli --list-flags
+python3 -m ast_matcher.cli --list-flags
 ```
 
 ---

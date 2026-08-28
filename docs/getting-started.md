@@ -13,12 +13,21 @@ environment. If you can't run it, jump to
 
 ## 0. Prerequisites
 
-- **JDK 21+** with `JAVA_HOME` pointing at it (`java -version` should print 21+).
+- **JDK 17+** with `JAVA_HOME` pointing at it (`java -version` should print 17+).
 - **Python 3.11+**.
 - For the native agent build only: **[zig](https://ziglang.org/) 0.16.x**.
   Optional; skip it and use the emulation fallback if you can't install it.
+- On **Windows**, the native agent build additionally needs **Git Bash** (from
+  [Git for Windows](https://git-scm.com/download/win)) so `native/build.sh` can
+  run and produce the Windows DLL. WSL is *not* an equivalent: it builds a Linux
+  `.so`, not the Windows `.dll` the JVM loads here.
 
-Everything else (`uv`, ASM, capstone, …) is pulled in by the setup script.
+Everything else (`uv`, ASM, `capstone`, `lief`, …) is pulled in by the setup
+script. The default recover path imports `capstone`, so it is a required
+dependency of `binary-introspect`, not optional.
+
+> The commands below use `python3` (the interpreter a minimal POSIX system
+> ships and that `scripts/setup.sh` selects). On Windows, use `python`.
 
 ---
 
@@ -40,7 +49,7 @@ bash scripts/setup.sh            # Linux / macOS
 ## 2. Check the toolchain — ~10 s
 
 ```bash
-python -m j2c_dumper_cli doctor
+python3 -m j2c_dumper_cli doctor
 ```
 
 It prints a table and, for anything missing, the exact next command. Example of
@@ -48,18 +57,24 @@ a not-yet-ready machine:
 
 ```
 JVM modules (installDist)   MISSING   not built: jar-parser, ...
-Native JVMTI agent          MISSING   no j2c_agent.(so|dll|dylib) under native/build/lib
+Native JVMTI agent          MISSING   no j2c_agent.so under native/build/lib
 ...
 Not ready. Missing: ... Run scripts/setup.sh (or scripts/setup.ps1) to fix.
 ```
 
-`doctor` exits non-zero until the default path is ready, so you can gate a
-script on it. The optional tools (Ghidra, unicorn, zig) never block.
+`doctor` checks tool versions and that the build artifacts the default path
+needs are present (it does not launch the JVM modules or load the agent). It
+exits non-zero only when a required piece is *missing*, so you can gate a script
+on it. A `WARN` (for example, Java is new enough but `JAVA_HOME` is unset) is a
+caveat, not a failure, and does not flip the ready bit. The optional tools
+(Ghidra, unicorn, zig) never block. On this host `doctor` only accepts the agent
+name it can actually load (`j2c_agent.so` on Linux, `.dylib` on macOS, `.dll` on
+Windows); a leftover build for another OS is reported as missing.
 
 ## 3. Recover — ~1–2 min
 
 ```bash
-python -m j2c_dumper_cli recover \
+python3 -m j2c_dumper_cli recover \
     path/to/obfuscated.jar \
     -o path/to/clean.jar \
     --run-cmd "java -jar path/to/obfuscated.jar"
@@ -69,8 +84,12 @@ The `--run-cmd` is a command that actually *runs* the obfuscated jar so the
 JVMTI agent can observe it. Exercise the classes you care about (a CLI that just
 prints help won't trace the interesting code paths).
 
-When it finishes you get `path/to/clean.jar` whose native methods now have real
-bytecode bodies and whose loader / native-blob entries are stripped.
+When it finishes you get `path/to/clean.jar` whose native-method stubs are
+replaced with *best-effort recovered bodies for the behavior that was observed*,
+and whose loader / native-blob entries are stripped. Dynamic tracing only covers
+the paths your `--run-cmd` actually executed; unobserved methods may keep a stub
+or a partial body, so inspect the output and expect some manual completion on
+hard targets.
 
 ---
 
@@ -98,20 +117,22 @@ needs a human pass — see [`manual-restoration.md`](manual-restoration.md).
 
 **`recover cannot start: required build artifacts are missing`**
 The JVM modules or native agent aren't built. Run `scripts/setup.sh` (or
-`scripts/setup.ps1`) and then `python -m j2c_dumper_cli doctor`.
+`scripts/setup.ps1`) and then `python3 -m j2c_dumper_cli doctor`.
 
-**`doctor` says `Java / JDK 21+  WARN` — JAVA_HOME is not set**
+**`doctor` says `Java / JDK 17+  WARN` — JAVA_HOME is not set**
 Java is new enough but `JAVA_HOME` is unset; the native agent build needs it.
-Set `JAVA_HOME` to your JDK directory and re-run `scripts/setup.sh`.
+This is a warning, not a blocker: if the agent is already built you can still
+run the dynamic path. Set `JAVA_HOME` to your JDK directory and re-run
+`scripts/setup.sh` when you next need to build the agent.
 
 **`doctor` says `Native JVMTI agent  MISSING` and setup skipped it**
-`zig` (or the JDK headers) wasn't found. Install
-[zig](https://ziglang.org/) 0.16.x (or set `ZIG` to its path), set `JAVA_HOME`,
-then `bash scripts/setup.sh --force`. If you can't install `zig`, use the
-emulation fallback below.
+`zig` (or the JDK headers) wasn't found — or a leftover agent for a different OS
+is present. Install [zig](https://ziglang.org/) 0.16.x (or set `ZIG` to its
+path), set `JAVA_HOME`, then `bash scripts/setup.sh --force`. If you can't
+install `zig`, use the emulation fallback below.
 
 **The Gradle build can't find a matching Java toolchain**
-Install a JDK 21+ and set `JAVA_HOME`, then re-run. `doctor` shows which Java it
+Install a JDK 17+ and set `JAVA_HOME`, then re-run. `doctor` shows which Java it
 found.
 
 **`recover` ran but `trace.jsonl` has no `enter` events**
@@ -129,7 +150,7 @@ decrypted constants, and call methods as pure-function oracles:
 
 ```bash
 pip install unicorn
-python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+python3 py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 ```
 
 Full walkthrough: [`emulation-recovery.md`](emulation-recovery.md).

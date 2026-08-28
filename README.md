@@ -31,10 +31,13 @@ You can run the default recovery path by hand — no coding agent required:
 
 ```bash
 git clone <this repo> && cd c2j-native-deobfuscator
-bash scripts/setup.sh                     # build JVM + Python + native agent
-python -m j2c_dumper_cli doctor           # confirm the toolchain is ready
-python -m j2c_dumper_cli recover in.jar -o out.jar --run-cmd "java -jar in.jar"
+bash scripts/setup.sh                      # build JVM + Python + native agent
+python3 -m j2c_dumper_cli doctor           # confirm the toolchain is ready
+python3 -m j2c_dumper_cli recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 ```
+
+> POSIX examples use `python3` (what a minimal system ships and what
+> `scripts/setup.sh` selects). On Windows use `python`.
 
 See [Quick start](#quick-start) below and the
 [10-minute getting-started guide](docs/getting-started.md)
@@ -265,7 +268,9 @@ render them.
 
 ## Quick start
 
-Prerequisites: **JDK 21+** (with `JAVA_HOME` set) and **Python 3.11+**.
+Prerequisites: **JDK 17+** (with `JAVA_HOME` set) and **Python 3.11+**. On
+Windows, building the native agent also needs **Git Bash** (from Git for
+Windows); WSL builds a Linux `.so`, not the Windows `.dll` the JVM loads here.
 New here? Follow the [10-minute getting-started guide](docs/getting-started.md)
 ([中文](docs/getting-started.zh-CN.md)).
 
@@ -287,12 +292,16 @@ either is missing (only the dynamic path needs it).
 ### 2. Check your toolchain
 
 ```bash
-python -m j2c_dumper_cli doctor
+python3 -m j2c_dumper_cli doctor
 ```
 
-`doctor` reports Java/JDK, Python, the built JVM modules and native agent, and
-the optional tools (Ghidra, unicorn, zig), and prints the next command for
-anything missing. It exits non-zero until the default path is ready.
+`doctor` reports Java/JDK, Python, the importability of the Python recover
+stage (`capstone` + `lief`), the built JVM modules and the host-matching native
+agent, plus the optional tools (Ghidra, unicorn, zig), and prints the next
+command for anything missing. It verifies tool versions and artifact presence —
+it does not launch the JVM modules or load the agent. It exits non-zero only
+when a required piece is *missing*; a `WARN` (e.g. `JAVA_HOME` unset) is a
+caveat, not a blocker.
 
 ### 3. Recover (default path — dynamic)
 
@@ -301,7 +310,7 @@ JVMTI agent to a live run, observes the JNI call stream, and lifts it back to
 bytecode:
 
 ```bash
-python -m j2c_dumper_cli recover \
+python3 -m j2c_dumper_cli recover \
     path/to/obfuscated.jar \
     -o path/to/clean.jar \
     --run-cmd "java -jar path/to/obfuscated.jar"
@@ -316,8 +325,13 @@ This chains:
 5. `trace-to-bc`       lifts to `recovered/*.json`
 6. `rebuild`           emits the loader-stripped output jar
 
-> `python -m j2c_dumper_cli ...` is the friendly entry point;
-> `python -m j2c_dumper_cli.main ...` still works too.
+The output contains *best-effort recovered bodies for the behavior observed
+during the run*. Dynamic tracing only covers executed paths, so unobserved
+methods may keep a stub or a partial body; inspect the result and expect manual
+completion on hard targets (see the human-pass note above).
+
+> `python3 -m j2c_dumper_cli ...` is the friendly entry point;
+> `python3 -m j2c_dumper_cli.main ...` still works too.
 
 ### Fallback: emulation (no live run, no Ghidra)
 
@@ -329,13 +343,13 @@ a CPU emulator with a mock JNI; no JVM and no Ghidra required:
 pip install unicorn
 
 # list native methods (entry points auto-discovered)
-python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+python3 py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 
 # dump a function's decrypted string constants (alphabet, secret, messages)
-python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+python3 py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
 
 # call a native method as a pure function (oracle)
-python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+python3 py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
     --arg-bytes "input" --static "v=@alphabet.txt"
 ```
 
@@ -345,7 +359,7 @@ command reference + verified matrix: [`py/native_emulate/README.md`](py/native_e
 ### Stage-by-stage
 
 Every stage has its own subcommand; see
-`python -m j2c_dumper_cli --help` for the full list.
+`python3 -m j2c_dumper_cli --help` for the full list.
 
 ---
 
@@ -357,9 +371,9 @@ requires **Ghidra 11.x**:
 
 ```bash
 # 1. Parse jar + introspect binary (no --run-cmd needed)
-python -m j2c_dumper_cli parse-jar      in.jar      -o classes.json
-python -m j2c_dumper_cli inspect-binary natives.bin -o binary.json
-python -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.json
+python3 -m j2c_dumper_cli parse-jar      in.jar      -o classes.json
+python3 -m j2c_dumper_cli inspect-binary natives.bin -o binary.json
+python3 -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.json
 
 # 2. Run Ghidra headless against the native blob
 <GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
@@ -368,8 +382,8 @@ python -m j2c_dumper_cli merge-manifest classes.json binary.json -o manifest.jso
     -postScript DumpFromManifest.java manifest.json ghidra-dump.json
 
 # 3. Lift the pseudo-C to bytecode + rebuild
-python -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
-python -m j2c_dumper_cli rebuild --input in.jar --recovered recovered/ \
+python3 -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
+python3 -m j2c_dumper_cli rebuild --input in.jar --recovered recovered/ \
     --manifest manifest.json -o out.jar
 ```
 
@@ -392,10 +406,10 @@ symbol-table tracking, lookup-table resolution, etc.). Disable a flag
 when it misbehaves on a specific binary:
 
 ```bash
-python -m ast_matcher.cli ghidra-dump.json -o recovered/ \
+python3 -m ast_matcher.cli ghidra-dump.json -o recovered/ \
     --disable use_throw_reason_invoke_hints \
     --disable skip_native_exception_guards
-python -m ast_matcher.cli --list-flags
+python3 -m ast_matcher.cli --list-flags
 ```
 
 ---
