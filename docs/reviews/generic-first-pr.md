@@ -183,3 +183,142 @@ Yes, and this is the strongest part of the PR. Verified end-to-end:
   cases documented above.
 - Not run: the Gradle/JVM build (this PR changes only Python, docs, and the
   schema) and the Windows PE loading path (no PE toolchain available here).
+
+---
+
+# Re-review — after must-fix commits
+
+- Branch re-reviewed: `cursor/generic-first-discovery-ca12` @ `2638079` (base
+  `main` @ `3843ec1`).
+- New commits since the first review: `f686fd9` (real-ELF discovery test +
+  fixtures), `488a19d` (lifter derives profile from the analysis artifact),
+  `2638079` (skip the positional fallback for ambiguous named tables).
+- Scope: verify the two must-fix items from the first review and check for new
+  regressions. No feature work was needed — both must-fixes are satisfied.
+- Delivery note: the PR review write path is not available from this
+  environment (read-only access to the upstream repository), so this re-review
+  is recorded here per the review instructions.
+
+## Ship verdict (re-review)
+
+**Ship as a draft / development merge.** Both original must-fixes are resolved
+and the full committed Python suite passes (21 tests, up from 14). The two
+items that previously kept this off the default-release path are cleared. What
+remains are the should-fix / residual items already listed in the first review;
+none of them is a must-fix, so they do not block a draft/dev merge. One of them
+(unnamed count-only positional mis-binding) is worth closing before this becomes
+the *default* release, because the generic path makes stack-built tables the
+common case — see below.
+
+## Must-fix 1 — prove the loading path with a committed end-to-end test: SATISFIED
+
+- A real fixture is now checked into git: `libjni_registrar.so` (13,832-byte
+  ELF 64-bit SysV shared object, x86-64, not stripped) alongside its source
+  `jni_registrar.c` for reproducibility. `git ls-files` confirms both are
+  tracked.
+- `test_introspect_real_elf_resolves_static_jni_table_relocations` calls the
+  real `binary_introspect.core.introspect()` on that `.so` — i.e. `lief.parse`,
+  format/arch detection, section reading, ABI detection, and relocation
+  resolution. It is not a mocked parser and not a synthetic byte buffer; the
+  earlier parametrized tests build fake instruction bytes, but this one loads
+  the committed binary.
+- The relocation path is genuinely exercised, not incidentally satisfied. In
+  the on-disk image the function-pointer slots of the static `JNINativeMethod[]`
+  table (at `0x3ee0`) read as `0x0` (unrelocated), yet `introspect()` recovers
+  `fnAddrs = ["0x1000", "0x1010"]` with names/descriptors `alpha ()V` /
+  `beta (I)I`. The addresses can only come from applying the ELF relocations,
+  so a broken relocation path would fail this assertion rather than silently
+  pass. Reported `abi = amd64-sysv`, `arch = x86_64`, `analysis = {profile:
+  generic, methodDiscovery: jni-spec}`.
+- Residual (unchanged from first review): the PE (`.dll`) and Mach-O loading
+  paths still have no committed fixture/test. The ELF loading path — the one the
+  "generic-first" claim most depends on — is now proven in CI.
+
+## Must-fix 2 — resolve the lifter default regression: SATISFIED
+
+- The chosen fix is profile derivation, not doc-only. `manifest_merge.merge()`
+  now carries `analysis` (including `profile`) from `binary.json` into
+  `manifest.json`; the lifter driver selects
+  `get_profile(profile_name or manifest.analysis.profile or "generic")`. Order
+  is correct: an explicit `--profile` wins, then the recorded artifact profile,
+  then conservative `generic`.
+- End-to-end the documented flows now recover the pre-PR strength without the
+  user re-typing the variant: `recover` and `inspect-binary` auto-detect the
+  variant (`_detect_native_obfuscator` scores 0.9 vs generic's 0.01), write it
+  to `binary.json.analysis.profile`, `merge-manifest` propagates it, and
+  `static-reverse` / `ast_matcher.cli` (invoked with `--manifest` and no
+  `--profile`) derive it. `static-lite`'s own example deliberately passes
+  `--profile generic` because it is the generic-path example; a variant target
+  passed to `static-lite` propagates that variant the same way.
+- `generic` remains conservative. It has `invoke_error_re = None`,
+  `field_error_re = None`, empty `skip_if_patterns`, and
+  `enable_exception_guard_heuristics` / `rewrite_ghidra_vtable_calls` /
+  `extract_cache_table` all `False`. The throw-reason parsers short-circuit to
+  `[]` when the regex is `None` (`throw_reason.py`), so throw-reason recovery is
+  genuinely off under true `generic`. Deriving `native_obfuscator` re-enables
+  exactly those knobs, matching `main`.
+- CLI/help text and both READMEs plus `docs/generic-recovery.md` now describe
+  the derivation and the precedence, so following the docs verbatim no longer
+  yields weaker-than-`main` lifting for a `native_obfuscator` target.
+- No dangling reference left behind: `detect_profile` was dropped from the
+  lifter driver's imports and is not referenced anywhere in `ast_matcher`.
+
+## Ambiguity guard (`2638079`)
+
+- **Named ambiguous tables: fixed.** When a named table's `(name, desc)`
+  signature matches more than one class, the exact matcher records the site in
+  `ambiguous_named_sites` and the positional count fallback now skips it.
+  Verified directly: two 1-native-method classes with the same signature plus a
+  1-address named table leave both classes unbound (`boundTo = None`, no
+  `fnAddr` assigned) instead of the fallback arbitrarily binding the first.
+  `test_ambiguous_named_table_is_not_rebound_by_position` covers this.
+- **Unnamed count-only collisions: still mis-bind (residual, not a must-fix).**
+  A table that carries only `fnAddrs` and no method names still binds by count
+  to the *first* class with a matching native-method count. Verified: two
+  1-native-method classes with a single count-only 1-address table bind the
+  first class and leave the second null. This is the same should-fix flagged in
+  the first review; the new commit intentionally scopes itself to the *named*
+  ambiguity. It is the item most worth closing before a default release, since
+  generic makes stack/count-only tables common — but it was never a must-fix.
+
+## Tests run (this re-review)
+
+- Installed the workspace's declared deps (`lief` 1.0.0, `capstone` 5.0.7,
+  `tree-sitter`/`tree-sitter-c`, `click`) and the three editable packages, then
+  ran the full committed suite from `py/` with the repo's `pyproject.toml`
+  config: **21 passed** (was 14 at first review — +7 from the three new
+  commits). Suites: `binary_introspect/tests`, `manifest_merge/tests`,
+  `ast_matcher/tests`.
+- Extra manual probes (outside the suite): dumped the raw on-disk table bytes to
+  confirm relocation dependence; exercised `merge()` for the named-ambiguous and
+  unnamed count-only cases; validated old- and new-shape `manifest.json` against
+  the updated `schemas/manifest.schema.json` with `jsonschema` (both valid — the
+  schema has no `additionalProperties: false`, and `analysis` is now declared).
+
+## No new regressions found
+
+- `f686fd9` adds only tests and fixtures — no production code touched.
+- `488a19d` is additive: `manifest.json` gains an `analysis` object (defaults to
+  `{}` when there is no binary report), the schema declares it, and the lifter
+  derivation only changes behavior when `--profile` is omitted *and* the
+  artifact records a profile. Old-shape manifests still validate and still fall
+  back to `generic`.
+- `2638079` only narrows the positional fallback (skips ambiguous named sites);
+  the existing single-candidate named-binding and count-binding tests still
+  pass.
+
+## Leftover risks (carried over; none are must-fix)
+
+- Unnamed count-only positional binding can still silently mis-assign a stack
+  table to the wrong class when multiple classes share a native-method count.
+- PE (`.dll`) and Mach-O loading paths remain unproven by committed tests; only
+  the ELF path has a real fixture.
+- Section-header-stripped ELF / unsupported arch still yields a silent empty
+  registry (no PT_LOAD segment fallback, no diagnostic).
+- Encrypted / runtime-decrypted method tables unreachable by emulation still
+  recover nothing under generic (acknowledged in docs).
+
+## Re-review-fix commits
+
+None. Both must-fixes were already satisfied by `f686fd9`, `488a19d`, and
+`2638079`; no additional code changes were required on this branch.
