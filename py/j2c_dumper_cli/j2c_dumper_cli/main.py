@@ -15,6 +15,14 @@ from typing import Optional
 import typer
 from rich.console import Console
 
+from .attach_support import (
+    CONFIRM_FLAG,
+    build_agent_options,
+    current_uid,
+    read_proc_info,
+    validate_attach_target,
+)
+
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
@@ -69,6 +77,89 @@ def run(cmd: list[str | Path], **kwargs) -> subprocess.CompletedProcess:
     if res.returncode != 0:
         raise typer.Exit(code=res.returncode)
     return res
+
+
+# ------------------------------------------------------------------
+# Live process attach (opt-in preview) — mechanism helpers
+# ------------------------------------------------------------------
+
+# Minimal helper using the documented JDK attach API (com.sun.tools.attach).
+# Compiled on demand so the preview path doesn't need its own Gradle module.
+_ATTACH_HELPER_SOURCE = """\
+import com.sun.tools.attach.VirtualMachine;
+
+public class J2cAttach {
+    public static void main(String[] args) throws Exception {
+        String pid = args[0];
+        String path = args[1];
+        String opts = args.length > 2 ? args[2] : "";
+        VirtualMachine vm = VirtualMachine.attach(pid);
+        try {
+            vm.loadAgentPath(path, opts.isEmpty() ? null : opts);
+        } finally {
+            vm.detach();
+        }
+        System.out.println("j2c-attach: loaded " + path + " into pid " + pid);
+    }
+}
+"""
+
+
+def _jdk_tool(name: str) -> str:
+    """Locate a JDK command-line tool (java / javac / jcmd)."""
+    exe = f"{name}.exe" if os.name == "nt" else name
+    java_home = os.environ.get("JAVA_HOME") or os.environ.get("JDK_HOME")
+    if java_home:
+        candidate = Path(java_home) / "bin" / exe
+        if candidate.exists():
+            return str(candidate)
+    found = shutil.which(name)
+    if found:
+        return found
+    raise FileNotFoundError(
+        f"could not find '{name}'. Set JAVA_HOME or put the JDK bin/ on PATH."
+    )
+
+
+def _attach_via_jcmd(pid: int, agent_path: Path, opts: str) -> None:
+    """Attach via `jcmd <pid> JVMTI.agent_load` (documented diagnostic command,
+    routed through the same attach mechanism, invokes Agent_OnAttach)."""
+    jcmd = _jdk_tool("jcmd")
+    run([jcmd, str(pid), "JVMTI.agent_load", str(agent_path), opts])
+
+
+def _attach_via_vm(pid: int, agent_path: Path, opts: str) -> None:
+    """Attach via com.sun.tools.attach.VirtualMachine using a compiled helper."""
+    javac = _jdk_tool("javac")
+    java = _jdk_tool("java")
+    helper_dir = Path(tempfile.mkdtemp(prefix="j2c-attach-"))
+    src = helper_dir / "J2cAttach.java"
+    src.write_text(_ATTACH_HELPER_SOURCE)
+    run([javac, "-d", str(helper_dir), str(src)])
+    run([java, "-cp", str(helper_dir), "J2cAttach", str(pid), str(agent_path), opts])
+
+
+def _do_attach(pid: int, agent_path: Path, opts: str, mechanism: str) -> None:
+    mechanism = (mechanism or "auto").lower()
+    if mechanism == "jcmd":
+        _attach_via_jcmd(pid, agent_path, opts)
+        return
+    if mechanism == "vm":
+        _attach_via_vm(pid, agent_path, opts)
+        return
+    if mechanism != "auto":
+        raise typer.BadParameter(
+            f"unknown --mechanism {mechanism!r}; choose auto | jcmd | vm"
+        )
+    # auto: prefer jcmd (no compile step); fall back to the VirtualMachine helper.
+    try:
+        _attach_via_jcmd(pid, agent_path, opts)
+    except (FileNotFoundError, typer.Exit) as exc:
+        console.log(
+            f"[yellow]jcmd attach unavailable ({exc!r}); "
+            "falling back to com.sun.tools.attach[/]"
+        )
+        _attach_via_vm(pid, agent_path, opts)
 
 
 # ------------------------------------------------------------------
@@ -280,6 +371,93 @@ def recover(
     console.rule("[6/6] rebuild")
     _run_rebuild(jar, recovered_dir, output, manifest_json)
     console.print(f"[bold green]done:[/] {output}")
+
+
+@app.command("attach")
+def cli_attach(
+    pid: int = typer.Option(
+        ..., "--pid",
+        help="PID of the already-running, same-user JVM to attach to (required).",
+    ),
+    output: Path = typer.Option(
+        Path("trace.jsonl"), "-o", "--output",
+        help="Where the agent writes the JSONL trace.",
+    ),
+    i_own_this_process: bool = typer.Option(
+        False, "--i-own-this-process",
+        help="Required confirmation that you own or may inspect this JVM "
+             "(authorized, same-user use only).",
+    ),
+    agent: Optional[Path] = typer.Option(
+        None, "--agent",
+        help="Path to the built JVMTI agent (default: native/build/lib/j2c_agent.*).",
+    ),
+    log_all: bool = typer.Option(
+        False, "--log-all",
+        help="Log JNI calls even outside user native frames.",
+    ),
+    max_frame_events: Optional[int] = typer.Option(
+        None, "--max-frame-events",
+        help="Cap JNI events per native frame (0 = unlimited).",
+    ),
+    mechanism: str = typer.Option(
+        "auto", "--mechanism",
+        help="Attach mechanism: auto | jcmd | vm (com.sun.tools.attach).",
+    ),
+):
+    """(preview) Attach the JVMTI agent to an already-running JVM you own.
+
+    Opt-in diagnostic path — NOT the default recover flow. The default,
+    highest-fidelity path is still startup instrumentation via -agentpath
+    (see `recover` / `dynamic-trace`). Live attach only observes work that
+    happens after attach, and per-JNI-call argument capture is limited to
+    threads started after attach; already-running threads still emit
+    bind/enter/exit/exception events. See docs/jvm-attach.md.
+    """
+    # 1. Refuse before touching the target unless ownership is confirmed.
+    if not i_own_this_process:
+        console.print(
+            f"[red]refusing to attach without {CONFIRM_FLAG}.[/]\n"
+            "Live process attach is opt-in and for same-user, authorized use "
+            f"only. Re-run with {CONFIRM_FLAG} to confirm you own or may "
+            "inspect this JVM."
+        )
+        raise typer.Exit(code=2)
+
+    # 2. Best-effort same-user / looks-like-Java validation.
+    proc = read_proc_info(pid)
+    result = validate_attach_target(pid, proc, current_uid())
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {warning}")
+    if not result.ok:
+        for problem in result.problems:
+            console.print(f"[red]error:[/] {problem}")
+        raise typer.Exit(code=2)
+
+    # 3. Resolve the agent library.
+    if agent is not None:
+        agent_path = agent
+        if not agent_path.exists():
+            console.print(f"[red]error:[/] agent not found: {agent_path}")
+            raise typer.Exit(code=2)
+    else:
+        try:
+            agent_path = native_lib()
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/] {exc}")
+            raise typer.Exit(code=2)
+
+    opts = build_agent_options(str(output), log_all, max_frame_events)
+    console.print(
+        f"[cyan]attaching[/] agent={agent_path} pid={pid} "
+        f"(comm={proc.comm or '?'}) mechanism={mechanism}"
+    )
+    _do_attach(pid, agent_path, opts, mechanism)
+    console.print(
+        f"[bold green]attached (preview).[/] trace -> {output}\n"
+        "Clean stop: terminate the target JVM normally; the agent flushes and "
+        "closes the trace on VM exit. Then feed the trace to `trace-to-bc`."
+    )
 
 
 if __name__ == "__main__":
