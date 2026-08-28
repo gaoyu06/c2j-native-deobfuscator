@@ -339,6 +339,104 @@ fi
 cleanup_fixture6
 trap - EXIT
 
+echo "-- 7. strict safety-bound parsing (--max-seconds / --max-events)"
+# A malformed bound must error (exit non-zero), never silently disable the
+# timeout or the event budget, and never fall through to a clean run.
+for opt in --max-seconds --max-events; do
+    for bad in "abc" "-1" "5x" ""; do
+        set +e
+        SB_OUT="$("$HOST_BIN" "$opt" "$bad" "$HELLO_LIB" 2>&1)"
+        SB_RC=$?
+        set -e
+        if [ "$SB_RC" = "0" ]; then
+            echo "FAIL: $opt '$bad' was accepted (exit 0) instead of rejected"
+            echo "$SB_OUT"
+            FAILED=1
+        fi
+        if grep -qF "host: shutdown ok" <<<"$SB_OUT"; then
+            echo "FAIL: $opt '$bad' fell through to a clean run"
+            FAILED=1
+        fi
+    done
+done
+# A well-formed value (including an explicit 0) must still be accepted and
+# run to a clean shutdown.
+for good in "0" "5" "32"; do
+    set +e
+    SB_GOOD="$("$HOST_BIN" --max-events "$good" --max-seconds "$good" \
+        "$HELLO_LIB" 2>&1)"
+    set -e
+    if grep -qF "must be a non-negative integer" <<<"$SB_GOOD"; then
+        echo "FAIL: a valid safety bound '$good' was rejected by the parser"
+        FAILED=1
+    fi
+    if ! grep -qF "host: shutdown ok" <<<"$SB_GOOD"; then
+        echo "FAIL: a valid safety bound '$good' did not run to a clean shutdown"
+        FAILED=1
+    fi
+done
+echo "PASS: malformed safety bounds are rejected; valid ones parse"
+
+echo "-- 8. live step failure must fail the command (never report success)"
+# A failure while stepping over a watched-export entry breakpoint could
+# previously leave a breakpoint in place yet still report success. Force
+# it and require a non-zero exit with "shutdown with errors". Only
+# meaningful where the live path actually attaches; skipped honestly
+# otherwise (same as sections 3 and 6).
+PIDFILE8="$(mktemp)"
+FXPID8=""
+cleanup_fixture8() {
+    [ -n "$FXPID8" ] && kill -9 "$FXPID8" >/dev/null 2>&1 || true
+    rm -f "$PIDFILE8" >/dev/null 2>&1 || true
+}
+trap cleanup_fixture8 EXIT
+LD_LIBRARY_PATH="$FIXTURE_LIBDIR:${LD_LIBRARY_PATH:-}" "$FIXTURE_BIN" "$PIDFILE8" &
+FXPID8=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$PIDFILE8" ] && break
+    sleep 0.2
+done
+TARGET_PID8="$(cat "$PIDFILE8" 2>/dev/null || true)"
+if [ -z "$TARGET_PID8" ]; then
+    echo "FAIL: fixture process (step-failure test) did not report a pid"
+    FAILED=1
+else
+    set +e
+    STEP_OBS="$(NX86_TEST_INJECT=step-over-fail "$HOST_BIN" \
+        --pid "$TARGET_PID8" --i-own-this-process \
+        --max-events 4 --max-seconds 10 \
+        "$OPENSSL_LIB" "$JNI_LIB" 2>&1)"
+    STEP_RC=$?
+    set -e
+    echo "$STEP_OBS"
+    if grep -qF "phase=enter" <<<"$STEP_OBS"; then
+        # Live path ran and reached the step: the injected failure must
+        # fail the command, print "shutdown with errors", and never print
+        # a clean "shutdown ok".
+        if [ "$STEP_RC" = "0" ]; then
+            echo "FAIL: live step failure did not fail the command (exit 0)"
+            FAILED=1
+        fi
+        if grep -qF "host: shutdown ok" <<<"$STEP_OBS"; then
+            echo "FAIL: live step failure still reported 'shutdown ok'"
+            FAILED=1
+        fi
+        if ! grep -qF "host: shutdown with errors" <<<"$STEP_OBS"; then
+            echo "FAIL: live step failure did not report 'shutdown with errors'"
+            FAILED=1
+        fi
+        if ! grep -qiE 'did not complete cleanly' <<<"$STEP_OBS"; then
+            echo "FAIL: live step failure did not warn about an unclean pass"
+            FAILED=1
+        fi
+        echo "PASS: live step failure fails the command"
+    else
+        echo "NOTE: live path did not attach here; step-failure check skipped."
+    fi
+fi
+cleanup_fixture8
+trap - EXIT
+
 if [ "$FAILED" != "0" ]; then
     echo "SMOKE TEST: FAIL"
     exit 1
