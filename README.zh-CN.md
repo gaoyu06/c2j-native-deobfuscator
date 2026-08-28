@@ -303,6 +303,19 @@ python -m ast_matcher.cli --list-flags
 
 ---
 
+## 实验性模块：`native-x86/`
+
+[`native-x86/`](native-x86/) 是一个与上面所有内容都相互独立的**实验性骨架**：
+一套用户态插件 ABI，用于描述通用的 x86 进程信息（模块、符号、调用点），
+内部不包含任何 JVM / JNI 概念。它**不是 JAR 恢复的必需组件** ——
+动态、静态、模拟三条路径都不依赖它，整个目录删掉也不影响它们。
+
+目前它只包含一个带版本号的 C ABI、一个加载示例插件的 host stub 以及文档，
+没有实现任何插桩逻辑。详见
+[`docs/native-x86-module.md`](docs/native-x86-module.md)。
+
+---
+
 ## 仓库结构
 
 ```
@@ -312,6 +325,8 @@ python -m ast_matcher.cli --list-flags
 │   ├── class-rebuilder/        input.jar + recovered/ → output.jar
 │   └── common/                 公共 schema 类型
 ├── native/                     C++ JVMTI agent（zig c++ 构建）
+├── native-x86/                 实验性的用户态 x86 插件 ABI 骨架
+│                               （任何恢复路径都不依赖它）
 ├── ghidra/scripts/             Ghidra Headless 脚本（Java）
 ├── py/                         Python 模块（uv workspace）
 │   ├── jar_parser/             —
@@ -343,6 +358,8 @@ python -m ast_matcher.cli --list-flags
 - [ROADMAP.md](docs/ROADMAP.md) — 已知限制和计划工作
 - [adding-obfuscator-profile.md](docs/adding-obfuscator-profile.md) — 如何注册新混淆器变体
 - [static-reverse-approach.md](docs/static-reverse-approach.md) — 基于 Ghidra 的静态路径设计笔记
+- [native-x86-module.md](docs/native-x86-module.md) — 实验性用户态 x86 模块的边界与非目标
+  （[插件 ABI](docs/plugin-abi.md)、[特权观察器](docs/privileged-observer.md)）
 - [`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md) —
   智能体使用手册（加载到你的编码智能体里）
 
