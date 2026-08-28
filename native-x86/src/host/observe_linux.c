@@ -617,19 +617,46 @@ static int poke_user(pid_t pid, size_t off, unsigned long value)
 
 /*
  * Test-only fault injection. The smoke test sets NX86_TEST_INJECT to a
- * comma/space-separated list of fault names so it can exercise the
+ * comma/space/tab-separated list of fault names so it can exercise the
  * refusal and cleanup-failure paths deterministically, without needing a
  * sandbox that actually blocks ptrace. When the variable is unset (every
  * production run) this always returns 0 and changes nothing.
  *
+ * Matching is exact per token, not substring, so one fault name can never
+ * accidentally enable another.
+ *
  *   attach-refused  - behave as if PTRACE_ATTACH was refused
  *   detach-fail     - skip the final detach so the attachment is treated
  *                     as possibly still active (must fail the command)
+ *   step-over-fail  - fail the single-step over a watched-export entry
+ *                     breakpoint as a non-ESRCH ptrace error, so the run
+ *                     must restore the byte, detach, and fail rather than
+ *                     report success with a breakpoint possibly in place
  */
 static int test_inject(const char *what)
 {
     const char *v = getenv("NX86_TEST_INJECT");
-    return (v != NULL && strstr(v, what) != NULL);
+    size_t wlen;
+    if (v == NULL) {
+        return 0;
+    }
+    wlen = strlen(what);
+    while (*v != '\0') {
+        const char *start;
+        size_t len;
+        while (*v == ',' || *v == ' ' || *v == '\t') {
+            ++v;
+        }
+        start = v;
+        while (*v != '\0' && *v != ',' && *v != ' ' && *v != '\t') {
+            ++v;
+        }
+        len = (size_t)(v - start);
+        if (len == wlen && memcmp(start, what, wlen) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Insert INT3, saving the original low byte into *saved. */
@@ -663,6 +690,13 @@ static int bp_step_over(pid_t pid, unsigned long addr, unsigned char saved)
 {
     int st;
     unsigned char tmp;
+    if (test_inject("step-over-fail")) {
+        /* Simulate a non-ESRCH ptrace failure before the byte is restored:
+         * the entry breakpoint is still in place, so the caller must go
+         * through the restore+detach helper and fail the run. */
+        errno = EIO;
+        return -1;
+    }
     if (bp_restore(pid, addr, saved) != 0) {
         return -1;
     }
@@ -827,9 +861,23 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
         return NX86_ERR_INTERNAL;
     }
 
-    /* Target is stopped: enumerate modules and resolve watched exports. */
-    (void)scan_all_modules(bus, cfg->pid, watches, n_watches, bps, &n_bps,
-                          NX86_MAX_BREAKPOINTS, log_fn);
+    /* Target is stopped: enumerate modules and resolve watched exports.
+     * A scan failure here is not something to paper over — we are attached
+     * but cannot produce the module/symbol pass, so detach cleanly and
+     * fail the run rather than continue as if it had succeeded. Nothing is
+     * armed yet, so the helper only has to release the attachment. */
+    if (scan_all_modules(bus, cfg->pid, watches, n_watches, bps, &n_bps,
+                         NX86_MAX_BREAKPOINTS, log_fn) != 0) {
+        emit_note(bus, cfg->pid, NX86_LOG_ERROR,
+                  "module scan failed while attached; detaching without "
+                  "observing");
+        /* Nothing is armed yet; this only has to release the attachment.
+         * Either way the run has failed. */
+        (void)remove_breakpoints_and_detach(pid, bps, n_bps, rbs, n_rbs);
+        free(bps);
+        free(rbs);
+        return NX86_ERR_INTERNAL;
+    }
 
     for (i = 0; i < n_bps; ++i) {
         unsigned char saved;
@@ -859,10 +907,19 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
     }
 
     if (ptrace(PTRACE_CONT, pid, (void *)0, (void *)0) != 0) {
-        target_alive = 0;
+        if (errno == ESRCH) {
+            /* Tracee already gone: nothing it held can still be active. */
+            target_alive = 0;
+        } else {
+            /* The target may still be alive and stopped with breakpoints
+             * in place. Do not skip cleanup and do not report success:
+             * fall through to the restore+detach path with the run marked
+             * failed. */
+            run_status = NX86_ERR_INTERNAL;
+        }
     }
 
-    while (target_alive) {
+    while (target_alive && run_status == NX86_OK) {
         pid_t w = waitpid(pid, &st, 0);
         if (w < 0) {
             if (errno == EINTR && g_alarm_fired) {
@@ -951,14 +1008,38 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                 ++call_events;
 
                 /* Rewind RIP over the restored breakpoint byte: one
-                 * register word written, nothing else. */
-                (void)poke_user(pid, NX86_OFF_RIP, (unsigned long)hit_addr);
+                 * register word written, nothing else. A failed rewind
+                 * would leave execution one byte past the INT3, so it can
+                 * never be reported as success: fail the run and fall
+                 * through to the restore+detach cleanup (the entry
+                 * breakpoint is still armed and will be removed there). */
+                if (poke_user(pid, NX86_OFF_RIP,
+                              (unsigned long)hit_addr) != 0) {
+                    if (errno == ESRCH) {
+                        target_alive = 0;
+                    } else {
+                        run_status = NX86_ERR_INTERNAL;
+                    }
+                    break;
+                }
 
                 {
                     int gone = bp_step_over(pid, (unsigned long)hit_addr,
                                             bps[ei].saved);
                     if (gone == 1) {
                         target_alive = 0;
+                        break;
+                    }
+                    if (gone < 0) {
+                        /* The step (restore / single-step / re-arm) failed.
+                         * A breakpoint byte may still be in place, so the
+                         * cleanup helper must restore it and detach, and the
+                         * run must fail. ESRCH means the tracee is gone. */
+                        if (errno == ESRCH) {
+                            target_alive = 0;
+                        } else {
+                            run_status = NX86_ERR_INTERNAL;
+                        }
                         break;
                     }
                 }
@@ -999,11 +1080,34 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                                NX86_CALL_SITE_THUNK, NX86_CALL_PHASE_RETURN);
                 ++call_events;
 
-                /* Rewind RIP over the restored breakpoint byte. */
-                (void)poke_user(pid, NX86_OFF_RIP, (unsigned long)hit_addr);
+                /* Rewind RIP over the restored breakpoint byte. A failed
+                 * rewind would leave execution past the INT3: fail and let
+                 * the cleanup helper restore the still-active return
+                 * breakpoint and detach. */
+                if (poke_user(pid, NX86_OFF_RIP,
+                              (unsigned long)hit_addr) != 0) {
+                    if (errno == ESRCH) {
+                        target_alive = 0;
+                    } else {
+                        run_status = NX86_ERR_INTERNAL;
+                    }
+                    break;
+                }
                 {
                     int gone = bp_step_off(pid, (unsigned long)hit_addr,
                                            rbs[ri].saved);
+                    if (gone < 0) {
+                        /* The step failed; the byte may still be in place,
+                         * so leave this return breakpoint marked active for
+                         * the cleanup helper to restore, and fail the run
+                         * (unless the tracee is already gone). */
+                        if (errno == ESRCH) {
+                            target_alive = 0;
+                        } else {
+                            run_status = NX86_ERR_INTERNAL;
+                        }
+                        break;
+                    }
                     rbs[ri].active = 0; /* one-shot: re-armed on next entry */
                     if (gone == 1) {
                         target_alive = 0;
