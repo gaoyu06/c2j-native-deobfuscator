@@ -43,7 +43,15 @@ extern "C" {
  * load a plugin whose minor version differs; both sides then negotiate
  * per-struct using the struct_size field that starts every versioned
  * record.
+ *
+ * Prefix negotiation: a struct carrying `avail` valid bytes contains a
+ * given field only when the field's end offset is within `avail`. Read a
+ * field a differing minor version might not carry only after this check;
+ * never read or write past the size the peer actually provided.
  */
+#define NX86_HAS_FIELD(avail, type, field)                    \
+    ((uint32_t)(avail) >=                                     \
+     (uint32_t)(offsetof(type, field) + sizeof(((type *)0)->field)))
 
 /* ------------------------------------------------------------------ */
 /* Linkage                                                             */
@@ -72,6 +80,7 @@ typedef int32_t nx86_status;
 #define NX86_ERR_NO_MEMORY      ((nx86_status)-4)
 #define NX86_ERR_NOT_FOUND      ((nx86_status)-5)
 #define NX86_ERR_INTERNAL       ((nx86_status)-6)
+#define NX86_ERR_LIFECYCLE      ((nx86_status)-7) /* emit outside start..stop */
 
 /* ------------------------------------------------------------------ */
 /* Log levels                                                          */
@@ -225,7 +234,12 @@ typedef struct nx86_host {
                                                  uint32_t token);
 
     /* Publish an event authored by the plugin. The host copies whatever
-     * it needs before returning; the caller keeps ownership. */
+     * it needs before returning; the caller keeps ownership. The host
+     * assigns `seq` and `timestamp_ns` on its copy but leaves
+     * `process_id` untouched: that field identifies the observed process
+     * and belongs to the producer, not the host. Callable only while the
+     * plugin is running (between `start` and `stop`); outside that window
+     * the host returns NX86_ERR_LIFECYCLE and dispatches nothing. */
     nx86_status (NX86_CALL *emit)(void *host_ctx,
                                   const nx86_event_header *event);
 
@@ -265,9 +279,18 @@ typedef struct nx86_plugin {
 
 /*
  * Plugin entry point, resolved by name from the loaded shared object.
- * The plugin fills `out_plugin` and returns NX86_OK, or returns
- * NX86_ERR_ABI_MISMATCH when it cannot work with `host->abi_version`.
- * `host` stays valid until the plugin's shutdown callback returns.
+ *
+ * The host sets `out_plugin->struct_size` before the call to the byte
+ * capacity of the caller-owned object. That capacity is an input: the
+ * plugin must not write past it, even when it was built against a newer
+ * minor version with a larger nx86_plugin. The plugin writes at most
+ * that many bytes, stores the number it actually filled back into
+ * `struct_size`, and returns NX86_OK; the host then reads only the
+ * fields both sides share (the common prefix). The plugin returns
+ * NX86_ERR_ABI_MISMATCH when it cannot work with `host->abi_version` or
+ * when the host's capacity is too small to hold the fields the plugin
+ * requires. `host` stays valid until the plugin's shutdown callback
+ * returns.
  */
 typedef nx86_status (NX86_CALL *nx86_plugin_init_fn)(const nx86_host *host,
                                                      nx86_plugin *out_plugin);

@@ -9,6 +9,15 @@ void nx86_bus_init(nx86_event_bus *bus)
     memset(bus, 0, sizeof(*bus));
     bus->next_token = 1u;
     bus->next_seq = 1u;
+    bus->accepting = 0u;
+}
+
+void nx86_bus_set_accepting(nx86_event_bus *bus, int accepting)
+{
+    if (bus == NULL) {
+        return;
+    }
+    bus->accepting = accepting ? 1u : 0u;
 }
 
 nx86_status nx86_bus_register(nx86_event_bus *bus,
@@ -62,7 +71,10 @@ void nx86_bus_stamp(nx86_event_bus *bus,
     header->kind = kind;
     header->seq = bus->next_seq++;
     header->timestamp_ns = nx86_plat_now_ns();
-    header->process_id = nx86_plat_process_id();
+    /* process_id names the observed process. The stub observes no target,
+     * so there is no observed process to name: leave it zero rather than
+     * mislabel the record with the host's own pid. */
+    header->process_id = 0u;
     header->thread_id = 0u; /* the stub observes nothing, so no thread id */
 }
 
@@ -80,6 +92,10 @@ nx86_status nx86_bus_publish(nx86_event_bus *bus,
     if (event->kind >= 32u) {
         /* Subscription masks are 32 bits wide in ABI 0.1. */
         return NX86_ERR_UNSUPPORTED;
+    }
+    if (bus->accepting == 0u) {
+        /* Outside the start..stop window nothing is delivered. */
+        return NX86_ERR_LIFECYCLE;
     }
 
     bus->published++;
@@ -109,11 +125,16 @@ nx86_status nx86_bus_republish(nx86_event_bus *bus,
         event->struct_size > (uint32_t)NX86_HOST_MAX_EVENT_SIZE) {
         return NX86_ERR_INVALID_ARG;
     }
+    if (bus->accepting == 0u) {
+        /* Reject before copying so shutdown-time emits reach no observer. */
+        return NX86_ERR_LIFECYCLE;
+    }
 
     memcpy(buffer.bytes, event, event->struct_size);
     buffer.header.seq = bus->next_seq++;
     buffer.header.timestamp_ns = nx86_plat_now_ns();
-    buffer.header.process_id = nx86_plat_process_id();
+    /* process_id is the producer's: it names the observed process, which
+     * the host does not own. Leave whatever the plugin set. */
 
     return nx86_bus_publish(bus, &buffer.header);
 }

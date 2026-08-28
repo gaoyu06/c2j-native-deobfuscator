@@ -22,6 +22,7 @@ typedef struct nx86_observer_slot {
 typedef struct nx86_event_bus {
     nx86_observer_slot slots[NX86_HOST_MAX_OBSERVERS];
     uint32_t           next_token;
+    uint32_t           accepting; /* 1 between start and stop; 0 otherwise */
     uint64_t           next_seq;
     uint64_t           published;
     uint64_t           delivered;
@@ -36,6 +37,12 @@ typedef union nx86_event_buffer {
 } nx86_event_buffer;
 
 void nx86_bus_init(nx86_event_bus *bus);
+
+/* Open or close the delivery window. While closed, publish and republish
+ * dispatch nothing and return NX86_ERR_LIFECYCLE. The host opens it
+ * before calling the plugin's `start` and closes it after `stop`
+ * returns, so a plugin that emits from `shutdown` reaches no observer. */
+void nx86_bus_set_accepting(nx86_event_bus *bus, int accepting);
 
 nx86_status nx86_bus_register(nx86_event_bus *bus,
                               uint32_t event_mask,
@@ -55,8 +62,9 @@ void nx86_bus_stamp(nx86_event_bus *bus,
 nx86_status nx86_bus_publish(nx86_event_bus *bus,
                              const nx86_event_header *event);
 
-/* Copy, re-stamp (seq / timestamp / pid) and publish an event authored
- * by a plugin. */
+/* Copy an event authored by a plugin, assign a fresh seq and timestamp,
+ * and publish it. `process_id` is left as the producer set it: it names
+ * the observed process, which the host does not own. */
 nx86_status nx86_bus_republish(nx86_event_bus *bus,
                                const nx86_event_header *event);
 

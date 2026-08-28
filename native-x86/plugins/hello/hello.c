@@ -143,19 +143,40 @@ static void NX86_CALL hello_shutdown(void *plugin_ctx)
 NX86_EXPORT nx86_status NX86_CALL nx86_plugin_init(const nx86_host *host,
                                                    nx86_plugin *out_plugin)
 {
+    uint32_t capacity;
+    uint32_t written;
+
     if (host == NULL || out_plugin == NULL) {
         return NX86_ERR_INVALID_ARG;
     }
-    if (host->struct_size < (uint32_t)sizeof(nx86_host) ||
-        NX86_VERSION_MAJOR(host->abi_version) != NX86_ABI_VERSION_MAJOR) {
+    /* Accept any matching major; a differing minor is allowed. Only read
+     * the host fields this plugin actually calls, and require the host's
+     * prefix to cover them rather than the whole (possibly newer) struct. */
+    if (NX86_VERSION_MAJOR(host->abi_version) != NX86_ABI_VERSION_MAJOR) {
+        return NX86_ERR_ABI_MISMATCH;
+    }
+    if (!NX86_HAS_FIELD(host->struct_size, nx86_host, log)) {
+        return NX86_ERR_ABI_MISMATCH;
+    }
+
+    /* out_plugin->struct_size is the byte capacity the host owns. Never
+     * write beyond it, even though this plugin's nx86_plugin might be
+     * larger than an older host expects. The host reads the common
+     * prefix; if it cannot even hold the callbacks, refuse. */
+    capacity = out_plugin->struct_size;
+    written = (uint32_t)sizeof(*out_plugin);
+    if (written > capacity) {
+        written = capacity;
+    }
+    if (!NX86_HAS_FIELD(written, nx86_plugin, shutdown)) {
         return NX86_ERR_ABI_MISMATCH;
     }
 
     memset(&g_state, 0, sizeof(g_state));
     g_state.host = host;
 
-    memset(out_plugin, 0, sizeof(*out_plugin));
-    out_plugin->struct_size = (uint32_t)sizeof(*out_plugin);
+    memset(out_plugin, 0, written);
+    out_plugin->struct_size = written;
     out_plugin->abi_version = NX86_ABI_VERSION;
     out_plugin->id = "hello";
     out_plugin->display_name = "nativex86 sample plugin";

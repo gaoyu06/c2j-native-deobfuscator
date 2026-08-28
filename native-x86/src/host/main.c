@@ -221,14 +221,23 @@ int main(int argc, char **argv)
     memcpy(&init_fn, &symbol, sizeof(init_fn));
 
     memset(&plugin, 0, sizeof(plugin));
+    /* Tell the plugin how many bytes it may write into our object. */
+    plugin.struct_size = (uint32_t)sizeof(plugin);
     status = init_fn(&host, &plugin);
     if (status != NX86_OK) {
         fprintf(stderr, "host: plugin init failed (%d)\n", (int)status);
         nx86_plat_close_library(library);
         return 1;
     }
-    if (plugin.struct_size < (uint32_t)sizeof(nx86_plugin) ||
-        NX86_VERSION_MAJOR(plugin.abi_version) != NX86_ABI_VERSION_MAJOR) {
+    /* A newer plugin may report a larger struct than this host knows:
+     * keep our own size and ignore any unknown tail. */
+    if (plugin.struct_size > (uint32_t)sizeof(plugin)) {
+        plugin.struct_size = (uint32_t)sizeof(plugin);
+    }
+    /* Reject only a major mismatch or a prefix too small to hold the
+     * fields this host reads (through the callbacks). */
+    if (NX86_VERSION_MAJOR(plugin.abi_version) != NX86_ABI_VERSION_MAJOR ||
+        !NX86_HAS_FIELD(plugin.struct_size, nx86_plugin, shutdown)) {
         fprintf(stderr, "host: plugin ABI %u.%u is incompatible with %u.%u\n",
                 (unsigned)NX86_VERSION_MAJOR(plugin.abi_version),
                 (unsigned)NX86_VERSION_MINOR(plugin.abi_version),
@@ -245,10 +254,14 @@ int main(int argc, char **argv)
            (unsigned)NX86_VERSION_MINOR(plugin.abi_version),
            (unsigned)plugin.capabilities);
 
+    /* Open the delivery window: the plugin may emit from start onward. */
+    nx86_bus_set_accepting(&state.bus, 1);
+
     if (plugin.start != NULL) {
         status = plugin.start(plugin.plugin_ctx);
         if (status != NX86_OK) {
             fprintf(stderr, "host: plugin start failed (%d)\n", (int)status);
+            nx86_bus_set_accepting(&state.bus, 0);
             if (plugin.shutdown != NULL) {
                 plugin.shutdown(plugin.plugin_ctx);
             }
@@ -262,6 +275,9 @@ int main(int argc, char **argv)
     if (plugin.stop != NULL) {
         plugin.stop(plugin.plugin_ctx);
     }
+    /* Close the window: no event authored after stop reaches an observer,
+     * so an emit from shutdown is rejected. */
+    nx86_bus_set_accepting(&state.bus, 0);
     if (plugin.shutdown != NULL) {
         plugin.shutdown(plugin.plugin_ctx);
     }

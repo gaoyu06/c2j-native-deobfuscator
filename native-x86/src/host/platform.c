@@ -12,7 +12,6 @@
 #else
 #  include <dlfcn.h>
 #  include <time.h>
-#  include <unistd.h>
 #endif
 
 static char g_last_error[512];
@@ -82,11 +81,6 @@ uint64_t nx86_plat_now_ns(void)
     return (v.QuadPart - 116444736000000000ULL) * 100ULL;
 }
 
-uint32_t nx86_plat_process_id(void)
-{
-    return (uint32_t)GetCurrentProcessId();
-}
-
 int nx86_plat_plugin_filename(const char *stem, char *out, size_t cap)
 {
     int n = snprintf(out, cap, "nx86_plugin_%s.dll", stem);
@@ -133,11 +127,6 @@ uint64_t nx86_plat_now_ns(void)
         return 0u;
     }
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-uint32_t nx86_plat_process_id(void)
-{
-    return (uint32_t)getpid();
 }
 
 int nx86_plat_plugin_filename(const char *stem, char *out, size_t cap)
