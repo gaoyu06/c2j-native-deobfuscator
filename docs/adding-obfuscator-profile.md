@@ -52,11 +52,14 @@ register_profile(Profile(
 ))
 ```
 
-放在 `PYTHONPATH` 上即可，启动时 `import` 一下：
+放在 `PYTHONPATH` 上即可，然后在启动 CLI 前 `import` 一下，让它注册进来。
+注意要用 setup 装包的那个工作区解释器（`py/.venv/bin/python`，Windows 上是
+`py\.venv\Scripts\python.exe`）——系统 `python3` 看不到这些包：
 
 ```bash
-PYTHONPATH=./my_profiles python -c "import obfuscator_x" \
-    binary-introspect introspect ./mybin.dll -o binary.json --profile obfuscator_x
+PYTHONPATH=./my_profiles py/.venv/bin/python \
+    -c "import obfuscator_x; from binary_introspect.cli import cli; cli()" \
+    introspect ./mybin.dll -o binary.json --profile obfuscator_x
 ```
 
 ## 三、深度变体：新 harvest 策略
@@ -98,11 +101,13 @@ register_profile(Profile(..., detector=my_detect))
 任何场景下都可以用 `--profile <name>` 跳过自动检测：
 
 ```bash
-binary-introspect introspect mybin.dll -o binary.json --profile obfuscator_x
-binary-introspect introspect mybin.dll -o binary.json --profile generic   # 完全不带任何变体偏好
+py/.venv/bin/python -c "from binary_introspect.cli import cli; cli()" \
+    introspect mybin.dll -o binary.json --profile obfuscator_x
+py/.venv/bin/python -c "from binary_introspect.cli import cli; cli()" \
+    introspect mybin.dll -o binary.json --profile generic   # 完全不带任何变体偏好
 ```
 
-`binary-introspect introspect --list-profiles` 列出已注册的全部 profile。
+同一条命令加上 `--list-profiles`，会列出已注册的全部 profile。
 
 ## 六、当前未参数化、需要 PR 才能扩展的部分
 

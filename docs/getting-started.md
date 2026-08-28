@@ -163,7 +163,7 @@ Install `unicorn` into the interpreter setup used, and run the harness with it
 (the launcher only wraps the CLI subcommands):
 
 ```bash
-(cd py && uv pip install unicorn)    # pip fallback: python3 -m pip install unicorn
+(cd py && uv pip install unicorn)    # no uv? `scripts/j2c doctor` prints the exact command
 py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 ```
 

@@ -224,8 +224,11 @@ def check_python_recover_deps(root: Optional[Path] = None) -> Check:
                    "through that interpreter — use `scripts/j2c doctor` "
                    "(or `scripts\\j2c.ps1 doctor` on Windows), which selects it")
         else:
+            # Name the interpreter in the manual fallback too: a bare `pip` is
+            # whichever one is on PATH, which may not be this one.
             fix = ("run scripts/setup.sh (or scripts/setup.ps1), or "
-                   "`pip install -e py/binary_introspect` (installs capstone + lief)")
+                   f"`{sys.executable} -m pip install -e py/binary_introspect` "
+                   "(installs capstone + lief)")
         return Check(
             name=name,
             status=STATUS_MISSING,

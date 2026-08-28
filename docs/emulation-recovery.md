@@ -80,7 +80,7 @@ workspace into — the `uv` venv at `py/.venv` (`py\.venv\Scripts\python` on
 Windows), or the interpreter the `pip` fallback used:
 
 ```bash
-(cd py && uv pip install unicorn)    # pip fallback: python3 -m pip install unicorn
+(cd py && uv pip install unicorn)    # no uv? `scripts/j2c doctor` prints the exact command
 ```
 
 Get a registrar address for j2cc-style dispatch (not needed for native-

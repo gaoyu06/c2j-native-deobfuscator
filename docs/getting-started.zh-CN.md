@@ -145,7 +145,7 @@ native 代码，因此能列出 native 方法、dump 解密后的常量，并把
 把 `unicorn` 装进 setup 所用的那个解释器，并用它来跑 harness（启动器只包装 CLI 子命令）：
 
 ```bash
-(cd py && uv pip install unicorn)    # pip 兜底时用 python3 -m pip install unicorn
+(cd py && uv pip install unicorn)    # 没有 uv？`scripts/j2c doctor` 会打印确切命令
 py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 ```
 

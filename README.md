@@ -355,7 +355,8 @@ blob, or you need the decrypted C-only constants. It runs the native code under
 a CPU emulator with a mock JNI; no JVM and no Ghidra required:
 
 ```bash
-# add unicorn to the workspace interpreter (pip fallback: python3 -m pip install unicorn)
+# add unicorn to the workspace interpreter (`scripts/j2c doctor` prints the
+# exact command if setup fell back to pip)
 (cd py && uv pip install unicorn)
 
 # list native methods (entry points auto-discovered)

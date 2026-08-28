@@ -295,7 +295,7 @@ scripts/j2c recover \
 也不需要 Ghidra：
 
 ```bash
-# 把 unicorn 装进工作区解释器（pip 兜底时用 python3 -m pip install unicorn）
+# 把 unicorn 装进工作区解释器（走 pip 兜底时，`scripts/j2c doctor` 会打印确切命令）
 (cd py && uv pip install unicorn)
 
 # 列出 native 方法（入口自动发现）
