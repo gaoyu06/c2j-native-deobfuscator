@@ -25,6 +25,30 @@ def _lea(insn: bytes, address: int, target: int) -> bytes:
     return insn + struct.pack("<i", target - (address + len(insn) + 4))
 
 
+def _static_tables(report) -> list[dict]:
+    return [
+        entry
+        for entry in report.native_registry
+        if entry.get("source") == "register-natives-static"
+    ]
+
+
+def _jni_exports(report) -> list[dict]:
+    return [
+        entry
+        for entry in report.native_registry
+        if entry.get("source") == "jni-export"
+    ]
+
+
+def _export_addr(report, name: str) -> str | None:
+    """Address of an exported symbol, tolerating a Mach-O leading underscore."""
+    for export in report.exported_functions:
+        if export["name"] in (name, f"_{name}"):
+            return export["addr"]
+    return None
+
+
 def test_introspect_real_elf_resolves_static_jni_table_relocations() -> None:
     report = introspect(FIXTURES / "libjni_registrar.so")
 
@@ -55,6 +79,161 @@ def test_introspect_real_elf_resolves_static_jni_table_relocations() -> None:
             ],
         }
     ]
+
+
+def test_introspect_real_pe_resolves_static_table_and_jni_export() -> None:
+    """PE / Microsoft x64 ABI proven end-to-end on a committed DLL: the
+    RegisterNatives static table decodes with names/descriptors, and a
+    specification-defined Java_* export is recorded."""
+    report = introspect(FIXTURES / "jni_registrar.dll")
+
+    assert report.fmt == "PE"
+    assert report.arch == "x86_64"
+    assert report.analysis == {"profile": "generic", "methodDiscovery": "jni-spec"}
+
+    tables = _static_tables(report)
+    assert len(tables) == 1
+    table = tables[0]
+    assert table["abi"] == "amd64-windows"
+    assert table["nMethods"] == 2
+    assert [(m["name"], m["desc"]) for m in table["methods"]] == [
+        ("alpha", "()V"),
+        ("beta", "(I)I"),
+    ]
+    # The table's function pointers cross-check against the export addresses:
+    # a broken PE pointer/section read would desync these.
+    assert table["methods"][0]["fnAddr"] == _export_addr(report, "fixture_alpha")
+    assert table["methods"][1]["fnAddr"] == _export_addr(report, "fixture_beta")
+
+    exports = _jni_exports(report)
+    assert [e["fnSymbol"] for e in exports] == ["Java_com_example_Sample_ping"]
+    assert exports[0]["fnAddr"] == _export_addr(
+        report, "Java_com_example_Sample_ping"
+    )
+
+
+def test_introspect_real_macho_resolves_static_table_and_jni_export() -> None:
+    """Mach-O / System V ABI proven end-to-end on a committed dylib. The
+    Java_* export is stored as _Java_... in the Mach-O symbol table and is
+    normalized back to the spec name; the static table decodes with names."""
+    report = introspect(FIXTURES / "libjni_registrar.dylib")
+
+    assert report.fmt == "MachO"
+    assert report.arch == "x86_64"
+    assert report.analysis == {"profile": "generic", "methodDiscovery": "jni-spec"}
+
+    tables = _static_tables(report)
+    assert len(tables) == 1
+    table = tables[0]
+    assert table["abi"] == "amd64-sysv"
+    assert table["nMethods"] == 2
+    assert [(m["name"], m["desc"]) for m in table["methods"]] == [
+        ("alpha", "()V"),
+        ("beta", "(I)I"),
+    ]
+    assert table["methods"][0]["fnAddr"] == _export_addr(report, "fixture_alpha")
+    assert table["methods"][1]["fnAddr"] == _export_addr(report, "fixture_beta")
+
+    exports = _jni_exports(report)
+    assert [e["fnSymbol"] for e in exports] == ["Java_com_example_Sample_ping"]
+
+
+def test_introspect_stripped_elf_still_recovers_table_via_generic_path() -> None:
+    """A symbol-stripped copy of the registrar still yields the registration
+    table via the generic path (relocations + section data, not .symtab).
+    Silent empty success is not allowed: the table must still be found."""
+    path = FIXTURES / "libjni_registrar.stripped.so"
+
+    # Confirm the fixture really is stripped so the test proves resilience,
+    # not that .symtab happened to survive.
+    binary = lief.parse(str(path))
+    assert list(binary.symtab_symbols) == []
+    assert not any(section.name == ".symtab" for section in binary.sections)
+
+    report = introspect(path)
+    assert report.fmt == "ELF"
+    assert report.arch == "x86_64"
+
+    tables = _static_tables(report)
+    assert len(tables) == 1, "stripped binary must not silently yield nothing"
+    table = tables[0]
+    assert table["abi"] == "amd64-sysv"
+    assert [(m["name"], m["desc"], m["fnAddr"]) for m in table["methods"]] == [
+        ("alpha", "()V", "0x1000"),
+        ("beta", "(I)I", "0x1010"),
+    ]
+
+
+def test_introspect_exports_only_elf_uses_export_family_not_table() -> None:
+    """Second registration family: a library that registers purely by Java_*
+    export names (no JNINativeMethod table, no RegisterNatives call site). The
+    generic path must recover it through exports, proving it is not locked to
+    the table shape."""
+    report = introspect(FIXTURES / "libjni_exports_only.so")
+
+    assert report.fmt == "ELF"
+    assert report.arch == "x86_64"
+
+    assert _static_tables(report) == []
+
+    exported = {e["fnSymbol"] for e in _jni_exports(report)}
+    assert exported == {
+        "Java_com_example_Widget_init",
+        "Java_com_example_Widget_compute",
+        "Java_com_example_Widget_hashOf__Ljava_lang_String_2",
+    }
+
+
+def test_real_pe_table_binds_through_manifest_merge_without_silent_gap() -> None:
+    """End-to-end: the PE-discovered named table binds to the matching class by
+    (name, desc), and an ambiguous duplicate leaves the table unbound with a
+    gap rather than silently mis-binding."""
+    from manifest_merge.core import merge
+
+    report = introspect(FIXTURES / "jni_registrar.dll")
+    binary = report.to_json_obj()
+
+    def _classes(class_names):
+        return {
+            "input": {"jarPath": "input.jar"},
+            "classes": [
+                {
+                    "name": name,
+                    "methods": [
+                        {
+                            "name": "alpha",
+                            "desc": "()V",
+                            "access": 0x0100,
+                            "isObfuscatedNative": True,
+                        },
+                        {
+                            "name": "beta",
+                            "desc": "(I)I",
+                            "access": 0x0100,
+                            "isObfuscatedNative": True,
+                        },
+                    ],
+                }
+                for name in class_names
+            ],
+        }
+
+    unique = merge(_classes(["com/example/Native"]), binary)
+    bound = {
+        m["name"]: m.get("fnAddr")
+        for m in unique["classes"][0]["methods"]
+    }
+    assert bound["alpha"] and bound["beta"]
+    assert unique["bindingGaps"] == []
+
+    ambiguous = merge(
+        _classes(["com/example/First", "com/example/Second"]), binary
+    )
+    assert all(
+        "fnAddr" not in method
+        for cls in ambiguous["classes"]
+        for method in cls["methods"]
+    )
 
 
 @pytest.mark.parametrize(
