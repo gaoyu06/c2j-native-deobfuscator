@@ -175,6 +175,64 @@ def test_check_native_agent_rejects_empty_file(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------------
+# Architecture normalisation + agent-arch header reading
+# ------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("x86_64", "x86_64"), ("AMD64", "x86_64"), ("x64", "x86_64"),
+        ("aarch64", "arm64"), ("arm64", "arm64"),
+        ("i686", "x86"), ("armv7l", "arm"),
+    ],
+)
+def test_host_machine_normalises(raw, expected):
+    assert doctor.host_machine(raw) == expected
+
+
+def _write_elf(path: Path, e_machine: int, size=doctor._MIN_AGENT_BYTES + 1):
+    header = bytearray(size)
+    header[0:4] = b"\x7fELF"
+    header[4] = 2  # 64-bit
+    header[5] = 1  # little-endian
+    header[18:20] = e_machine.to_bytes(2, "little")
+    path.write_bytes(bytes(header))
+
+
+def test_agent_arch_reads_elf(tmp_path):
+    p = tmp_path / "lib.so"
+    _write_elf(p, 0x3E)  # x86-64
+    assert doctor.agent_arch(p) == "x86_64"
+    _write_elf(p, 0xB7)  # aarch64
+    assert doctor.agent_arch(p) == "arm64"
+
+
+def test_check_native_agent_rejects_wrong_arch(tmp_path, monkeypatch):
+    # A host-named agent whose machine code is x86-64 must not read as ready on
+    # an ARM host (native/build.sh only ever emits x86-64).
+    monkeypatch.setattr(doctor.sys, "platform", "linux")
+    monkeypatch.setattr(doctor.os, "name", "posix")
+    monkeypatch.setattr(doctor, "host_machine", lambda machine=None: "arm64")
+    libdir = tmp_path / "native" / "build" / "lib"
+    libdir.mkdir(parents=True)
+    _write_elf(libdir / "j2c_agent.so", 0x3E)  # built for x86-64
+    c = doctor.check_native_agent(tmp_path)
+    assert c.status == doctor.STATUS_MISSING
+    assert "x86_64" in c.detail  # names what it was built for
+    assert "arm64" in c.detail   # names this host
+
+
+def test_check_native_agent_ok_when_arch_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor.sys, "platform", "linux")
+    monkeypatch.setattr(doctor.os, "name", "posix")
+    monkeypatch.setattr(doctor, "host_machine", lambda machine=None: "x86_64")
+    libdir = tmp_path / "native" / "build" / "lib"
+    libdir.mkdir(parents=True)
+    _write_elf(libdir / "j2c_agent.so", 0x3E)
+    assert doctor.check_native_agent(tmp_path).status == doctor.STATUS_OK
+
+
+# ------------------------------------------------------------------
 # Optional tools
 # ------------------------------------------------------------------
 
@@ -296,3 +354,39 @@ def test_check_python_recover_deps_missing(monkeypatch):
     assert c.status == doctor.STATUS_MISSING
     assert not c.optional
     assert c.fix
+
+
+def _make_venv_python(root: Path) -> Path:
+    if os.name == "nt":
+        py = root / "py" / ".venv" / "Scripts" / "python.exe"
+    else:
+        py = root / "py" / ".venv" / "bin" / "python"
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text("")
+    return py
+
+
+def test_venv_python_detected(tmp_path):
+    assert doctor.venv_python(tmp_path) is None
+    made = _make_venv_python(tmp_path)
+    assert doctor.venv_python(tmp_path) == made
+
+
+def test_check_python_recover_deps_points_at_venv(tmp_path, monkeypatch):
+    # When the import fails but a uv venv exists (and is not the current
+    # interpreter), the fix must send the user to that interpreter/launcher
+    # rather than only suggesting a reinstall.
+    _make_venv_python(tmp_path)
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "binary_introspect.cli" or name.startswith("capstone"):
+            raise ModuleNotFoundError("No module named 'capstone'", name="capstone")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    c = doctor.check_python_recover_deps(tmp_path)
+    assert c.status == doctor.STATUS_MISSING
+    assert "scripts/j2c" in c.fix or "j2c.ps1" in c.fix
+    assert ".venv" in c.fix
