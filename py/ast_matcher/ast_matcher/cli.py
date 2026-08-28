@@ -35,7 +35,10 @@ _LIFTER_FLAGS = [f.name for f in dataclasses.fields(LifterOptions)]
               help="manifest.json from manifest-merge — used for per-class "
                    "lookup tables + string-pool offsets.")
 @click.option("--profile", "profile_name", default=None,
-              help="Obfuscator profile (auto-detect when omitted).")
+              help="Obfuscator profile; defaults to the conservative 'generic' "
+                   "profile when omitted (the lifter does not auto-detect from a "
+                   "pseudo-C dump). Pass the variant, e.g. --profile "
+                   "native_obfuscator, to enable its body-lift heuristics.")
 @click.option("--enable", "enables", multiple=True,
               type=click.Choice(_LIFTER_FLAGS),
               help="Force-enable a lifter feature (repeatable).")
