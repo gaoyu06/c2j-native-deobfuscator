@@ -12,6 +12,7 @@ recovery path is still startup instrumentation via ``-agentpath``.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -177,3 +178,78 @@ def build_agent_options(
     if max_frame_events is not None:
         opts.append(f"max-frame-events={max_frame_events}")
     return ",".join(opts)
+
+
+# ---------------------------------------------------------------------------
+# jcmd JVMTI.agent_load helpers
+#
+# `jcmd <pid> JVMTI.agent_load <lib> <opts>` routes <opts> through the
+# diagnostic-command argument parser, which treats ``key=value`` tokens as its
+# *own* named arguments and, for a positional argument, keeps only the part
+# before ``=`` (dropping the value). A bare option string such as
+# ``trace=out.jsonl`` therefore reaches the agent as an empty trace path, the
+# agent returns JNI_ERR, and — critically — ``jcmd`` still exits 0, printing
+# ``return code: -1`` on stdout. Wrapping the option string in single quotes
+# makes the DCmd parser take it as one literal positional value, so the agent
+# receives the options intact. These helpers are typer-free so both the option
+# form and the return-code parsing are unit-testable without a live JVM.
+# ---------------------------------------------------------------------------
+
+_JCMD_RETURN_CODE_RE = re.compile(r"return code:\s*(-?\d+)", re.IGNORECASE)
+
+
+def jcmd_agent_option_arg(opts: str) -> str:
+    """Quote ``opts`` for ``jcmd JVMTI.agent_load`` so ``key=value`` survives.
+
+    The diagnostic-command parser only preserves an option string containing
+    ``=`` when it is a single-quoted literal. We refuse rather than silently
+    corrupt if the option string itself contains a single quote (paths with an
+    apostrophe are out of scope for this preview; use ``--mechanism vm``).
+    """
+    if "'" in opts:
+        raise ValueError(
+            "agent option string contains a single quote, which cannot be "
+            "passed safely through jcmd; use --mechanism vm instead"
+        )
+    return f"'{opts}'"
+
+
+def build_jcmd_agent_load_argv(
+    jcmd: str, pid: int, agent_path: str, opts: str
+) -> List[str]:
+    """Build the argv for ``jcmd <pid> JVMTI.agent_load <lib> '<opts>'``."""
+    argv = [jcmd, str(pid), "JVMTI.agent_load", agent_path]
+    if opts:
+        argv.append(jcmd_agent_option_arg(opts))
+    return argv
+
+
+def parse_jcmd_return_code(output: str) -> Optional[int]:
+    """Return the agent's ``Agent_OnAttach`` code from jcmd output, or None.
+
+    ``jcmd JVMTI.agent_load`` prints ``return code: <N>`` where ``<N>`` is the
+    value ``Agent_OnAttach`` returned (0 == success). It reports this even when
+    the agent fails, while the ``jcmd`` process itself still exits 0.
+    """
+    match = None
+    for match in _JCMD_RETURN_CODE_RE.finditer(output or ""):
+        pass
+    return int(match.group(1)) if match else None
+
+
+def jcmd_load_error(returncode: int, output: str) -> Optional[str]:
+    """Return a human-readable failure reason, or None if the load succeeded.
+
+    Treats both a non-zero ``jcmd`` process exit and a non-zero agent
+    ``return code:`` as failures, so an agent that fails to initialize can never
+    be reported as a successful attach.
+    """
+    if returncode != 0:
+        return f"jcmd exited with status {returncode}"
+    agent_rc = parse_jcmd_return_code(output)
+    if agent_rc is not None and agent_rc != 0:
+        return (
+            f"agent Agent_OnAttach returned {agent_rc} "
+            "(load failed; see the target JVM's stderr for details)"
+        )
+    return None

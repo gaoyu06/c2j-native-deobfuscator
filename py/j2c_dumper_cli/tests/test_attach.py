@@ -130,6 +130,65 @@ def test_build_agent_options_full():
 
 
 # ---------------------------------------------------------------------------
+# jcmd option form + return-code parsing (regression for the false-success bug)
+# ---------------------------------------------------------------------------
+
+def test_jcmd_agent_option_is_single_quoted():
+    # A bare `trace=...,...` option makes jcmd's diagnostic-command parser drop
+    # the value; the option must be single-quoted so it reaches Agent_OnAttach
+    # intact. This test would have failed against the pre-fix (bare) form.
+    opts = "trace=out.jsonl,log-all=true,max-frame-events=0"
+    assert A.jcmd_agent_option_arg(opts) == "'trace=out.jsonl,log-all=true,max-frame-events=0'"
+
+
+def test_build_jcmd_argv_quotes_options():
+    argv = A.build_jcmd_agent_load_argv("jcmd", 4321, "/x/j2c_agent.so", "trace=t.jsonl")
+    assert argv == ["jcmd", "4321", "JVMTI.agent_load", "/x/j2c_agent.so", "'trace=t.jsonl'"]
+    # The option argument must be quoted (not bare) to survive DCmd parsing.
+    assert argv[-1].startswith("'") and argv[-1].endswith("'")
+
+
+def test_build_jcmd_argv_omits_empty_options():
+    argv = A.build_jcmd_agent_load_argv("jcmd", 1, "/x/a.so", "")
+    assert argv == ["jcmd", "1", "JVMTI.agent_load", "/x/a.so"]
+
+
+def test_jcmd_option_rejects_embedded_single_quote():
+    with pytest.raises(ValueError):
+        A.jcmd_agent_option_arg("trace=/tmp/it's/t.jsonl")
+
+
+def test_parse_jcmd_return_code_success():
+    assert A.parse_jcmd_return_code("4321:\nreturn code: 0\n") == 0
+
+
+def test_parse_jcmd_return_code_failure():
+    # This is exactly the false-success output: jcmd process exit 0 but the
+    # agent's Agent_OnAttach returned -1.
+    assert A.parse_jcmd_return_code("4321:\nreturn code: -1\n") == -1
+
+
+def test_parse_jcmd_return_code_absent():
+    assert A.parse_jcmd_return_code("some unrelated output") is None
+
+
+def test_jcmd_load_error_flags_agent_failure_despite_exit_zero():
+    # The core regression: jcmd exited 0, but the agent failed. Must be an error.
+    err = A.jcmd_load_error(0, "4321:\nreturn code: -1\n")
+    assert err is not None
+    assert "-1" in err
+
+
+def test_jcmd_load_error_none_on_success():
+    assert A.jcmd_load_error(0, "4321:\nreturn code: 0\n") is None
+
+
+def test_jcmd_load_error_flags_nonzero_process_exit():
+    err = A.jcmd_load_error(1, "java.lang.IllegalArgumentException: Unknown argument")
+    assert err is not None
+
+
+# ---------------------------------------------------------------------------
 # CLI-level: refuse-without-flag / validation / help text
 # ---------------------------------------------------------------------------
 
@@ -185,3 +244,77 @@ def test_top_level_help_lists_attach(runner, app):
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "attach" in _flat(result)
+
+
+# ---------------------------------------------------------------------------
+# CLI-level: jcmd false-success must become a hard failure (must-fix #1)
+# ---------------------------------------------------------------------------
+
+class _FakeCompleted:
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _patch_attach_gate(monkeypatch, pid, agent_file):
+    """Get past the ownership/validation gate and agent resolution so the test
+    can exercise the actual jcmd invocation path."""
+    from j2c_dumper_cli import main as M
+
+    monkeypatch.setattr(M, "_jdk_tool", lambda name: name)
+    monkeypatch.setattr(
+        M, "read_proc_info",
+        lambda p: A.ProcInfo(pid=p, exists=True, uid=None, comm="java",
+                             cmdline=["/usr/bin/java", "-jar", "app.jar"]),
+    )
+
+
+def test_attach_jcmd_false_success_is_failure(runner, app, monkeypatch, tmp_path):
+    """jcmd exits 0 while Agent_OnAttach returned -1 -> CLI must fail, not
+    print 'attached'. This is the exact regression the review flagged."""
+    from j2c_dumper_cli import main as M
+
+    agent = tmp_path / "j2c_agent.so"
+    agent.write_bytes(b"\x7fELF")
+    _patch_attach_gate(monkeypatch, 4321, agent)
+
+    seen = {}
+
+    def fake_run(argv, check=False, capture_output=False, text=False):
+        seen["argv"] = argv
+        # Emulate jcmd's false success: process exit 0, agent return code -1.
+        return _FakeCompleted(0, stdout="4321:\nreturn code: -1\n")
+
+    monkeypatch.setattr(M.subprocess, "run", fake_run)
+
+    result = runner.invoke(app, [
+        "attach", "--pid", "4321", "--i-own-this-process",
+        "--agent", str(agent), "--mechanism", "jcmd",
+    ])
+    assert result.exit_code != 0
+    assert "attached (preview)" not in result.output
+    # And the options were passed single-quoted (would-be-corrupted otherwise).
+    opt_arg = seen["argv"][-1]
+    assert opt_arg.startswith("'") and opt_arg.endswith("'")
+    assert "trace=" in opt_arg
+
+
+def test_attach_jcmd_success_reports_attached(runner, app, monkeypatch, tmp_path):
+    from j2c_dumper_cli import main as M
+
+    agent = tmp_path / "j2c_agent.so"
+    agent.write_bytes(b"\x7fELF")
+    _patch_attach_gate(monkeypatch, 4321, agent)
+
+    monkeypatch.setattr(
+        M.subprocess, "run",
+        lambda *a, **k: _FakeCompleted(0, stdout="4321:\nreturn code: 0\n"),
+    )
+
+    result = runner.invoke(app, [
+        "attach", "--pid", "4321", "--i-own-this-process",
+        "--agent", str(agent), "--mechanism", "jcmd",
+    ])
+    assert result.exit_code == 0
+    assert "attached (preview)" in _flat(result)

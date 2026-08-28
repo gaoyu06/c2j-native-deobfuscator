@@ -18,7 +18,9 @@ from rich.console import Console
 from .attach_support import (
     CONFIRM_FLAG,
     build_agent_options,
+    build_jcmd_agent_load_argv,
     current_uid,
+    jcmd_load_error,
     read_proc_info,
     validate_attach_target,
 )
@@ -123,9 +125,25 @@ def _jdk_tool(name: str) -> str:
 
 def _attach_via_jcmd(pid: int, agent_path: Path, opts: str) -> None:
     """Attach via `jcmd <pid> JVMTI.agent_load` (documented diagnostic command,
-    routed through the same attach mechanism, invokes Agent_OnAttach)."""
+    routed through the same attach mechanism, invokes Agent_OnAttach).
+
+    Two subtleties make a naive invocation report false success:
+      * the diagnostic-command parser strips the value from a bare ``key=value``
+        agent option, so the option string must be passed single-quoted; and
+      * ``jcmd`` exits 0 even when ``Agent_OnAttach`` fails, printing
+        ``return code: <N>`` on stdout — so we parse that and fail loudly.
+    """
     jcmd = _jdk_tool("jcmd")
-    run([jcmd, str(pid), "JVMTI.agent_load", str(agent_path), opts])
+    argv = build_jcmd_agent_load_argv(jcmd, pid, str(agent_path), opts)
+    console.log(f"[dim]$ {' '.join(argv)}[/]")
+    res = subprocess.run(argv, check=False, capture_output=True, text=True)
+    combined = f"{res.stdout}{res.stderr}"
+    if combined.strip():
+        console.log(combined.rstrip())
+    error = jcmd_load_error(res.returncode, combined)
+    if error:
+        console.print(f"[red]error:[/] jcmd agent load failed: {error}")
+        raise typer.Exit(code=1)
 
 
 def _attach_via_vm(pid: int, agent_path: Path, opts: str) -> None:
@@ -151,12 +169,14 @@ def _do_attach(pid: int, agent_path: Path, opts: str, mechanism: str) -> None:
         raise typer.BadParameter(
             f"unknown --mechanism {mechanism!r}; choose auto | jcmd | vm"
         )
-    # auto: prefer jcmd (no compile step); fall back to the VirtualMachine helper.
+    # auto: prefer jcmd (no compile step); fall back to the VirtualMachine helper
+    # only when jcmd itself is unavailable. A genuine agent-load failure must
+    # propagate (not silently trigger a second attempt that reloads the agent).
     try:
         _attach_via_jcmd(pid, agent_path, opts)
-    except (FileNotFoundError, typer.Exit) as exc:
+    except FileNotFoundError as exc:
         console.log(
-            f"[yellow]jcmd attach unavailable ({exc!r}); "
+            f"[yellow]jcmd unavailable ({exc!r}); "
             "falling back to com.sun.tools.attach[/]"
         )
         _attach_via_vm(pid, agent_path, opts)
@@ -410,9 +430,12 @@ def cli_attach(
     Opt-in diagnostic path — NOT the default recover flow. The default,
     highest-fidelity path is still startup instrumentation via -agentpath
     (see `recover` / `dynamic-trace`). Live attach only observes work that
-    happens after attach, and per-JNI-call argument capture is limited to
-    threads started after attach; already-running threads still emit
-    bind/enter/exit/exception events. See docs/jvm-attach.md.
+    happens after attach. Coverage depends on which JVMTI capabilities the JDK
+    grants after attach: on OpenJDK 21 typically only native-method-bind is
+    available, so the trace holds `bind` events and method entry/exit,
+    local-variable, and exception events are NOT captured. The trace's
+    `capability` / `gap` records state exactly what was obtained. See
+    docs/jvm-attach.md.
     """
     # 1. Refuse before touching the target unless ownership is confirmed.
     if not i_own_this_process:
