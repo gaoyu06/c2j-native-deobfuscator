@@ -396,6 +396,39 @@ static int parse_positive_pid(const char *s, long *out)
     return 0;
 }
 
+/* Parse a safety-bound argument (--max-events / --max-seconds) as a
+ * strict non-negative integer that fits in uint32_t. The whole argument
+ * must be base-10 digits with no leading sign, no trailing text, and no
+ * overflow. A value of 0 keeps its documented meaning (no event / no time
+ * budget); a malformed value is an error, never a silent fall-through to
+ * "unlimited". "abc", "-1", "5x" and "" all fail. Returns 0 and writes
+ * *out on success, -1 otherwise. */
+static int parse_nonneg_u32(const char *s, uint32_t *out)
+{
+    char *end = NULL;
+    unsigned long value;
+
+    if (s == NULL || s[0] == '\0') {
+        return -1;
+    }
+    /* Reject a leading sign or space so "-1" and "+7" never pass; strtoul
+     * would otherwise accept "-1" as a huge wrapped value read as
+     * "unlimited". */
+    if (s[0] < '0' || s[0] > '9') {
+        return -1;
+    }
+    errno = 0;
+    value = strtoul(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') {
+        return -1;
+    }
+    if (value > 0xFFFFFFFFUL) {
+        return -1;
+    }
+    *out = (uint32_t)value;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     host_state state;
@@ -433,9 +466,19 @@ int main(int argc, char **argv)
         } else if (strcmp(a, "--no-live") == 0) {
             no_live = 1;
         } else if (strcmp(a, "--max-events") == 0 && i + 1 < argc) {
-            max_events = (uint32_t)strtoul(argv[++i], NULL, 10);
+            if (parse_nonneg_u32(argv[++i], &max_events) != 0) {
+                fprintf(stderr,
+                        "host: --max-events must be a non-negative integer "
+                        "(got '%s')\n", argv[i]);
+                return 2;
+            }
         } else if (strcmp(a, "--max-seconds") == 0 && i + 1 < argc) {
-            max_seconds = (uint32_t)strtoul(argv[++i], NULL, 10);
+            if (parse_nonneg_u32(argv[++i], &max_seconds) != 0) {
+                fprintf(stderr,
+                        "host: --max-seconds must be a non-negative integer "
+                        "(got '%s')\n", argv[i]);
+                return 2;
+            }
         } else if (a[0] == '-') {
             fprintf(stderr, "host: unknown option '%s'\n", a);
             usage(argv[0]);
