@@ -13,10 +13,13 @@
 #define NX86_HOST_MAX_EVENT_SIZE 256
 
 /* A diagnostic note carries short host/status text, never a data buffer.
- * The host rejects a plugin-authored note whose text exceeds this many
- * bytes so note.text cannot be used as a side channel to smuggle a
- * payload past the metadata-only record model. Host-authored notes are
- * well under this. */
+ * This cap bounds only the *length* of note.text: the host rejects a
+ * plugin-authored note whose text exceeds this many bytes. It does not
+ * make note.text safe by construction — a plugin can still place up to
+ * this many bytes of arbitrary text here. What keeps note.text from
+ * becoming a payload channel is policy (host/status text only; no keys,
+ * buffers or payloads; the host never parses it as data), not the cap.
+ * Host-authored notes are well under this. */
 #define NX86_NOTE_TEXT_MAX 512u
 
 typedef struct nx86_observer_slot {
