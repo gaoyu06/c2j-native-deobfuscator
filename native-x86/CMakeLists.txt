@@ -59,6 +59,15 @@ add_executable(nx86_fixture_target tests/fixtures/fixture_target.c)
 target_link_libraries(nx86_fixture_target PRIVATE nx86_fixture_exports)
 target_compile_options(nx86_fixture_target PRIVATE ${NX86_WARNINGS})
 
+# A multithreaded variant of the same fixture, used to check that the live
+# pass refuses a target with more than one thread and falls back to the
+# read-only pass (single-thread-only preview policy).
+find_package(Threads REQUIRED)
+add_executable(nx86_fixture_target_mt tests/fixtures/fixture_target_mt.c)
+target_link_libraries(nx86_fixture_target_mt
+    PRIVATE nx86_fixture_exports Threads::Threads)
+target_compile_options(nx86_fixture_target_mt PRIVATE ${NX86_WARNINGS})
+
 # ABI contract checks: prefix negotiation and the lifecycle delivery
 # window. Compiles the host event bus and the sample plugin directly so
 # it can drive nx86_plugin_init at different capacities.

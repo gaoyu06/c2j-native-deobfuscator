@@ -35,6 +35,7 @@
 
 #include "observe.h"
 
+#include <dirent.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -632,6 +633,14 @@ static int poke_user(pid_t pid, size_t off, unsigned long value)
  *                     breakpoint as a non-ESRCH ptrace error, so the run
  *                     must restore the byte, detach, and fail rather than
  *                     report success with a breakpoint possibly in place
+ *   insert-fail     - fail every bp_insert() as a non-ESRCH ptrace error,
+ *                     so the entry-arming loop cannot arm any watch; the
+ *                     run must restore, detach, and fail rather than
+ *                     continue and later report a clean live success
+ *   cont-fail       - fail every in-loop PTRACE_CONT as a non-ESRCH ptrace
+ *                     error, so the run must restore any placed breakpoint,
+ *                     detach, and fail rather than leave the target stopped
+ *                     with a breakpoint in place and still report success
  */
 static int test_inject(const char *what)
 {
@@ -659,11 +668,56 @@ static int test_inject(const char *what)
     return 0;
 }
 
+/*
+ * Count the threads of a process by listing /proc/PID/task, one entry per
+ * thread. Returns the count (>= 1 for a live process), or -1 if the
+ * directory cannot be read. The "." and ".." entries are skipped.
+ *
+ * This is a preview-policy gate, not a thread-group tracer: the live pass
+ * places one process-wide software breakpoint per watched export, and
+ * stepping such a breakpoint over the restored byte is only safe when no
+ * other thread can run the patched entry meanwhile. Rather than attach and
+ * single-step every thread (TRACECLONE and a full multi-thread debugger are
+ * explicitly out of scope for this preview), a target with more than one
+ * thread refuses the live pass and falls back to the read-only pass.
+ */
+static int count_task_threads(uint32_t pid)
+{
+    char path[64];
+    DIR *d;
+    struct dirent *ent;
+    int n = 0;
+
+    (void)snprintf(path, sizeof(path), "/proc/%u/task", (unsigned)pid);
+    d = opendir(path);
+    if (d == NULL) {
+        return -1;
+    }
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.' &&
+            (ent->d_name[1] == '\0' ||
+             (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
+            continue; /* "." and ".." */
+        }
+        ++n;
+    }
+    closedir(d);
+    return n;
+}
+
 /* Insert INT3, saving the original low byte into *saved. */
 static int bp_insert(pid_t pid, unsigned long addr, unsigned char *saved)
 {
-    long orig = peek_word(pid, addr);
+    long orig;
     long patched;
+    if (test_inject("insert-fail")) {
+        /* Simulate a non-ESRCH ptrace failure while arming a breakpoint:
+         * the caller must treat an un-armed watch as an incomplete live
+         * pass, restore whatever did arm, detach, and fail the run. */
+        errno = EIO;
+        return -1;
+    }
+    orig = peek_word(pid, addr);
     if (errno != 0) {
         return -1;
     }
@@ -809,6 +863,34 @@ static int remove_breakpoints_and_detach(pid_t pid,
     return leaked;
 }
 
+/*
+ * Resume the tracee with PTRACE_CONT, delivering signal `sig` (0 for
+ * none). Returns 0 when the resume is known to be fine, -1 when it failed
+ * in a way the caller must surface as a run failure.
+ *
+ * A CONT that fails for anything other than ESRCH may leave the target
+ * stopped with a breakpoint byte still in place: that must never be
+ * reported as success, so this returns -1 and the caller fails the run and
+ * falls through to remove_breakpoints_and_detach(). ESRCH means the tracee
+ * is already gone — nothing it held can still be active — so *alive is
+ * cleared and 0 is returned, letting the loop end cleanly.
+ */
+static int cont_or_fail(pid_t pid, int sig, int *alive)
+{
+    if (test_inject("cont-fail")) {
+        errno = EIO;
+        return -1;
+    }
+    if (ptrace(PTRACE_CONT, pid, (void *)0, (void *)(long)sig) != 0) {
+        if (errno == ESRCH) {
+            *alive = 0;
+            return 0;
+        }
+        return -1;
+    }
+    return 0;
+}
+
 static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                            const nx86_watch_entry *watches, uint32_t n_watches,
                            void (*log_fn)(uint32_t, const char *))
@@ -829,6 +911,38 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
         free(bps);
         free(rbs);
         return NX86_ERR_NO_MEMORY;
+    }
+
+    /* Preview policy: before attaching or placing any process-wide INT3,
+     * count the target's threads. Stepping a breakpoint over its restored
+     * byte is only safe when no other thread can run the patched entry in
+     * the meantime, so a multithreaded target refuses the live pass
+     * outright (no attach, no breakpoints) and runs the documented
+     * read-only module/symbol fallback with an honest note. Implementing a
+     * full thread-group tracer (attaching every thread, TRACECLONE) is
+     * deliberately out of scope for this preview. */
+    {
+        int nthreads = count_task_threads(cfg->pid);
+        if (nthreads > 1) {
+            nx86_status fb;
+            emit_note(bus, cfg->pid, NX86_LOG_WARN,
+                      "target has more than one thread; live entry/return "
+                      "observation is single-thread only in this preview. "
+                      "Running the read-only module/symbol pass instead "
+                      "(no attach, no breakpoints)");
+            if (log_fn != NULL) {
+                log_fn(NX86_LOG_WARN,
+                       "multithreaded target: refusing live pass, "
+                       "read-only fallback");
+            }
+            free(bps);
+            free(rbs);
+            fb = (scan_all_modules(bus, cfg->pid, watches, n_watches,
+                                   NULL, NULL, 0, log_fn) == 0)
+                     ? NX86_OK
+                     : NX86_ERR_UNSUPPORTED;
+            return fb;
+        }
     }
 
     if (test_inject("attach-refused") ||
@@ -879,14 +993,6 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
         return NX86_ERR_INTERNAL;
     }
 
-    for (i = 0; i < n_bps; ++i) {
-        unsigned char saved;
-        if (bp_insert(pid, (unsigned long)bps[i].address, &saved) == 0) {
-            bps[i].saved = saved;
-            bps[i].armed = 1;
-        }
-    }
-
     if (n_bps == 0) {
         int leaked;
         emit_note(bus, cfg->pid, NX86_LOG_INFO,
@@ -896,6 +1002,52 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
         free(bps);
         free(rbs);
         return leaked ? NX86_ERR_INTERNAL : NX86_OK;
+    }
+
+    {
+        int n_arm_fail = 0;
+        for (i = 0; i < n_bps; ++i) {
+            unsigned char saved;
+            if (bp_insert(pid, (unsigned long)bps[i].address, &saved) == 0) {
+                bps[i].saved = saved;
+                bps[i].armed = 1;
+            } else if (errno == ESRCH) {
+                /* Tracee vanished mid-arming: nothing it held is active. */
+                target_alive = 0;
+                break;
+            } else {
+                ++n_arm_fail;
+            }
+        }
+
+        /* Arming a watched-export breakpoint is what turns this into a live
+         * pass. If any insert failed we cannot honestly report a complete
+         * live observation, and a partially-armed target must still be
+         * cleaned up: restore whatever did arm, detach, and fail the run
+         * rather than continue and later print a clean "shutdown ok". This
+         * covers both "some watches failed to arm" and "every watch failed
+         * to arm" — silently ignoring the failure is not allowed. */
+        if (n_arm_fail > 0) {
+            int leaked;
+            emit_note(bus, cfg->pid, NX86_LOG_ERROR,
+                      "could not arm one or more watched-export "
+                      "breakpoints; restoring and detaching without a live "
+                      "pass");
+            leaked = remove_breakpoints_and_detach(pid, bps, n_bps, rbs,
+                                                   n_rbs);
+            (void)leaked;
+            free(bps);
+            free(rbs);
+            return NX86_ERR_INTERNAL;
+        }
+        if (!target_alive) {
+            /* Tracee exited while arming; nothing is left in place. */
+            emit_note(bus, cfg->pid, NX86_LOG_INFO,
+                      "target process ended before the live pass began");
+            free(bps);
+            free(rbs);
+            return NX86_OK;
+        }
     }
 
     g_alarm_fired = 0;
@@ -957,9 +1109,14 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
             continue;
         }
         if (WSTOPSIG(st) != SIGTRAP) {
-            /* Forward any other signal so we do not alter delivery. */
-            (void)ptrace(PTRACE_CONT, pid, (void *)0,
-                         (void *)(long)WSTOPSIG(st));
+            /* Forward any other signal so we do not alter delivery. A CONT
+             * that fails for anything but ESRCH may leave the target
+             * stopped with breakpoints in place, so fail the run and clean
+             * up rather than silently ignore it. */
+            if (cont_or_fail(pid, WSTOPSIG(st), &target_alive) != 0) {
+                run_status = NX86_ERR_INTERNAL;
+                break;
+            }
             continue;
         }
 
@@ -1067,7 +1224,10 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                     call_events >= cfg->max_call_events) {
                     break;
                 }
-                (void)ptrace(PTRACE_CONT, pid, (void *)0, (void *)0);
+                if (cont_or_fail(pid, 0, &target_alive) != 0) {
+                    run_status = NX86_ERR_INTERNAL;
+                    break;
+                }
                 continue;
             }
 
@@ -1118,12 +1278,20 @@ static nx86_status run_live(nx86_event_bus *bus, const nx86_observe_config *cfg,
                     call_events >= cfg->max_call_events) {
                     break;
                 }
-                (void)ptrace(PTRACE_CONT, pid, (void *)0, (void *)0);
+                if (cont_or_fail(pid, 0, &target_alive) != 0) {
+                    run_status = NX86_ERR_INTERNAL;
+                    break;
+                }
                 continue;
             }
 
-            /* A trap we did not set: hand it back and continue. */
-            (void)ptrace(PTRACE_CONT, pid, (void *)0, (void *)0);
+            /* A trap we did not set: hand it back and continue. A CONT
+             * failure here is surfaced the same way, never silently
+             * ignored. */
+            if (cont_or_fail(pid, 0, &target_alive) != 0) {
+                run_status = NX86_ERR_INTERNAL;
+                break;
+            }
         }
     }
 

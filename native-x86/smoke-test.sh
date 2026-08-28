@@ -50,6 +50,7 @@ if [ "$USE_CMAKE" = "1" ] && command -v cmake >/dev/null 2>&1; then
     OPENSSL_LIB="$BUILD_DIR/lib/libnx86_plugin_crypto_openssl.so"
     JNI_LIB="$BUILD_DIR/lib/libnx86_plugin_jni_natives.so"
     FIXTURE_BIN="$BUILD_DIR/bin/nx86_fixture_target"
+    FIXTURE_MT_BIN="$BUILD_DIR/bin/nx86_fixture_target_mt"
     FIXTURE_LIBDIR="$BUILD_DIR/lib"
 else
     echo "-- configuring without cmake"
@@ -86,12 +87,18 @@ else
         "$SCRIPT_DIR/tests/fixtures/fixture_target.c" \
         -L "$BUILD_DIR/lib" -lnx86_fixture_exports \
         -Wl,-rpath,"$BUILD_DIR/lib"
+    # shellcheck disable=SC2086
+    "$CC_BIN" -O2 -o "$BUILD_DIR/bin/nx86_fixture_target_mt" \
+        "$SCRIPT_DIR/tests/fixtures/fixture_target_mt.c" \
+        -L "$BUILD_DIR/lib" -lnx86_fixture_exports \
+        -Wl,-rpath,"$BUILD_DIR/lib" -lpthread
     HOST_BIN="$BUILD_DIR/bin/nx86_host"
     CHECKS_BIN="$BUILD_DIR/bin/nx86_abi_checks"
     HELLO_LIB="$BUILD_DIR/lib/libnx86_plugin_hello.so"
     OPENSSL_LIB="$BUILD_DIR/lib/libnx86_plugin_crypto_openssl.so"
     JNI_LIB="$BUILD_DIR/lib/libnx86_plugin_jni_natives.so"
     FIXTURE_BIN="$BUILD_DIR/bin/nx86_fixture_target"
+    FIXTURE_MT_BIN="$BUILD_DIR/bin/nx86_fixture_target_mt"
     FIXTURE_LIBDIR="$BUILD_DIR/lib"
 fi
 
@@ -435,6 +442,202 @@ else
     fi
 fi
 cleanup_fixture8
+trap - EXIT
+
+echo "-- 9. live CONT failure must fail the command (never report success)"
+# A PTRACE_CONT failure inside the event loop (resuming the tracee after a
+# breakpoint) could previously be discarded, leaving the target stopped
+# with a breakpoint in place yet still reporting success. Force every
+# in-loop CONT to fail and require a non-zero exit with "shutdown with
+# errors". Only meaningful where the live path actually attaches; skipped
+# honestly otherwise (same as sections 3, 6 and 8).
+PIDFILE9="$(mktemp)"
+FXPID9=""
+cleanup_fixture9() {
+    [ -n "$FXPID9" ] && kill -9 "$FXPID9" >/dev/null 2>&1 || true
+    rm -f "$PIDFILE9" >/dev/null 2>&1 || true
+}
+trap cleanup_fixture9 EXIT
+LD_LIBRARY_PATH="$FIXTURE_LIBDIR:${LD_LIBRARY_PATH:-}" "$FIXTURE_BIN" "$PIDFILE9" &
+FXPID9=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$PIDFILE9" ] && break
+    sleep 0.2
+done
+TARGET_PID9="$(cat "$PIDFILE9" 2>/dev/null || true)"
+if [ -z "$TARGET_PID9" ]; then
+    echo "FAIL: fixture process (CONT-failure test) did not report a pid"
+    FAILED=1
+else
+    set +e
+    CONT_OBS="$(NX86_TEST_INJECT=cont-fail "$HOST_BIN" \
+        --pid "$TARGET_PID9" --i-own-this-process \
+        --max-events 4 --max-seconds 10 \
+        "$OPENSSL_LIB" "$JNI_LIB" 2>&1)"
+    CONT_RC=$?
+    set -e
+    echo "$CONT_OBS"
+    if grep -qF "phase=enter" <<<"$CONT_OBS"; then
+        # Live path ran and reached the first resume: the injected CONT
+        # failure must fail the command, print "shutdown with errors", and
+        # never print a clean "shutdown ok".
+        if [ "$CONT_RC" = "0" ]; then
+            echo "FAIL: live CONT failure did not fail the command (exit 0)"
+            FAILED=1
+        fi
+        if grep -qF "host: shutdown ok" <<<"$CONT_OBS"; then
+            echo "FAIL: live CONT failure still reported 'shutdown ok'"
+            FAILED=1
+        fi
+        if ! grep -qF "host: shutdown with errors" <<<"$CONT_OBS"; then
+            echo "FAIL: live CONT failure did not report 'shutdown with errors'"
+            FAILED=1
+        fi
+        if ! grep -qiE 'did not complete cleanly' <<<"$CONT_OBS"; then
+            echo "FAIL: live CONT failure did not warn about an unclean pass"
+            FAILED=1
+        fi
+        echo "PASS: live CONT failure fails the command"
+    else
+        echo "NOTE: live path did not attach here; CONT-failure check skipped."
+    fi
+fi
+cleanup_fixture9
+trap - EXIT
+
+echo "-- 10. breakpoint-arming failure must fail the command (never succeed)"
+# If arming a watched-export breakpoint (bp_insert) fails, the run must not
+# continue and later report a clean live success. Force every insert to
+# fail and require the honest "could not arm" note plus a non-zero exit
+# with "shutdown with errors" and no live phases. Only meaningful where the
+# live path actually attaches; skipped honestly otherwise.
+PIDFILE10="$(mktemp)"
+FXPID10=""
+cleanup_fixture10() {
+    [ -n "$FXPID10" ] && kill -9 "$FXPID10" >/dev/null 2>&1 || true
+    rm -f "$PIDFILE10" >/dev/null 2>&1 || true
+}
+trap cleanup_fixture10 EXIT
+LD_LIBRARY_PATH="$FIXTURE_LIBDIR:${LD_LIBRARY_PATH:-}" "$FIXTURE_BIN" "$PIDFILE10" &
+FXPID10=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$PIDFILE10" ] && break
+    sleep 0.2
+done
+TARGET_PID10="$(cat "$PIDFILE10" 2>/dev/null || true)"
+if [ -z "$TARGET_PID10" ]; then
+    echo "FAIL: fixture process (insert-failure test) did not report a pid"
+    FAILED=1
+else
+    set +e
+    INSERT_OBS="$(NX86_TEST_INJECT=insert-fail "$HOST_BIN" \
+        --pid "$TARGET_PID10" --i-own-this-process \
+        --max-events 4 --max-seconds 10 \
+        "$OPENSSL_LIB" "$JNI_LIB" 2>&1)"
+    INSERT_RC=$?
+    set -e
+    echo "$INSERT_OBS"
+    if grep -qiE 'could not arm' <<<"$INSERT_OBS"; then
+        # The arming path ran and every insert failed: the run must fail,
+        # print "shutdown with errors", place no live phases, and never
+        # print a clean "shutdown ok".
+        if [ "$INSERT_RC" = "0" ]; then
+            echo "FAIL: arming failure did not fail the command (exit 0)"
+            FAILED=1
+        fi
+        if grep -qF "host: shutdown ok" <<<"$INSERT_OBS"; then
+            echo "FAIL: arming failure still reported 'shutdown ok'"
+            FAILED=1
+        fi
+        if ! grep -qF "host: shutdown with errors" <<<"$INSERT_OBS"; then
+            echo "FAIL: arming failure did not report 'shutdown with errors'"
+            FAILED=1
+        fi
+        if grep -qF "phase=enter" <<<"$INSERT_OBS"; then
+            echo "FAIL: arming failure should place no live entry phases"
+            FAILED=1
+        fi
+        echo "PASS: breakpoint-arming failure fails the command"
+    else
+        echo "NOTE: live path did not arm here; insert-failure check skipped."
+    fi
+fi
+cleanup_fixture10
+trap - EXIT
+
+echo "-- 11. multithreaded target refuses live pass (read-only fallback, exit 0)"
+# A target with more than one thread must not get process-wide INT3
+# breakpoints in this preview. The host counts /proc/PID/task before
+# attaching and, when it sees a second thread, refuses the live pass and
+# runs the read-only module/symbol pass with an honest note. This check is
+# environment-independent: the refusal happens before any ptrace attach.
+PIDFILE11="$(mktemp)"
+FXPID11=""
+cleanup_fixture11() {
+    [ -n "$FXPID11" ] && kill -9 "$FXPID11" >/dev/null 2>&1 || true
+    rm -f "$PIDFILE11" >/dev/null 2>&1 || true
+}
+trap cleanup_fixture11 EXIT
+LD_LIBRARY_PATH="$FIXTURE_LIBDIR:${LD_LIBRARY_PATH:-}" "$FIXTURE_MT_BIN" "$PIDFILE11" &
+FXPID11=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$PIDFILE11" ] && break
+    sleep 0.2
+done
+TARGET_PID11="$(cat "$PIDFILE11" 2>/dev/null || true)"
+if [ -z "$TARGET_PID11" ]; then
+    echo "FAIL: multithreaded fixture did not report a pid"
+    FAILED=1
+else
+    set +e
+    MT_OBS="$("$HOST_BIN" --pid "$TARGET_PID11" --i-own-this-process \
+        --max-events 12 --max-seconds 15 \
+        "$OPENSSL_LIB" "$JNI_LIB" 2>&1)"
+    MT_RC=$?
+    set -e
+    echo "$MT_OBS"
+    # The refusal is a clean success (the read-only fallback did real work).
+    if [ "$MT_RC" != "0" ]; then
+        echo "FAIL: multithread refusal exited non-zero ($MT_RC)"
+        FAILED=1
+    fi
+    # Honest note: names the multithread limit and the read-only fallback.
+    if ! grep -qiE 'more than one thread' <<<"$MT_OBS"; then
+        echo "FAIL: multithread refusal did not name the thread-count limit"
+        FAILED=1
+    fi
+    if ! grep -qiE 'single-thread only' <<<"$MT_OBS"; then
+        echo "FAIL: multithread refusal did not state the single-thread limit"
+        FAILED=1
+    fi
+    # The read-only pass still resolves modules and symbols from disk.
+    for expected in \
+        "kind=module-load" \
+        "symbol=SSL_write" \
+        "Java_com_example_Demo_ping"
+    do
+        if ! grep -qF "$expected" <<<"$MT_OBS"; then
+            echo "FAIL: multithread read-only fallback missing: $expected"
+            FAILED=1
+        fi
+    done
+    # No breakpoints were placed, so no live entry/return phases appear.
+    if grep -qF "phase=enter" <<<"$MT_OBS"; then
+        echo "FAIL: multithread refusal must not place live entry phases"
+        FAILED=1
+    fi
+    # Metadata-only guarantee still holds on the fallback output.
+    if grep -qiE 'plaintext|ciphertext|arg-bytes|keybytes|payload=' <<<"$MT_OBS"; then
+        echo "FAIL: multithread fallback output contains a content-like field"
+        FAILED=1
+    fi
+    if ! grep -qF "host: shutdown ok" <<<"$MT_OBS"; then
+        echo "FAIL: multithread refusal did not shut down cleanly"
+        FAILED=1
+    fi
+    echo "PASS: multithreaded target refuses live pass and falls back read-only"
+fi
+cleanup_fixture11
 trap - EXIT
 
 if [ "$FAILED" != "0" ]; then
