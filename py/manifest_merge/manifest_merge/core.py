@@ -132,6 +132,7 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
     # count-only positional matching and is available for static tables and
     # RegisterNatives calls captured through emulation.
     used_classes: set[str] = set()
+    ambiguous_named_sites: set[int] = set()
     for site in register_sites:
         methods = site.get("methods") or []
         if not methods:
@@ -143,6 +144,8 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
             if [(m.get("name"), m.get("desc")) for m in nats] == signature
         ]
         if len(candidates) != 1:
+            if len(candidates) > 1:
+                ambiguous_named_sites.add(id(site))
             continue
         cname, nats = candidates[0]
         used_classes.add(cname)
@@ -156,7 +159,7 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
     # Fall back to positional count matching for stack-built tables whose
     # string pointers are materialised only at runtime.
     for site in register_sites:
-        if site.get("boundTo"):
+        if site.get("boundTo") or id(site) in ambiguous_named_sites:
             continue
         addrs = site.get("fnAddrs") or []
         n = len(addrs)

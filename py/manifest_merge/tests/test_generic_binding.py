@@ -82,3 +82,37 @@ def test_merge_preserves_binary_analysis_profile() -> None:
         "profile": "native_obfuscator",
         "methodDiscovery": "jni-spec",
     }
+
+
+def test_ambiguous_named_table_is_not_rebound_by_position() -> None:
+    classes = {
+        "input": {"jarPath": "input.jar"},
+        "classes": [
+            {
+                "name": owner,
+                "methods": [
+                    {
+                        "name": "same",
+                        "desc": "()V",
+                        "access": 0x0100,
+                        "isObfuscatedNative": True,
+                    }
+                ],
+            }
+            for owner in ("sample/First", "sample/Second")
+        ],
+    }
+    site = {
+        "source": "register-natives-static",
+        "fnAddrs": ["0x401000"],
+        "methods": [{"name": "same", "desc": "()V", "fnAddr": "0x401000"}],
+    }
+
+    manifest = merge(classes, {"nativeRegistry": [site]})
+
+    assert "boundTo" not in site
+    assert all(
+        "fnAddr" not in method
+        for cls in manifest["classes"]
+        for method in cls["methods"]
+    )
