@@ -23,6 +23,10 @@ comparisons, the `<clinit>` string tables) and gives you an executable oracle.
 
 License: **GPLv3**.
 
+The [optional observer contract](docs/privileged-observer.md) is off by
+default and unsigned by this project. It is not required for JAR recovery; no
+kernel image or kernel source is shipped.
+
 ---
 
 ## ⭐ Recommended workflow: drive it with a coding agent
