@@ -37,6 +37,10 @@ class ValidationResult:
     ok: bool
     problems: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    # Structured refusals for the cases that have a stable reason code
+    # (cross-user, not-a-jvm) so the CLI can print the same
+    # ``attach failed (reason=<code>):`` form as every other refusal.
+    refusals: List["AttachRefusal"] = field(default_factory=list)
 
 
 def looks_like_java(comm: str, cmdline: List[str]) -> bool:
@@ -132,6 +136,7 @@ def validate_attach_target(
     """
     problems: List[str] = []
     warnings: List[str] = []
+    refusals: List[AttachRefusal] = []
 
     if pid <= 0:
         problems.append(f"pid must be a positive integer, got {pid}")
@@ -152,18 +157,38 @@ def validate_attach_target(
             "skipping the same-user check"
         )
     elif proc.uid != current:
-        problems.append(
+        msg = (
             f"pid {pid} is owned by uid {proc.uid}, not the current uid "
             f"{current}; attach is same-user only"
         )
+        problems.append(msg)
+        refusals.append(
+            AttachRefusal(
+                reason=REASON_CROSS_USER,
+                message=(
+                    f"{msg}. Run as the owning user; do not use elevated "
+                    "privileges to cross users."
+                ),
+            )
+        )
 
     if not looks_like_java(proc.comm, proc.cmdline):
-        problems.append(
+        msg = (
             f"pid {pid} does not look like a Java process "
             f"(comm={proc.comm!r}); refusing to attach"
         )
+        problems.append(msg)
+        refusals.append(
+            AttachRefusal(
+                reason=REASON_NOT_A_JVM,
+                message=msg,
+                recommend_startup=False,
+            )
+        )
 
-    return ValidationResult(ok=not problems, problems=problems, warnings=warnings)
+    return ValidationResult(
+        ok=not problems, problems=problems, warnings=warnings, refusals=refusals
+    )
 
 
 def build_agent_options(
@@ -269,7 +294,6 @@ def jcmd_load_error(returncode: int, output: str) -> Optional[str]:
 # Stable reason codes (kept intentionally short and machine-greppable).
 REASON_ATTACH_DISABLED = "attach-disabled"
 REASON_DYNAMIC_AGENT_DISABLED = "dynamic-agent-disabled"
-REASON_ALLOW_ATTACH_SELF_DISABLED = "allow-attach-self-disabled"
 REASON_NOT_A_JVM = "not-a-jvm"
 REASON_CROSS_USER = "cross-user"
 REASON_AGENT_ONATTACH_MISSING = "agent-onattach-missing"
@@ -319,6 +343,10 @@ def _allow_attach_self_disabled(cmdline: List[str]) -> bool:
     Java's ``Boolean.getBoolean`` treats only ``"true"`` (case-insensitively) as
     true, so any other value — most obviously ``false`` — disables it. We only
     flag the obvious explicit ``=false`` form the docs mention.
+
+    Note this property governs *self*-attach only (a JVM attaching to its own
+    process). It does **not** block an external, same-user attach from this CLI,
+    so it is surfaced as a warning, not a refusal.
     """
     for tok in cmdline:
         low = tok.lower()
@@ -337,11 +365,14 @@ def scan_cmdline_for_refusals(cmdline: List[str]) -> Optional[AttachRefusal]:
 
       * ``-XX:+DisableAttachMechanism``          -> ``attach-disabled``
       * ``-XX:-EnableDynamicAgentLoading``       -> ``dynamic-agent-disabled``
-      * ``-Djdk.attach.allowAttachSelf=false``   -> ``allow-attach-self-disabled``
 
     Returns the most severe matching refusal, or None if nothing was detected
     (which is not a guarantee the attach will succeed — the target may carry the
     flags in ``JAVA_TOOL_OPTIONS`` etc. that argv does not show).
+
+    ``-Djdk.attach.allowAttachSelf=false`` is deliberately **not** a refusal
+    here: it disables *self*-attach only and does not block this external,
+    same-user attach. See :func:`scan_cmdline_for_warnings`.
     """
     tokens = list(cmdline or [])
     joined = " ".join(tokens)
@@ -366,17 +397,25 @@ def scan_cmdline_for_refusals(cmdline: List[str]) -> Optional[AttachRefusal]:
             ),
         )
 
-    if _allow_attach_self_disabled(tokens):
-        return AttachRefusal(
-            reason=REASON_ALLOW_ATTACH_SELF_DISABLED,
-            message=(
-                "target sets jdk.attach.allowAttachSelf=false; self-attach is "
-                "disabled (this blocks a same-process attach — attach from a "
-                "separate process, or use the startup path)."
-            ),
-        )
-
     return None
+
+
+def scan_cmdline_for_warnings(cmdline: List[str]) -> List[str]:
+    """Non-fatal notes about a target's argv that do **not** block an attach.
+
+    ``jdk.attach.allowAttachSelf=false`` disables a JVM attaching to *itself*
+    only; an external, same-user attach from this CLI is unaffected. We surface
+    it as a warning and proceed, rather than refusing a valid target on the
+    strength of a flag that does not apply to us.
+    """
+    warnings: List[str] = []
+    if _allow_attach_self_disabled(list(cmdline or [])):
+        warnings.append(
+            "target sets jdk.attach.allowAttachSelf=false; this disables "
+            "self-attach only and does not block this external, same-user "
+            "attach — proceeding."
+        )
+    return warnings
 
 
 def classify_attach_error(

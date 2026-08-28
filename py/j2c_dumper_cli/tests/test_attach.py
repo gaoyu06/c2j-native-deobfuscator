@@ -223,12 +223,16 @@ def test_attach_requires_pid(runner, app):
 
 
 def test_attach_rejects_non_java_process(runner, app):
-    # Our own (Python) process: same uid, but not a JVM -> validation refuses.
+    # Our own (Python) process: same uid, but not a JVM -> validation refuses
+    # with the shared `attach failed (reason=not-a-jvm):` form (must-fix #2).
     result = runner.invoke(
         app, ["attach", "--pid", str(os.getpid()), "--i-own-this-process"]
     )
-    assert result.exit_code == 2
-    assert "does not look like a Java process" in _flat(result)
+    assert result.exit_code != 0
+    flat = _flat(result)
+    assert "attach failed (reason=not-a-jvm)" in flat
+    assert "does not look like a Java process" in flat
+    assert "attached (preview)" not in result.output
 
 
 def test_attach_help_marks_preview_and_flag(runner, app):
@@ -357,18 +361,26 @@ def test_scan_does_not_flag_dynamic_agent_loading_enabled():
     ) is None
 
 
-def test_scan_detects_allow_attach_self_false():
-    r = A.scan_cmdline_for_refusals(
+def test_scan_does_not_refuse_allow_attach_self_false():
+    # allowAttachSelf=false disables *self*-attach only; it must NOT hard-refuse
+    # this external, same-user attach. It is surfaced as a warning instead.
+    assert A.scan_cmdline_for_refusals(
+        ["java", "-Djdk.attach.allowAttachSelf=false", "-jar", "app.jar"]
+    ) is None
+    warnings = A.scan_cmdline_for_warnings(
         ["java", "-Djdk.attach.allowAttachSelf=false", "-jar", "app.jar"]
     )
-    assert r is not None
-    assert r.reason == A.REASON_ALLOW_ATTACH_SELF_DISABLED
+    assert any("allowAttachSelf=false" in w for w in warnings)
+    assert any("self-attach only" in w for w in warnings)
 
 
 def test_scan_ignores_allow_attach_self_true():
     assert A.scan_cmdline_for_refusals(
         ["java", "-Djdk.attach.allowAttachSelf=true", "-jar", "app.jar"]
     ) is None
+    assert A.scan_cmdline_for_warnings(
+        ["java", "-Djdk.attach.allowAttachSelf=true", "-jar", "app.jar"]
+    ) == []
 
 
 def test_scan_priority_attach_disabled_first():
@@ -485,6 +497,74 @@ def test_attach_refuses_disable_attach_mechanism_before_jcmd(
     flat = _flat(result)
     assert "attach-disabled" in flat
     assert "attached (preview)" not in result.output
+
+
+def test_attach_cross_user_prints_reason_form(runner, app, monkeypatch, tmp_path):
+    """A cross-user target must print the shared
+    `attach failed (reason=cross-user):` form (must-fix #2), exit non-zero, and
+    never print 'attached (preview)'."""
+    from j2c_dumper_cli import main as M
+
+    agent = tmp_path / "j2c_agent.so"
+    agent.write_bytes(b"\x7fELF")
+
+    monkeypatch.setattr(M, "current_uid", lambda: 1000)
+    monkeypatch.setattr(
+        M, "read_proc_info",
+        lambda p: A.ProcInfo(
+            pid=p, exists=True, uid=4242, comm="java",
+            cmdline=["/usr/bin/java", "-jar", "app.jar"],
+        ),
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("subprocess.run must not be called after refusal")
+
+    monkeypatch.setattr(M.subprocess, "run", boom)
+
+    result = runner.invoke(app, [
+        "attach", "--pid", "4321", "--i-own-this-process", "--agent", str(agent),
+    ])
+    assert result.exit_code != 0
+    flat = _flat(result)
+    assert "attach failed (reason=cross-user)" in flat
+    assert "attached (preview)" not in result.output
+
+
+def test_attach_allow_attach_self_false_warns_but_proceeds(
+    runner, app, monkeypatch, tmp_path
+):
+    """allowAttachSelf=false disables *self*-attach only; an external same-user
+    attach must NOT be refused for it (must-fix #1). The CLI warns and proceeds
+    to a normal (here faked-successful) attach."""
+    from j2c_dumper_cli import main as M
+
+    agent = tmp_path / "j2c_agent.so"
+    agent.write_bytes(b"\x7fELF")
+
+    monkeypatch.setattr(M, "_jdk_tool", lambda name: name)
+    monkeypatch.setattr(
+        M, "read_proc_info",
+        lambda p: A.ProcInfo(
+            pid=p, exists=True, uid=None, comm="java",
+            cmdline=["/usr/bin/java", "-Djdk.attach.allowAttachSelf=false",
+                     "-jar", "app.jar"],
+        ),
+    )
+    monkeypatch.setattr(
+        M.subprocess, "run",
+        lambda *a, **k: _FakeCompleted(0, stdout="4321:\nreturn code: 0\n"),
+    )
+
+    result = runner.invoke(app, [
+        "attach", "--pid", "4321", "--i-own-this-process",
+        "--agent", str(agent), "--mechanism", "jcmd",
+    ])
+    assert result.exit_code == 0
+    flat = _flat(result)
+    assert "allowAttachSelf=false" in flat  # warned
+    assert "attach failed" not in flat      # not refused
+    assert "attached (preview)" in flat      # proceeded
 
 
 def test_attach_jcmd_failure_prints_reason_and_startup_path(

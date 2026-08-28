@@ -27,6 +27,7 @@ from .attach_support import (
     parse_jcmd_return_code,
     read_proc_info,
     scan_cmdline_for_refusals,
+    scan_cmdline_for_warnings,
     validate_attach_target,
 )
 
@@ -493,11 +494,20 @@ def cli_attach(
     for warning in result.warnings:
         console.print(f"[yellow]warning:[/] {warning}")
     if not result.ok:
+        # cross-user / not-a-jvm carry a stable reason code: print the same
+        # `attach failed (reason=<code>):` form as every other refusal.
+        if result.refusals:
+            _report_refusal(result.refusals[0])
         for problem in result.problems:
             console.print(f"[red]error:[/] {problem}")
         raise typer.Exit(code=2)
 
-    # 2b. Pre-attach cmdline scan: if the target's own argv shows the attach or
+    # 2b. Non-fatal cmdline notes (e.g. jdk.attach.allowAttachSelf=false, which
+    # only disables self-attach and does not block this external attach).
+    for note in scan_cmdline_for_warnings(proc.cmdline):
+        console.print(f"[yellow]warning:[/] {note}")
+
+    # 2c. Pre-attach cmdline scan: if the target's own argv shows the attach or
     # dynamic-agent-loading mechanism is disabled, classify and refuse *before*
     # invoking jcmd/VirtualMachine. This is honest handling, not a bypass: the
     # remedy is to restart under startup instrumentation.

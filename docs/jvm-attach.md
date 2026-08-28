@@ -186,13 +186,25 @@ It never prints `attached (preview)` in these cases.
 |---|---|---|
 | `attach-disabled` | `-XX:+DisableAttachMechanism` on argv, or the attach handshake is unavailable (`AttachNotSupportedException`, "unable to open socket file", "attach listener", "doesn't respond within …") | Refuse; recommend restarting under startup `-agentpath`. **No bypass** of `DisableAttachMechanism`. |
 | `dynamic-agent-disabled` | `-XX:-EnableDynamicAgentLoading` on argv, or "dynamic agent loading is not enabled" from the attach layer | Refuse; recommend startup `-agentpath`. |
-| `allow-attach-self-disabled` | `-Djdk.attach.allowAttachSelf=false` on argv | Refuse (this only blocks a *self*-attach); attach from a separate process, or use the startup path. |
 | `cross-user` | Same-user check fails pre-attach, or the attach layer refuses on ownership/permission grounds ("operation not permitted", "well-known file is not secure") | Refuse; run as the owning user — **no** privilege escalation to cross users. |
 | `not-a-jvm` | The target does not look like a JVM (pre-attach validation) | Refuse before touching the target. |
 | `agent-onattach-missing` | Attach output shows the agent has no `Agent_OnAttach` export | Refuse; rebuild the current `native/` sources (they export it). |
 | `agent-init-failed` | `Agent_OnAttach` ran but returned non-zero / `AgentInitializationException` | Refuse; check the target JVM's stderr for the agent's own diagnostics. |
 | `jcmd-false-success` | `jcmd` exited 0 but `return code: <N≠0>` | Treat as failure, not success (see "Failure reporting" above). |
 | `unknown` | Attach failed with an unrecognized error | Refuse; include a truncated raw snippet for context. |
+
+Both pre-validation refusals — `cross-user` (owner uid ≠ current uid) and
+`not-a-jvm` (the target does not look like a JVM) — print the same
+`attach failed (reason=<code>): …` line as the rows above, exit non-zero, and
+never print `attached (preview)`.
+
+**`jdk.attach.allowAttachSelf=false` is not a refusal.** This property disables
+a JVM attaching to *its own* process (self-attach). It does **not** block an
+external, same-user attach from this CLI, so the pre-attach scan only **warns**
+(`target sets jdk.attach.allowAttachSelf=false … proceeding.`) and continues —
+it does not refuse a valid same-user target on the strength of a flag that does
+not apply to us. The hard pre-scan refusals remain `-XX:+DisableAttachMechanism`
+and `-XX:-EnableDynamicAgentLoading`.
 
 **Reduced coverage is not a refusal.** If the attach *succeeds* but the JDK
 grants only bind-only capabilities (the common OpenJDK 21 case), that is honest
@@ -257,9 +269,11 @@ applicable. It does **not** attempt to hide itself or patch the target's checks.
 **Unsupported / known gaps:**
 
 - **Attach disabled on the target.** If the JVM was started with
-  `-XX:+DisableAttachMechanism` (or `-Djdk.attach.allowAttachSelf=false` for
-  self-attach), the attach handshake fails. There is no workaround from this
-  tool — restart the target and use the startup `-agentpath` path instead.
+  `-XX:+DisableAttachMechanism`, the attach handshake fails. There is no
+  workaround from this tool — restart the target and use the startup
+  `-agentpath` path instead. (Note `-Djdk.attach.allowAttachSelf=false` is
+  *not* in this category: it only disables a JVM attaching to itself and does
+  not block this external, same-user attach — the CLI warns and proceeds.)
 - **Dynamic agent loading disabled / warned.** Recent JDKs restrict or warn on
   dynamically loaded agents (`-XX:-EnableDynamicAgentLoading`, and the
   "a dynamically loaded agent has been loaded" warning). If dynamic loading is
