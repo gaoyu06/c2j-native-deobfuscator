@@ -7,7 +7,9 @@
   2. Sync the Python workspace (uv, or pip fallback)
   3. Build the native JVMTI agent when a JDK is available
 
-  Re-running is safe. On success, run:  python -m j2c_dumper_cli doctor
+  Re-running is safe. uv installs the Python workspace into py/.venv, so use the
+  scripts\j2c.ps1 launcher (which selects that interpreter) rather than a bare
+  `python -m j2c_dumper_cli`. On success, run:  scripts\j2c.ps1 doctor
 
 .PARAMETER Force
   Rebuild the native agent even if it is already up to date.
@@ -90,6 +92,11 @@ if ($SkipNative) {
     # On Windows only j2c_agent.dll is loadable; a leftover .so/.dylib is a
     # wrong-platform artifact and must not count as "already built".
     $agent = Join-Path $libDir "j2c_agent.dll"
+    # native/build.sh cross-targets x86-64 only; on an ARM64 Windows host it
+    # would emit a DLL the JVM here cannot load, so do not build it and do not
+    # report the default dynamic path as ready.
+    $hostArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    $archOk = ($hostArch -eq "AMD64")
     # Rebuild when the DLL is missing, empty, or older than any input.
     $needsBuild = $true
     if ((Test-Path $agent) -and ((Get-Item $agent).Length -gt 0)) {
@@ -108,7 +115,12 @@ if ($SkipNative) {
     # the Windows DLL. WSL runs it as Linux: it selects a Linux target and emits a
     # .so, not the Windows .dll the JVM here loads, so it is NOT equivalent.
     $hasBash = Get-Command bash -ErrorAction SilentlyContinue
-    if ((-not $needsBuild) -and (-not $Force)) {
+    if (-not $archOk) {
+        Warn "This host is $hostArch, but native/build.sh targets x86-64; skipping native agent."
+        Warn "The default dynamic path needs a host-matching agent. Use the emulation fallback,"
+        Warn "or port native/build.sh to $hostArch and rebuild."
+        $nativeNote = "native agent skipped ($hostArch host; build.sh targets x86-64); the dynamic path is unavailable"
+    } elseif ((-not $needsBuild) -and (-not $Force)) {
         Info "Native agent up to date ($agent); pass -Force to rebuild."
         $nativeReady = $true
     } elseif (-not (Test-Path (Join-Path $jdkHome "include"))) {
@@ -138,9 +150,10 @@ if ($SkipNative) {
 }
 
 if ($nativeReady) {
-    Info "Setup finished (default dynamic path ready). Verify with: python -m j2c_dumper_cli doctor"
+    Info "Setup finished: required versions and build artifacts for the default (dynamic) path are in place."
+    Info "Recovery is still best-effort per target — inspect the output. Verify the toolchain with: scripts\j2c.ps1 doctor"
 } else {
     Warn "Setup finished, but $nativeNote."
     Warn "Use the emulation fallback, or install the missing piece and re-run."
-    Info "Verify with: python -m j2c_dumper_cli doctor"
+    Info "Verify with: scripts\j2c.ps1 doctor"
 }

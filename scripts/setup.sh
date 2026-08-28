@@ -8,7 +8,9 @@
 # Re-running is safe: Gradle and uv skip up-to-date work, and the native
 # agent is only rebuilt when its inputs changed (or --force is passed).
 #
-# On success, run:  python3 -m j2c_dumper_cli doctor
+# uv installs the Python workspace into py/.venv, so use the scripts/j2c
+# launcher (which selects that interpreter) rather than a bare
+# `python3 -m j2c_dumper_cli`. On success, run:  scripts/j2c doctor
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -98,45 +100,54 @@ else
         *)                   AGENT_NAME="j2c_agent.so" ;;
     esac
     HOST_ARCH="$(uname -m)"
-    case "$HOST_ARCH" in
-        x86_64|amd64) : ;;
-        *) warn "native/build.sh targets x86-64 but this host is $HOST_ARCH; the agent may not load. " \
-                "Rebuild for $HOST_ARCH if the dynamic path fails to attach." ;;
-    esac
     AGENT="$LIBDIR/$AGENT_NAME"
-    # Rebuild when the artifact is missing, empty, or older than any input.
-    needs_build=0
-    if [ ! -s "$AGENT" ]; then
-        needs_build=1
-    else
-        for src in "$ROOT"/native/src/*.cpp "$ROOT"/native/include/* "$ROOT/native/build.sh"; do
-            [ -e "$src" ] || continue
-            if [ "$src" -nt "$AGENT" ]; then needs_build=1; break; fi
-        done
-    fi
-    if [ "$needs_build" -eq 0 ] && [ "$FORCE" -eq 0 ]; then
-        info "Native agent up to date ($AGENT); pass --force to rebuild."
-        NATIVE_READY=1
-    elif [ ! -d "$JDK_HOME/include" ]; then
-        warn "No JDK headers under '$JDK_HOME/include'; skipping native agent."
-        warn "Install a full JDK (not just a JRE), set JAVA_HOME, then re-run."
-        NATIVE_NOTE="native agent skipped (no JDK headers); the dynamic path is unavailable"
-    elif ! command -v zig >/dev/null 2>&1 && [ -z "${ZIG:-}" ]; then
-        warn "zig not found; skipping native agent (needed only for the dynamic path)."
-        warn "Install zig 0.16.x or set ZIG, then re-run. Emulation path needs no native build."
-        NATIVE_NOTE="native agent skipped (zig not found); the dynamic path is unavailable"
-    else
-        info "Building native JVMTI agent (JDK_HOME=$JDK_HOME)"
-        ( cd "$ROOT/native" && JDK_HOME="$JDK_HOME" ZIG="${ZIG:-zig}" bash build.sh ) \
-            || die "Native agent build failed. See the output above."
-        NATIVE_READY=1
-    fi
+    case "$HOST_ARCH" in
+        x86_64|amd64)
+            # Rebuild when the artifact is missing, empty, or older than any input.
+            needs_build=0
+            if [ ! -s "$AGENT" ]; then
+                needs_build=1
+            else
+                for src in "$ROOT"/native/src/*.cpp "$ROOT"/native/include/* "$ROOT/native/build.sh"; do
+                    [ -e "$src" ] || continue
+                    if [ "$src" -nt "$AGENT" ]; then needs_build=1; break; fi
+                done
+            fi
+            if [ "$needs_build" -eq 0 ] && [ "$FORCE" -eq 0 ]; then
+                info "Native agent up to date ($AGENT); pass --force to rebuild."
+                NATIVE_READY=1
+            elif [ ! -d "$JDK_HOME/include" ]; then
+                warn "No JDK headers under '$JDK_HOME/include'; skipping native agent."
+                warn "Install a full JDK (not just a JRE), set JAVA_HOME, then re-run."
+                NATIVE_NOTE="native agent skipped (no JDK headers); the dynamic path is unavailable"
+            elif ! command -v zig >/dev/null 2>&1 && [ -z "${ZIG:-}" ]; then
+                warn "zig not found; skipping native agent (needed only for the dynamic path)."
+                warn "Install zig 0.16.x or set ZIG, then re-run. Emulation path needs no native build."
+                NATIVE_NOTE="native agent skipped (zig not found); the dynamic path is unavailable"
+            else
+                info "Building native JVMTI agent (JDK_HOME=$JDK_HOME)"
+                ( cd "$ROOT/native" && JDK_HOME="$JDK_HOME" ZIG="${ZIG:-zig}" bash build.sh ) \
+                    || die "Native agent build failed. See the output above."
+                NATIVE_READY=1
+            fi
+            ;;
+        *)
+            # native/build.sh cross-targets x86-64 unconditionally; on any other
+            # host CPU it would emit an agent this JVM cannot load. Do not build
+            # it and do not report the default dynamic path as ready.
+            warn "This host is $HOST_ARCH, but native/build.sh targets x86-64; skipping native agent."
+            warn "The default dynamic path needs a host-matching agent. Use the emulation fallback,"
+            warn "or port native/build.sh to $HOST_ARCH and rebuild."
+            NATIVE_NOTE="native agent skipped ($HOST_ARCH host; build.sh targets x86-64); the dynamic path is unavailable"
+            ;;
+    esac
 fi
 
 if [ "$NATIVE_READY" -eq 1 ]; then
-    info "Setup finished (default dynamic path ready). Verify with: python3 -m j2c_dumper_cli doctor"
+    info "Setup finished: required versions and build artifacts for the default (dynamic) path are in place."
+    info "Recovery is still best-effort per target — inspect the output. Verify the toolchain with: scripts/j2c doctor"
 else
     warn "Setup finished, but $NATIVE_NOTE."
     warn "Use the emulation fallback, or install the missing piece and re-run."
-    info "Verify with: python3 -m j2c_dumper_cli doctor"
+    info "Verify with: scripts/j2c doctor"
 fi
