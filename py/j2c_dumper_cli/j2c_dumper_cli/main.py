@@ -17,12 +17,17 @@ from rich.console import Console
 
 from j2c_dumper_cli import doctor as doctor_mod
 
-HELP = """\
+# The interpreter name setup selects and that is present on each platform:
+# a minimal POSIX environment ships `python3` (not `python`); Windows ships
+# `python`. Runtime messages echo the one that will actually work here.
+PYCMD = "python" if os.name == "nt" else "python3"
+
+HELP = f"""\
 Recover JNI-native transpiled JARs back to readable JVM bytecode.
 
 DEFAULT PATH (dynamic): if the JAR can be launched, run
 
-    python -m j2c_dumper_cli recover IN.jar -o OUT.jar --run-cmd "java -jar IN.jar"
+    {PYCMD} -m j2c_dumper_cli recover IN.jar -o OUT.jar --run-cmd "java -jar IN.jar"
 
 FIRST TIME? run `doctor` to check your toolchain, then `scripts/setup.sh`
 (or `scripts/setup.ps1` on Windows) to build everything.
@@ -34,10 +39,19 @@ individual stage commands and docs/getting-started.md.
 
 app = typer.Typer(
     add_completion=False,
-    no_args_is_help=True,
     help=HELP,
 )
 console = Console(stderr=True)
+
+
+@app.callback(invoke_without_command=True)
+def _root(ctx: typer.Context) -> None:
+    # Running with no subcommand prints help and exits 0 (a successful,
+    # intentional "show me what's here"), rather than Typer's default
+    # usage-error exit code.
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit(code=0)
 
 
 # ------------------------------------------------------------------
@@ -63,7 +77,7 @@ def jvm_bin(name: str) -> Path:
             f"JVM module '{name}' is not built.\n"
             f"  Fix: run scripts/setup.sh (or scripts/setup.ps1 on Windows),\n"
             f"       or `cd jvm && ./gradlew :{name}:installDist`.\n"
-            f"  Diagnose: python -m j2c_dumper_cli doctor"
+            f"  Diagnose: {PYCMD} -m j2c_dumper_cli doctor"
         )
     return candidate
 
@@ -75,17 +89,21 @@ def native_lib() -> Path:
     hint = (
         "  Fix: run scripts/setup.sh (or scripts/setup.ps1 on Windows),\n"
         "       or `cd native && JDK_HOME=\"$JAVA_HOME\" bash build.sh`.\n"
-        "  Diagnose: python -m j2c_dumper_cli doctor"
+        f"  Diagnose: {PYCMD} -m j2c_dumper_cli doctor"
     )
     if not libdir.exists():
         raise FileNotFoundError(
             "Native JVMTI agent is not built (the dynamic path needs it).\n" + hint
         )
-    for name in ("j2c_agent.dll", "j2c_agent.so", "j2c_agent.dylib"):
-        if (libdir / name).exists():
-            return libdir / name
+    # Only the host-matching artifact can be loaded here; a leftover .so on
+    # Windows (or .dll on Linux) is not usable.
+    want = doctor_mod.host_agent_name()
+    target = libdir / want
+    if target.exists():
+        return target
     raise FileNotFoundError(
-        f"Native JVMTI agent is not built: no j2c_agent.* under {libdir}.\n" + hint
+        f"Native JVMTI agent is not built for this host: no {want} under {libdir}.\n"
+        + hint
     )
 
 
@@ -190,7 +208,7 @@ def _preflight_recover(run_cmd: Optional[str], no_dynamic: bool) -> None:
                       "artifacts are missing.")
         for p in problems:
             console.print(f"  - {p}")
-        console.print("Run [bold]python -m j2c_dumper_cli doctor[/] for a full "
+        console.print(f"Run [bold]{PYCMD} -m j2c_dumper_cli doctor[/] for a full "
                       "report, then [bold]scripts/setup.sh[/] "
                       "(or scripts/setup.ps1 on Windows).")
         raise typer.Exit(code=2)
@@ -305,8 +323,16 @@ def doctor() -> None:
             console.print(f"  - {tag}{c.name}: {c.fix}")
 
     if report.healthy:
-        console.print("\n[bold green]Ready.[/] Try: "
-                      "python -m j2c_dumper_cli recover IN.jar -o OUT.jar "
+        # These checks confirm the required tool versions and that the build
+        # artifacts the default path needs are present. They do not launch the
+        # JVM modules or load the agent, so this is a readiness of the inputs,
+        # not a guarantee that a given target recovers cleanly.
+        console.print("\n[bold green]Required checks passed.[/] "
+                      "Versions and build artifacts for the default path are "
+                      "in place.")
+        for c in report.warnings:
+            console.print(f"[yellow]note:[/] {c.name}: {c.detail}")
+        console.print(f"Try: {PYCMD} -m j2c_dumper_cli recover IN.jar -o OUT.jar "
                       "--run-cmd \"java -jar IN.jar\"")
     else:
         missing = ", ".join(c.name for c in report.blocking)

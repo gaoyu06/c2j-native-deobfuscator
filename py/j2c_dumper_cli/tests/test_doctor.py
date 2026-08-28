@@ -127,18 +127,51 @@ def test_check_jvm_modules_ok(tmp_path):
 # Native agent probe
 # ------------------------------------------------------------------
 
+def _write_agent(tmp_path, libname, size=doctor._MIN_AGENT_BYTES + 1):
+    libdir = tmp_path / "native" / "build" / "lib"
+    libdir.mkdir(parents=True, exist_ok=True)
+    (libdir / libname).write_bytes(b"\x7fELF" + b"\x00" * (size - 4))
+    return libdir
+
+
+def test_host_agent_name_per_platform():
+    assert doctor.host_agent_name("linux") == "j2c_agent.so"
+    assert doctor.host_agent_name("darwin") == "j2c_agent.dylib"
+    assert doctor.host_agent_name("win32") == "j2c_agent.dll"
+
+
 def test_check_native_agent_missing(tmp_path):
     c = doctor.check_native_agent(tmp_path)
     assert c.status == doctor.STATUS_MISSING
     assert c.fix
 
 
-@pytest.mark.parametrize("libname", ["j2c_agent.so", "j2c_agent.dll", "j2c_agent.dylib"])
-def test_check_native_agent_present(tmp_path, libname):
+def test_check_native_agent_present_host_match(tmp_path):
+    # The host-matching name (as this interpreter sees it) reads as ready.
+    _write_agent(tmp_path, doctor.host_agent_name())
+    assert doctor.check_native_agent(tmp_path).status == doctor.STATUS_OK
+
+
+def test_check_native_agent_rejects_wrong_platform(tmp_path, monkeypatch):
+    # Pretend we are on Linux; a leftover Windows DLL must not read as ready.
+    monkeypatch.setattr(doctor.sys, "platform", "linux")
+    monkeypatch.setattr(doctor.os, "name", "posix")
+    _write_agent(tmp_path, "j2c_agent.dll")
+    c = doctor.check_native_agent(tmp_path)
+    assert c.status == doctor.STATUS_MISSING
+    assert "j2c_agent.so" in c.detail  # tells the user what this host needs
+    assert "j2c_agent.dll" in c.detail  # names the wrong-platform leftover
+
+
+def test_check_native_agent_rejects_empty_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor.sys, "platform", "linux")
+    monkeypatch.setattr(doctor.os, "name", "posix")
     libdir = tmp_path / "native" / "build" / "lib"
     libdir.mkdir(parents=True)
-    (libdir / libname).write_bytes(b"\x7fELF")
-    assert doctor.check_native_agent(tmp_path).status == doctor.STATUS_OK
+    (libdir / "j2c_agent.so").write_bytes(b"")  # 0 bytes → not a real library
+    c = doctor.check_native_agent(tmp_path)
+    assert c.status == doctor.STATUS_MISSING
+    assert "empty" in c.detail or "truncated" in c.detail
 
 
 # ------------------------------------------------------------------
@@ -207,9 +240,59 @@ def test_build_report_healthy_when_everything_present(tmp_path, monkeypatch):
                         lambda exe: 'openjdk version "21.0.10"')
     monkeypatch.setattr(sys, "version_info", (3, 11, 5))
     _make_jvm_installs(tmp_path, doctor.REQUIRED_JVM_MODULES)
-    libdir = tmp_path / "native" / "build" / "lib"
-    libdir.mkdir(parents=True)
-    (libdir / "j2c_agent.so").write_bytes(b"\x7fELF")
+    _write_agent(tmp_path, doctor.host_agent_name())
     report = doctor.build_report(tmp_path)
     assert report.healthy
     assert report.blocking == []
+
+
+def test_warn_does_not_block():
+    # A required check that only WARNs is a caveat, not a blocker.
+    r = doctor.Report()
+    r.add(doctor.Check("Java / JDK 17+", doctor.STATUS_WARN, "no JAVA_HOME"))
+    r.add(doctor.Check("Python 3.11+", doctor.STATUS_OK, "3.12"))
+    assert r.healthy
+    assert r.blocking == []
+    assert [c.name for c in r.warnings] == ["Java / JDK 17+"]
+
+
+def test_build_report_warn_stays_healthy(tmp_path, monkeypatch):
+    # Java new enough but JAVA_HOME unset -> WARN, yet the report is healthy
+    # because the agent and modules are present.
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    monkeypatch.setattr(doctor, "_java_executable", lambda: "/usr/bin/java")
+    monkeypatch.setattr(doctor, "_query_java_version",
+                        lambda exe: 'openjdk version "17.0.9"')
+    monkeypatch.setattr(sys, "version_info", (3, 11, 5))
+    _make_jvm_installs(tmp_path, doctor.REQUIRED_JVM_MODULES)
+    _write_agent(tmp_path, doctor.host_agent_name())
+    report = doctor.build_report(tmp_path)
+    assert report.healthy
+    assert any(c.status == doctor.STATUS_WARN for c in report.warnings)
+
+
+# ------------------------------------------------------------------
+# Python recover-stage dependency probe
+# ------------------------------------------------------------------
+
+def test_check_python_recover_deps_ok():
+    # capstone + lief are installed in the test/setup environment.
+    c = doctor.check_python_recover_deps()
+    assert c.status == doctor.STATUS_OK
+    assert not c.optional
+
+
+def test_check_python_recover_deps_missing(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "binary_introspect.cli" or name.startswith("capstone"):
+            raise ModuleNotFoundError("No module named 'capstone'", name="capstone")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    c = doctor.check_python_recover_deps()
+    assert c.status == doctor.STATUS_MISSING
+    assert not c.optional
+    assert c.fix
