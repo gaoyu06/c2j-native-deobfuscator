@@ -34,7 +34,7 @@ review can be skipped.
 | **#6** | `doctor`, setup scripts, launchers, and getting-started material. JDK 17 is retained. | **Yes, as a draft.** | Normal merge review remains; no JDK migration is implied. |
 | **#7** | Native-x86 process inspection, library instrumentation, and plugin ABI at `8b9231c145e80acbc723fbc893d072398cba143b`, after multiple must-fix rounds. | **Yes, as a preview draft only.** | Yes for later promotion, broader platform support, ABI trust, and transport decisions. The current preview verdict is supported by the completed review rounds and smoke evidence. |
 | **#8** | Optional Swing + FlatLaf artifact viewer. The visual pass is complete. The desktop module uses JDK 21 while the repository baseline remains JDK 17. | **Yes, as an optional desktop draft.** | Yes, principally for the JDK 21 module boundary and normal merge review. |
-| **#9** | Opt-in JVMTI attach at `1a8cea87e8882fd48df8c00c5034021e23ccdaf3`. Common attach refusals are classified, there is no stealth or bypass behavior, and default recovery remains startup `-agentpath`. | **Yes: ship-as-preview-draft.** | Two review nits remain: `allowAttachSelf=false` governs self-attach and must not hard-refuse an external CLI, and pre-validation should print reason codes. Review remains required before capability or default-policy expansion. |
+| **#9** | Opt-in JVMTI attach at `f7664e46f89b83bc6ffb6c3680193412c8cbff36`. Common attach refusals are classified, there is no stealth or bypass behavior, and default recovery remains startup `-agentpath`. | **Yes: ship-as-preview-draft.** | `allowAttachSelf=false` warns rather than hard-refusing the external CLI; `cross-user` and `not-a-jvm` failures print `attach failed (reason=…)`; pytest reports 55 passed. Review remains required before capability or default-policy expansion. |
 | **#10** | This options and status report; documentation only. | **Yes, as docs.** | Owner accuracy and decision sign-off. |
 | **#11** | Optional privileged observer at `dc30188118a6579c024978fa9ff52ca154012170`, with a versioned plugin ABI and Linux maps backend. It is default-off userspace code with no kernel files. | **Yes: ship-as-preview-userspace.** | Yes for later promotion and merge-order integration with #7. It is not a kernel feature, and the default remains **no**. |
 | **#12** | Desktop live-attach/listen GUI, based on PR #8’s branch rather than `main`. Visual review is preview-ok. | **Yes, as a preview after #8.** | Yes for integration review after #8 and for the same attach limitations as #9. |
@@ -106,16 +106,16 @@ remain explicit rather than silently changing the repository baseline.
 ### JVMTI attach (#9)
 
 - The reviewed revision is
-  `1a8cea87e8882fd48df8c00c5034021e23ccdaf3`.
+  `f7664e46f89b83bc6ffb6c3680193412c8cbff36`.
 - Attach is opt-in and uses the existing same-user plus explicit confirmation
   policy.
 - Common attach refusals are classified.
 - There is no stealth or bypass behavior.
 - On OpenJDK 21, live attach is often bind-only.
 - Startup `-agentpath` remains the default recovery path.
-- Outstanding review nit: `allowAttachSelf=false` controls JVM self-attach; it
-  should not cause the external CLI to hard-refuse an attach attempt.
-- Outstanding review nit: pre-validation should print its reason codes.
+- `allowAttachSelf=false` warns and does not hard-refuse the external CLI.
+- `cross-user` and `not-a-jvm` failures print `attach failed (reason=…)`.
+- The test run reports `pytest`: 55 passed.
 
 The consequence is that attach can ship as a preview, but the GUI and CLI must
 display the capability actually obtained and must not imply startup-equivalent
@@ -185,8 +185,9 @@ the recommendation, and the consequence of adopting it.
 - #8/#12 must keep their JDK 21 requirement module-local unless the repository
   separately approves a baseline migration.
 - #9/#12 must report actual attach capabilities and retain startup `-agentpath`
-  as the default recovery path. #9 should also correct the `allowAttachSelf`
-  pre-check and print pre-validation reason codes.
+  as the default recovery path. #9 now warns for `allowAttachSelf=false` rather
+  than hard-refusing the external CLI, and prints reason codes for `cross-user`
+  and `not-a-jvm` failures.
 - #11 is a userspace preview with a versioned plugin ABI and Linux maps backend.
   It must remain default-off, and any promotion or kernel scope requires a
   separate decision backed by new evidence.
