@@ -34,13 +34,5 @@
       ]
     }
   ],
-  "bindingGaps": [
-    {
-      "kind": "unbound-native-method",
-      "method": "com/example/Crypto.checksum",
-      "desc": "([B)J",
-      "detail": "com/example/Crypto.checksum ([B)J had no RegisterNatives call site match"
-    }
-  ],
   "hiddenClasses": []
 }

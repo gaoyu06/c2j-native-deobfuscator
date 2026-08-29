@@ -68,6 +68,7 @@ fun main(args: Array<String>) {
             val content = f.contentPane
             val cw = content.width.coerceAtLeast(1)
             val ch = content.height.coerceAtLeast(1)
+            println("PROBE $name content=${cw}x$ch")
             val img = BufferedImage(cw, ch, BufferedImage.TYPE_INT_RGB)
             val g = img.createGraphics()
             content.printAll(g)
@@ -112,9 +113,12 @@ fun main(args: Array<String>) {
         f.selectTab("Trace")
     }
 
-    // The honest attach form: a PID and the ownership box are set so the shown
-    // command carries --i-own-this-process and the Run button is live.
-    componentShot("07-attach-form", 560, 560) {
+    // The honest attach form. A PID and the ownership box are set so the shown
+    // command carries --i-own-this-process, but on this checkout the attach
+    // preview CLI is absent, so the form says so and keeps Run disabled — it
+    // never pretends the displayed command would run. Listen and the pre-scan
+    // still work.
+    componentShot("07-attach-form", 560, 620) {
         AttachPanel(
             defaultOutput = "trace.jsonl",
             onStartTail = {},
@@ -149,7 +153,7 @@ fun main(args: Array<String>) {
     // -XX:+DisableAttachMechanism, so the form refuses before launch, names the
     // reason code, gives the one-line meaning, and points at the startup path.
     // No stealth, no bypass — reaching this banner means no attach happened.
-    componentShot("10-attach-refused", 560, 560) {
+    componentShot("10-attach-refused", 560, 620) {
         AttachPanel(
             defaultOutput = "trace.jsonl",
             onStartTail = {},
@@ -166,6 +170,32 @@ fun main(args: Array<String>) {
                 )
             )
             showRefusal(AttachRefusal(AttachRefusalCode.ATTACH_DISABLED, RefusalSource.CMDLINE_SCAN))
+        }
+    }
+
+    // A non-fatal argv warning surfaced by the real pre-scan: the target sets
+    // -Djdk.attach.allowAttachSelf=false, which governs self-attach only and
+    // does NOT block this same-user attach, so the form warns (amber) and does
+    // not refuse. Same scan/classification the live refresh runs.
+    componentShot("12-attach-self-warning", 560, 620) {
+        AttachPanel(
+            defaultOutput = "trace.jsonl",
+            onStartTail = {},
+            onClose = {},
+        ).apply {
+            applyRequest(
+                AttachRequest(
+                    pid = "48213",
+                    output = "trace.jsonl",
+                    iOwnThisProcess = true,
+                    logAll = false,
+                    mechanism = "auto",
+                    agentPath = "",
+                )
+            )
+            previewCmdlineScan(
+                listOf("java", "-Djdk.attach.allowAttachSelf=false", "-jar", "app.jar"),
+            )
         }
     }
 

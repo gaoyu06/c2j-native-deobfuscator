@@ -72,7 +72,11 @@ object SessionScanner {
         )
 
         val traceEvents = readTrace(tracePath, notes)
-        val binaryAnalysis = readBinaryAnalysis(binary)
+        // bindingGaps live on manifest.json (PR #4 writes them there); read the
+        // manifest as a tree too so they can be lifted onto the analysis strip.
+        // Quiet read — the typed manifest read above already reports any problem.
+        val manifestTree = tryReadTreeQuiet(manifestPath)
+        val binaryAnalysis = readBinaryAnalysis(binary, manifestTree)
 
         val next = NextCommandPlanner.plan(
             hasClasses = classesPath.exists(),
@@ -91,15 +95,21 @@ object SessionScanner {
     // ---------------------------------------------------------------
 
     /**
-     * Pull the compact analysis facts out of binary.json. Reads defensively:
-     * `input.format` / `input.arch` are long-standing, while `analysis.profile`,
-     * `analysis.methodDiscovery`, and `bindingGaps` are newer and optional — any
-     * missing field reads as null / empty and is omitted from the strip.
+     * Pull the compact analysis facts out of the reports. Reads defensively and
+     * from the source each field actually lives in:
+     *  - `input.format` / `input.arch` and `analysis.*` come from `binary.json`;
+     *  - `bindingGaps` come from `manifest.json` (PR #4 writes them on the
+     *    manifest), and only fall back to `binary.json` when a run put them
+     *    there instead.
+     * Any missing field reads as null / empty and is omitted from the strip, so
+     * this still works against older reports that only carry the counts.
      */
-    private fun readBinaryAnalysis(binary: JsonNode?): BinaryAnalysis? {
+    private fun readBinaryAnalysis(binary: JsonNode?, manifest: JsonNode?): BinaryAnalysis? {
         if (binary == null) return null
         val input = binary["input"]
         val analysis = binary["analysis"]
+        val bindingGaps = readBindingGaps(manifest?.get("bindingGaps"))
+            .ifEmpty { readBindingGaps(binary["bindingGaps"]) }
         return BinaryAnalysis(
             format = input?.get("format")?.textOrNull(),
             arch = input?.get("arch")?.textOrNull(),
@@ -107,7 +117,7 @@ object SessionScanner {
             methodDiscovery = analysis?.get("methodDiscovery")?.textOrNull(),
             nativeClassCount = binary["nativeRegistry"]?.size() ?: 0,
             stringCount = binary["stringPool"]?.get("strings")?.size() ?: 0,
-            bindingGaps = readBindingGaps(binary["bindingGaps"]),
+            bindingGaps = bindingGaps,
         )
     }
 
@@ -288,6 +298,17 @@ object SessionScanner {
             JsonIO.mapper.readTree(Files.readString(path))
         } catch (e: Exception) {
             notes += "could not read ${path.name}: ${e.message}"
+            null
+        }
+    }
+
+    /** Read a JSON file as a tree without recording a note on failure — used
+     *  when a typed read of the same file already reports any problem. */
+    private fun tryReadTreeQuiet(path: Path): JsonNode? {
+        if (!path.exists()) return null
+        return try {
+            JsonIO.mapper.readTree(Files.readString(path))
+        } catch (e: Exception) {
             null
         }
     }

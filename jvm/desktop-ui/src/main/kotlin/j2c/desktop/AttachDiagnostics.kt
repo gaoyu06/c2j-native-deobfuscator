@@ -65,6 +65,14 @@ object AttachDiagnostics {
     }
 
     /**
+     * The target's argv tokens (Linux `/proc/<pid>/cmdline`), or null when
+     * unreadable / non-Linux. Public so the form can derive both a hard refusal
+     * ([scanCmdlineTokens]) and the non-fatal warnings ([warningsForTokens])
+     * from a single read on each refresh.
+     */
+    fun cmdlineTokens(pid: Int): List<String>? = readCmdline(pid)
+
+    /**
      * The pure part of [scanCmdline]: classify an argv token list. Kept separate
      * so it tests without procfs.
      *

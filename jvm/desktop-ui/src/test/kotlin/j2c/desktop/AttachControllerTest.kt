@@ -167,4 +167,97 @@ class AttachControllerTest {
         assertTrue(rec.contains("-agentpath"), "got: $rec")
         assertTrue(rec.contains("recover"), "got: $rec")
     }
+
+    // ---------------------------------------------------------------
+    // Outcome decision — the tail / announce rule after a finished run.
+    // A refusal OR any non-zero exit must not tail and must not claim
+    // attached; only a clean exit with no refusal is a real attach.
+    // ---------------------------------------------------------------
+
+    @Test
+    fun `a non-zero exit never tails and never claims attached`() {
+        val outcome = AttachController.outcomeFor(
+            AttachController.RunResult(exitCode = 3, output = "some attach-layer error, no reason code"),
+        )
+        assertNull(outcome.refusal)
+        assertFalse(outcome.shouldTail, "must not tail on a non-zero exit")
+        assertFalse(outcome.shouldAnnounceAttached, "must not claim attached on a non-zero exit")
+    }
+
+    @Test
+    fun `a parsed refusal never tails and never claims attached even on exit zero`() {
+        // jcmd can exit 0 while the agent actually refused; the reason line wins.
+        val outcome = AttachController.outcomeFor(
+            AttachController.RunResult(
+                exitCode = 0,
+                output = "error: attach failed (reason=jcmd-false-success): agent returned an error",
+            ),
+        )
+        assertEquals(AttachRefusalCode.JCMD_FALSE_SUCCESS, outcome.refusal?.code)
+        assertFalse(outcome.shouldTail, "must not tail when the CLI printed a refusal")
+        assertFalse(outcome.shouldAnnounceAttached, "must not claim attached when the CLI refused")
+    }
+
+    @Test
+    fun `a clean exit with no refusal tails and announces attached`() {
+        val outcome = AttachController.outcomeFor(
+            AttachController.RunResult(exitCode = 0, output = "agent loaded; detaching\n"),
+        )
+        assertNull(outcome.refusal)
+        assertTrue(outcome.shouldTail)
+        assertTrue(outcome.shouldAnnounceAttached)
+    }
+
+    // ---------------------------------------------------------------
+    // Attach subcommand availability — the GUI must not pretend the shown
+    // command runs when this checkout has no `attach` subcommand.
+    // ---------------------------------------------------------------
+
+    @Test
+    fun `main without an attach command is detected as unavailable`() {
+        val src = """
+            app = typer.Typer()
+            @app.command("parse-jar")
+            def cli_parse_jar(): ...
+            @app.command()
+            def recover(): ...
+        """.trimIndent()
+        assertFalse(AttachController.mainDeclaresAttach(src))
+    }
+
+    @Test
+    fun `main with an explicitly named attach command is detected`() {
+        val src = """
+            @app.command("attach")
+            def cli_attach(): ...
+        """.trimIndent()
+        assertTrue(AttachController.mainDeclaresAttach(src))
+    }
+
+    @Test
+    fun `main with a bare attach command function is detected`() {
+        val src = """
+            @app.command()
+            def attach(pid: int): ...
+        """.trimIndent()
+        assertTrue(AttachController.mainDeclaresAttach(src))
+    }
+
+    @Test
+    fun `this checkout has no attach subcommand`() {
+        // This branch is stacked only on the parse/introspect pipeline; the
+        // attach preview CLI lands separately. The GUI relies on this being
+        // false to show its honest banner and keep Run disabled.
+        assertFalse(
+            AttachController.attachSubcommandAvailable(),
+            "attach must read as unavailable on this branch",
+        )
+    }
+
+    @Test
+    fun `the CLI-missing notice names Listen and the proc pre-scan`() {
+        val notice = AttachController.ATTACH_CLI_MISSING_NOTICE
+        assertTrue(notice.contains("Listen"), "got: $notice")
+        assertTrue(notice.contains("/proc"), "got: $notice")
+    }
 }

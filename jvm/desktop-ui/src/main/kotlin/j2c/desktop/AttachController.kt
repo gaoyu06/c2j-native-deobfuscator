@@ -2,6 +2,7 @@ package j2c.desktop
 
 import java.nio.file.Path
 import kotlin.io.path.exists
+import kotlin.io.path.readText
 
 /**
  * Assembles — and, only on explicit confirmation, runs — the `attach` CLI
@@ -21,6 +22,17 @@ import kotlin.io.path.exists
 object AttachController {
 
     const val CONFIRM_FLAG = "--i-own-this-process"
+
+    /**
+     * The honest notice shown when [attachSubcommandAvailable] is false: the
+     * `attach` subcommand is not in this checkout, so the displayed command
+     * cannot be run here. It names what still works (Listen / the /proc
+     * pre-scan) rather than pretending Run does something.
+     */
+    const val ATTACH_CLI_MISSING_NOTICE =
+        "Run attach needs the attach preview CLI, which is not in this checkout. " +
+            "This viewer can still Listen — tail a trace some other attach is writing — " +
+            "and still pre-scan the target's /proc flags below."
 
     /** The interpreter + module invocation, kept separate so the display and
      *  the process share one source of truth. */
@@ -96,8 +108,60 @@ object AttachController {
         return null
     }
 
+    /**
+     * Whether the CLI this GUI would actually run has an `attach` subcommand.
+     * This branch is stacked only on the parse/introspect pipeline; the attach
+     * preview CLI lands on a separate change, so here the shown command would
+     * fail. The form must say so instead of pretending it works.
+     *
+     * Read-only: it inspects the same `main.py` the run path launches
+     * (`py/j2c_dumper_cli`). When the project root cannot be located the CLI
+     * cannot be run either, so this returns false — the honest default.
+     */
+    fun attachSubcommandAvailable(): Boolean {
+        val root = projectRoot() ?: return false
+        val main = root.resolve("py/j2c_dumper_cli/j2c_dumper_cli/main.py")
+        if (!main.exists()) return false
+        return runCatching { mainDeclaresAttach(main.readText()) }.getOrDefault(false)
+    }
+
+    /**
+     * Pure: does a Typer CLI `main.py` register an `attach` subcommand? Matches
+     * either an explicit name (`@app.command("attach")`) or a bare
+     * `@app.command()` immediately above a `def attach` / `def cli_attach`.
+     * Factored out so it unit-tests without a checkout on disk.
+     */
+    fun mainDeclaresAttach(mainPySource: String): Boolean {
+        val named = Regex("""@app\.command\(\s*["']attach["']""")
+        if (named.containsMatchIn(mainPySource)) return true
+        val bare = Regex("""@app\.command\(\s*\)\s*\r?\n\s*def\s+(?:cli_)?attach\b""")
+        return bare.containsMatchIn(mainPySource)
+    }
+
     /** Result of a finished attach process. */
     data class RunResult(val exitCode: Int, val output: String)
+
+    /**
+     * The tail / announce decision for a finished attach, factored out of the
+     * panel so it unit-tests without Swing. The rule is strict: a parsed CLI
+     * refusal *or* any non-zero exit means the attach did not happen — never
+     * tail the trace and never claim it attached. Only a clean exit with no
+     * refusal line is a real attach.
+     */
+    data class AttachOutcome(
+        val refusal: AttachRefusal?,
+        val shouldTail: Boolean,
+        val shouldAnnounceAttached: Boolean,
+    )
+
+    fun outcomeFor(result: RunResult): AttachOutcome {
+        val refusal = AttachDiagnostics.parseRefusal(result.output)
+        return when {
+            refusal != null -> AttachOutcome(refusal, shouldTail = false, shouldAnnounceAttached = false)
+            result.exitCode == 0 -> AttachOutcome(null, shouldTail = true, shouldAnnounceAttached = true)
+            else -> AttachOutcome(null, shouldTail = false, shouldAnnounceAttached = false)
+        }
+    }
 
     /**
      * Run the attach command, streaming combined stdout/stderr line-by-line to

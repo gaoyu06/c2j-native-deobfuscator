@@ -55,6 +55,20 @@ class AttachPanel(
     private val refusalLabel = JLabel()
     private val refusalBanner = JPanel(BorderLayout())
 
+    // An honest notice for the checkout where the attach preview CLI is absent
+    // (this branch): Run cannot work, but Listen and the /proc pre-scan still
+    // do. Shown instead of pretending the displayed command runs.
+    private val noticeLabel = JLabel()
+    private val noticeBanner = JPanel(BorderLayout())
+
+    // A non-fatal warning line (amber) for argv notes that do not block an
+    // attach — currently jdk.attach.allowAttachSelf=false. Blank when clear.
+    private val warningLabel = JLabel(" ")
+
+    /** True when the CLI this GUI would launch actually has an `attach`
+     *  subcommand. Fixed for the panel's life; drives the notice + Run gate. */
+    private val attachAvailable = AttachController.attachSubcommandAvailable()
+
     private val copyButton = JButton("Copy command")
     private val runButton = JButton("Run attach")
     private val listenButton = JButton("Listen (tail only)")
@@ -81,6 +95,24 @@ class AttachPanel(
     }
 
     /**
+     * Feed argv tokens through the same pre-scan the live refresh runs and
+     * update the form's banners / warning line from them. A test / screenshot
+     * hook so the allowAttachSelf warning (and argv refusals) can be shown
+     * deterministically without a live `/proc` entry — it runs the real
+     * classification and the real UI update, not a mock.
+     */
+    fun previewCmdlineScan(tokens: List<String>) {
+        showWarnings(AttachDiagnostics.warningsForTokens(tokens))
+        val refusal = AttachDiagnostics.scanCmdlineTokens(tokens)
+        if (refusal != null) {
+            showRefusal(refusal)
+        } else {
+            clearRefusal()
+            if (!attachAvailable) showNotice()
+        }
+    }
+
+    /**
      * Show a classified refusal as a first-class banner: the reason code, the
      * one-line meaning, and the one honest remedy. Also disables Run — reaching
      * here means the attach did not (or will not) happen. Screenshot / test hook.
@@ -91,7 +123,7 @@ class AttachPanel(
             RefusalSource.CLI_OUTPUT -> "reported by the attach CLI"
         }
         refusalLabel.text = buildString {
-            append("<html><div style='width:452px'>")
+            append("<html><div style='width:${WRAP_PX}px'>")
             append("<span style='color:").append(hex(Theme.BAD)).append("'><b>")
             append("attach refused &middot; reason=").append(refusal.code.code)
             append("</b></span><br>")
@@ -105,6 +137,9 @@ class AttachPanel(
             }
             append("</span></div></html>")
         }
+        // A hard refusal is the most specific statement; it supersedes the
+        // CLI-missing notice (both would only disable Run anyway).
+        noticeBanner.isVisible = false
         refusalBanner.isVisible = true
         runButton.isEnabled = false
         hintLabel.text = "Run is blocked — this attach cannot proceed (see below)."
@@ -116,10 +151,40 @@ class AttachPanel(
     private fun clearRefusal() {
         if (refusalBanner.isVisible) {
             refusalBanner.isVisible = false
-            refusalLabel.text = ""
             revalidate()
             repaint()
         }
+    }
+
+    private fun showNotice() {
+        if (!noticeBanner.isVisible) {
+            noticeBanner.isVisible = true
+            revalidate()
+            repaint()
+        }
+    }
+
+    private fun hideNotice() {
+        if (noticeBanner.isVisible) {
+            noticeBanner.isVisible = false
+            revalidate()
+            repaint()
+        }
+    }
+
+    /** Surface non-fatal argv notes (e.g. allowAttachSelf=false) as a warning
+     *  line that does not block Run. Empty list hides it. */
+    private fun showWarnings(warnings: List<String>) {
+        if (warnings.isEmpty()) {
+            if (warningLabel.isVisible) {
+                warningLabel.isVisible = false
+                warningLabel.text = " "
+            }
+            return
+        }
+        warningLabel.text = "<html><div style='width:${WRAP_PX}px'>warning: " +
+            warnings.joinToString("<br>warning: ") { escape(it) } + "</div></html>"
+        warningLabel.isVisible = true
     }
 
     private fun hex(c: java.awt.Color): String = "#%02x%02x%02x".format(c.red, c.green, c.blue)
@@ -141,8 +206,11 @@ class AttachPanel(
     // ---------------------------------------------------------------
 
     private fun buildForm(): JComponent {
-        val intro = JLabel(
-            "<html><div style='width:460px'>" +
+        // The intro wraps inside a fixed-width BorderLayout.CENTER region (the
+        // pattern the analysis-gap rows use) so words break cleanly and stay
+        // complete instead of the last one being clipped at the panel edge.
+        val introLabel = JLabel(
+            "<html><div style='width:${WRAP_PX}px'>" +
                 "This runs the same <b>attach</b> command you would type — nothing more. " +
                 "It needs a PID and your confirmation first. Attach works on a same-user " +
                 "JVM you own; how much it can see depends on what the JDK grants, and the " +
@@ -151,7 +219,11 @@ class AttachPanel(
         ).apply {
             font = Theme.sansSmall
             foreground = Theme.DIM
+        }
+        val intro = JPanel(BorderLayout()).apply {
+            background = Theme.BG
             border = BorderFactory.createEmptyBorder(0, 0, 10, 0)
+            add(introLabel, BorderLayout.CENTER)
         }
 
         val grid = JPanel(GridBagLayout()).apply { background = Theme.BG }
@@ -227,6 +299,32 @@ class AttachPanel(
         )
         refusalBanner.add(refusalLabel, BorderLayout.CENTER)
 
+        // The CLI-missing notice: amber, not red — nothing is broken, this
+        // checkout just cannot run attach. Content is static; visibility flips
+        // in refresh(). Built once here so the width matches the other banners.
+        noticeLabel.font = Theme.sansSmall
+        noticeLabel.text = buildString {
+            append("<html><div style='width:${WRAP_PX}px'>")
+            append("<span style='color:").append(hex(Theme.WARN)).append("'><b>")
+            append("attach CLI not in this checkout")
+            append("</b></span><br>")
+            append("<span style='color:").append(hex(Theme.TEXT)).append("'>")
+            append(escape(AttachController.ATTACH_CLI_MISSING_NOTICE))
+            append("</span></div></html>")
+        }
+        noticeBanner.background = Theme.BG
+        noticeBanner.isVisible = false
+        noticeBanner.border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Theme.WARN),
+            BorderFactory.createEmptyBorder(8, 10, 8, 10),
+        )
+        noticeBanner.add(noticeLabel, BorderLayout.CENTER)
+
+        warningLabel.font = Theme.sansSmall
+        warningLabel.foreground = Theme.WARN
+        warningLabel.border = BorderFactory.createEmptyBorder(2, 2, 2, 2)
+        warningLabel.isVisible = false
+
         logArea.apply {
             isEditable = false
             font = Theme.monoSmall
@@ -245,7 +343,9 @@ class AttachPanel(
         stack.add(left(Ui.sectionLabel("command")))
         stack.add(commandArea)
         stack.add(left(hintLabel))
+        stack.add(bannerRow(noticeBanner))
         stack.add(bannerRow(refusalBanner))
+        stack.add(left(warningLabel))
         stack.add(left(Ui.sectionLabel("attach output")))
         stack.add(Ui.scroll(logArea).apply { preferredSize = Dimension(480, 120) })
         return stack
@@ -322,25 +422,43 @@ class AttachPanel(
         val req = request()
         commandArea.text = AttachController.commandLine(req)
         commandArea.caretPosition = 0
+        // Listen (tail only) never needs the attach CLI; it only needs a path.
+        listenButton.isEnabled = req.output.isNotBlank()
+
         val blocked = AttachController.runBlockedReason(req)
 
-        // Pre-launch: scan the target's argv for flags that make an attach
-        // impossible, and refuse before Run rather than after an opaque failure.
-        // Only when the basic gates (PID / ownership / output) already pass, so
-        // the banner doesn't fight the plain "enter a PID" hint.
-        val preScan = if (blocked == null) {
-            req.pid.trim().toIntOrNull()?.let { AttachDiagnostics.scanCmdline(it) }
+        // Read the target's argv once (Linux /proc), then derive both the hard
+        // refusal and the non-fatal warnings from it. This is read-only and
+        // works even where the attach CLI is absent, so the pre-scan stays
+        // useful on this checkout. Only when the basic gates already pass, so
+        // the banner does not fight the plain "enter a PID" hint.
+        val tokens = if (blocked == null) {
+            req.pid.trim().toIntOrNull()?.let { AttachDiagnostics.cmdlineTokens(it) }
         } else null
+        val preScan = tokens?.let { AttachDiagnostics.scanCmdlineTokens(it) }
+        showWarnings(tokens?.let { AttachDiagnostics.warningsForTokens(it) } ?: emptyList())
 
+        // A hard refusal (argv scan) is the most specific message: show it and
+        // block Run regardless of anything below.
         if (preScan != null) {
             showRefusal(preScan)
-            listenButton.isEnabled = req.output.isNotBlank()
             return
         }
-
         clearRefusal()
+
+        // No attach subcommand in this checkout: Run cannot honestly proceed.
+        // Say so plainly and keep Run disabled; Listen and the pre-scan above
+        // still work, so the viewer is not pretending the command runs.
+        if (!attachAvailable) {
+            showNotice()
+            runButton.isEnabled = false
+            hintLabel.text = "Run is disabled here — the attach preview CLI is not in this checkout."
+            hintLabel.foreground = Theme.WARN
+            return
+        }
+        hideNotice()
+
         runButton.isEnabled = blocked == null
-        listenButton.isEnabled = req.output.isNotBlank()
         hintLabel.text = blocked ?: "Ready to run. This loads the agent; the target keeps writing the trace."
         hintLabel.foreground = if (blocked == null) Theme.OK else Theme.WARN
     }
@@ -365,6 +483,15 @@ class AttachPanel(
         val req = request()
         if (AttachController.runBlockedReason(req) != null) return
 
+        // Never pretend the shown command works when this checkout has no
+        // attach subcommand. Run stays disabled in that state, but guard here
+        // too so no code path can launch a command that would just error.
+        if (!attachAvailable) {
+            showNotice()
+            appendLog("Run is disabled — ${AttachController.ATTACH_CLI_MISSING_NOTICE}")
+            return
+        }
+
         // Fail before launch: re-run the argv pre-scan at the moment of Run, so a
         // target that acquired a blocking flag between edits is still refused.
         val pid = req.pid.trim().toIntOrNull()
@@ -386,19 +513,21 @@ class AttachPanel(
                 runButton.isEnabled = true
                 listenButton.isEnabled = req.output.isNotBlank()
 
-                // Classify any refusal the CLI printed. A refusal, or any
-                // non-zero exit, means the attach did not happen: never tail and
-                // never claim attached in that case.
-                val refusal = AttachDiagnostics.parseRefusal(result.output)
+                // Decide via the pure outcome rule: a parsed refusal, or any
+                // non-zero exit, means the attach did not happen — never tail
+                // and never claim attached in that case.
+                val outcome = AttachController.outcomeFor(result)
                 when {
-                    refusal != null -> {
-                        showRefusal(refusal)
-                        appendLog("attach refused (reason=${refusal.code.code}) — nothing was tailed.")
+                    outcome.refusal != null -> {
+                        showRefusal(outcome.refusal)
+                        appendLog("attach refused (reason=${outcome.refusal.code.code}) — nothing was tailed.")
                     }
-                    result.exitCode == 0 -> {
+                    outcome.shouldAnnounceAttached -> {
                         appendLog("attached; tailing ${req.output}")
-                        onStartTail(Path.of(req.output.trim()))
-                        onClose()
+                        if (outcome.shouldTail) {
+                            onStartTail(Path.of(req.output.trim()))
+                            onClose()
+                        }
                     }
                     else ->
                         appendLog("attach did not succeed — see the output above. Nothing was tailed.")
@@ -414,5 +543,14 @@ class AttachPanel(
 
     private fun onEdt(block: () -> Unit) {
         if (SwingUtilities.isEventDispatchThread()) block() else SwingUtilities.invokeLater(block)
+    }
+
+    private companion object {
+        /**
+         * The wrap width (px) shared by the intro paragraph and every banner so
+         * they line up and, crucially, wrap with complete words inside the
+         * form's fixed content column instead of clipping the last word.
+         */
+        const val WRAP_PX = 452
     }
 }

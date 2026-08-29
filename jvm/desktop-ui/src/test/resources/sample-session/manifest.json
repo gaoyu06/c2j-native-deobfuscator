@@ -7,6 +7,14 @@
   "loaderClass": "com/example/NativeLoader",
   "nativeDir": "native",
   "stringPool": ["key-7f3a", "booting", "invalid length"],
+  "bindingGaps": [
+    {
+      "kind": "unbound-native-method",
+      "method": "com/example/Crypto.checksum",
+      "desc": "([B)J",
+      "detail": "com/example/Crypto.checksum ([B)J had no RegisterNatives call site match"
+    }
+  ],
   "classes": [
     {
       "name": "com/example/Crypto",
