@@ -120,4 +120,26 @@ else
     skip "no clang + ld64.lld — keeping committed libjni_registrar.dylib"
 fi
 
+echo "[Mach-O/arm64] libjni_registrar_arm64.dylib (AAPCS64 static table + Java_* export)"
+# The arm64 sibling of the Mach-O fixture above: a genuine (MachO, aarch64)
+# image, not a renamed ELF or x86-64 dylib. clang emits the compact
+# adr-based table-address form for this small image, which the AArch64 backend
+# folds back to the table VA. `zig cc -target aarch64-macos` produces an
+# equivalent binary when clang + ld64.lld are not available.
+if command -v clang >/dev/null 2>&1 && command -v ld64.lld >/dev/null 2>&1; then
+    clang -O2 -target arm64-apple-macos11 -dynamiclib -fuse-ld=lld -nostdlib \
+        -Wl,-undefined,dynamic_lookup \
+        -Wl,-install_name,@rpath/libjni_registrar_arm64.dylib \
+        -Wl,-no_uuid \
+        -o libjni_registrar_arm64.dylib jni_registrar_macho_arm64.c
+    log "built libjni_registrar_arm64.dylib"
+elif command -v zig >/dev/null 2>&1; then
+    zig cc -target aarch64-macos -O2 -shared -nostdlib \
+        -Wl,-install_name,@rpath/libjni_registrar_arm64.dylib \
+        -o libjni_registrar_arm64.dylib jni_registrar_macho_arm64.c
+    log "built libjni_registrar_arm64.dylib (zig cc)"
+else
+    skip "no clang + ld64.lld or zig — keeping committed libjni_registrar_arm64.dylib"
+fi
+
 echo "done."
