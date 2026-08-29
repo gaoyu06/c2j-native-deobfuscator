@@ -1,6 +1,6 @@
 # Options and status report for JNI-native recovery platform work
 
-> Status checked against GitHub on 2026-08-28. Pull requests #2 through #12 are
+> Status checked against GitHub on 2026-08-29. Pull requests #2 through #12 are
 > all open, unmerged drafts. This report is documentation only; it does not
 > implement or promote a product feature.
 >
@@ -29,7 +29,7 @@ review can be skipped.
 |---:|---|---|---|
 | **#2** | Design-theory assessment and PR sequence; documentation only and mergeable as documentation. | **Yes, as docs.** | Owner documentation sign-off only. |
 | **#3** | Genericity audit; documentation only. | **Yes, as docs.** | Owner factual spot-check only. |
-| **#4** | Generic-first discovery at `864f1a427c1fa30071733cfe09440cbbe6c6a483`. Committed x86-64 fixtures now cover real PE, Mach-O, stripped ELF without `.symtab`, and exports-only ELF; pytest reports 27 passed. Ambiguous count-only cases still use `bindingGaps`, and `recover` keeps its existing default. | **Yes: ship-as-draft-dev; not as the default release.** | Yes before default promotion. Non-x86-64, section-header-removed ELF, and encrypted or shuffled tables remain unproven. |
+| **#4** | Generic-first discovery at `d6d2637a8aee382c409844603a0631f4197d6e1f`. In addition to the x86-64 formats, committed fixtures now prove real AArch64 ELF and section-header-removed ELF mapped from `PT_LOAD`; independent review confirmed the AArch64 image and zero section headers. Pytest covers at least 23 introspection-and-merge cases, and the implementer reports 31 passing in the full suite. | **Yes: ship-as-draft-dev; not as the default release.** | Yes before default promotion. Mach-O arm64, 32-bit ARM, and encrypted or shuffled tables remain unproven. |
 | **#5** | Platform plan selecting Swing + FlatLaf and recording reserved decisions; documentation only. | **Yes, as docs.** | Owner documentation sign-off only. |
 | **#6** | `doctor`, setup scripts, launchers, and getting-started material. JDK 17 is retained. | **Yes, as a draft.** | Normal merge review remains; no JDK migration is implied. |
 | **#7** | Native-x86 process inspection, library instrumentation, and plugin ABI at `8b9231c145e80acbc723fbc893d072398cba143b`, after multiple must-fix rounds. | **Yes, as a preview draft only.** | Yes for later promotion, broader platform support, ABI trust, and transport decisions. The current preview verdict is supported by the completed review rounds and smoke evidence. |
@@ -37,24 +37,28 @@ review can be skipped.
 | **#9** | Opt-in JVMTI attach at `f7664e46f89b83bc6ffb6c3680193412c8cbff36`. Common attach refusals are classified, there is no stealth or bypass behavior, and default recovery remains startup `-agentpath`. | **Yes: ship-as-preview-draft.** | `allowAttachSelf=false` warns rather than hard-refusing the external CLI; `cross-user` and `not-a-jvm` failures print `attach failed (reason=…)`; pytest reports 55 passed. Review remains required before capability or default-policy expansion. |
 | **#10** | This options and status report; documentation only. | **Yes, as docs.** | Owner accuracy and decision sign-off. |
 | **#11** | Optional privileged observer at `dc30188118a6579c024978fa9ff52ca154012170`, with a versioned plugin ABI and Linux maps backend. It is default-off userspace code with no kernel files. | **Yes: ship-as-preview-userspace.** | Yes for later promotion and merge-order integration with #7. It is not a kernel feature, and the default remains **no**. |
-| **#12** | Desktop live-attach/listen GUI, based on PR #8’s branch rather than `main`. Visual review is preview-ok. | **Yes, as a preview after #8.** | Yes for integration review after #8 and for the same attach limitations as #9. |
+| **#12** | Desktop live-attach/listen GUI at `e07275c1dc0500db3afe79b78792835f510c4a35`, based on PR #8. The must-fixes cover clipping, honest Run disabling when the attach CLI is absent, `outcomeFor` tests, the `allowAttachSelf` warning, and manifest-derived `bindingGaps`; visual shots 07–12 are preview-ok. | **Yes: ship-as-preview after #8.** | Yes for integration review after #8. An enabled attach Run also needs the #9 CLI; the GUI does not replace the CLI. |
 
 ## Current evidence and boundaries
 
 ### Generic-first discovery (#4)
 
 - The reviewed revision is
-  `864f1a427c1fa30071733cfe09440cbbe6c6a483`.
+  `d6d2637a8aee382c409844603a0631f4197d6e1f`.
 - Committed x86-64 fixtures exercise real PE, Mach-O, stripped ELF without
   `.symtab`, and exports-only ELF images.
-- The independent review run reports `pytest`: 27 passed.
+- Committed fixtures also exercise a real AArch64 ELF and a
+  section-header-removed ELF mapped from `PT_LOAD`.
+- Independent review confirmed that the former is a real AArch64 ELF and the
+  latter has zero section headers.
+- Pytest covers at least 23 introspection-and-merge cases; the implementer
+  reports 31 passing in the full suite.
 - Ambiguous count-only matching is represented with `bindingGaps`; it is not
   silently treated as a complete binding.
 - The branch can ship as a draft/development path.
 - The `recover` default is unchanged.
 - It is not the default release path.
-- Non-x86-64 binaries, ELF images with section headers removed, and encrypted
-  or shuffled tables remain unproven.
+- Mach-O arm64, 32-bit ARM, and encrypted or shuffled tables remain unproven.
 
 The consequence is deliberate: developers can continue validating the generic
 path without presenting incomplete platform coverage as a released default.
@@ -97,11 +101,18 @@ feature claim.
 - PR #8’s visual pass is complete.
 - PR #8 is an optional artifact viewer and does not replace the CLI.
 - Its module requires JDK 21 while the repository baseline remains JDK 17.
-- PR #12 is stacked on PR #8’s branch, not on `main`.
-- PR #12’s visual review is preview-ok.
+- PR #12 is reviewed at
+  `e07275c1dc0500db3afe79b78792835f510c4a35` and remains stacked on PR #8.
+- PR #12 fixed clipping, disables Run honestly when the attach CLI is absent,
+  tests `outcomeFor`, surfaces the `allowAttachSelf` warning, and derives
+  `bindingGaps` from the manifest.
+- PR #12’s visual shots 07–12 are preview-ok.
+- The attach CLI itself is #9; the GUI does not replace the CLI.
 
-The consequence is that #12 must follow #8, and the desktop toolchain split must
-remain explicit rather than silently changing the repository baseline.
+The consequence is that #12 can ship as a preview after #8, and the desktop
+toolchain split must remain explicit rather than silently changing the
+repository baseline. Its attach Run remains disabled until the #9 CLI is
+available.
 
 ### JVMTI attach (#9)
 
@@ -177,13 +188,16 @@ the recommendation, and the consequence of adopting it.
 ## Promotion gates
 
 - #4 now has committed x86-64 PE, Mach-O, stripped-ELF-without-`.symtab`, and
-  exports-only ELF fixtures. Default promotion remains blocked on non-x86-64
-  evidence and more incomplete images, including section-header-removed ELF and
-  encrypted or shuffled tables.
+  exports-only ELF fixtures, plus real AArch64 ELF and
+  section-header-removed-ELF fixtures. Default promotion remains blocked on
+  Mach-O arm64, 32-bit ARM, and encrypted or shuffled table evidence.
 - #7 needs explicit plugin trust and transport decisions, additional platform
   evidence, and a separate promotion review before it can move beyond preview.
 - #8/#12 must keep their JDK 21 requirement module-local unless the repository
   separately approves a baseline migration.
+- #12 is preview-ok at the reviewed revision after its must-fixes, but it still
+  depends on #8. An enabled attach Run needs the #9 CLI; without that CLI, Run
+  must remain disabled.
 - #9/#12 must report actual attach capabilities and retain startup `-agentpath`
   as the default recovery path. #9 now warns for `allowAttachSelf=false` rather
   than hard-refusing the external CLI, and prints reason codes for `cross-user`
