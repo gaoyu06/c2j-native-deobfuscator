@@ -49,6 +49,12 @@ class AttachPanel(
     private val hintLabel = JLabel(" ")
     private val logArea = JTextArea(7, 40)
 
+    // A first-class refusal banner. Hidden until a pre-launch cmdline scan or a
+    // parsed CLI refusal fills it in; then it names the reason code, a one-line
+    // meaning, and the one honest remedy. Never claims an attach happened.
+    private val refusalLabel = JLabel()
+    private val refusalBanner = JPanel(BorderLayout())
+
     private val copyButton = JButton("Copy command")
     private val runButton = JButton("Run attach")
     private val listenButton = JButton("Listen (tail only)")
@@ -73,6 +79,53 @@ class AttachPanel(
         agentField.text = req.agentPath
         refresh()
     }
+
+    /**
+     * Show a classified refusal as a first-class banner: the reason code, the
+     * one-line meaning, and the one honest remedy. Also disables Run — reaching
+     * here means the attach did not (or will not) happen. Screenshot / test hook.
+     */
+    fun showRefusal(refusal: AttachRefusal) {
+        val where = when (refusal.source) {
+            RefusalSource.CMDLINE_SCAN -> "detected before launch (target argv)"
+            RefusalSource.CLI_OUTPUT -> "reported by the attach CLI"
+        }
+        refusalLabel.text = buildString {
+            append("<html><div style='width:452px'>")
+            append("<span style='color:").append(hex(Theme.BAD)).append("'><b>")
+            append("attach refused &middot; reason=").append(refusal.code.code)
+            append("</b></span><br>")
+            append("<span style='color:").append(hex(Theme.TEXT)).append("'>")
+            append(escape(refusal.code.meaning)).append("</span><br>")
+            append("<span style='color:").append(hex(Theme.WARN)).append("'>next step: ")
+            append(escape(AttachDiagnostics.STARTUP_RECOMMENDATION)).append("</span><br>")
+            append("<span style='color:").append(hex(Theme.DIM)).append("'>").append(where)
+            if (refusal.detail.isNotBlank()) {
+                append(" &mdash; ").append(escape(refusal.detail.take(220)))
+            }
+            append("</span></div></html>")
+        }
+        refusalBanner.isVisible = true
+        runButton.isEnabled = false
+        hintLabel.text = "Run is blocked — this attach cannot proceed (see below)."
+        hintLabel.foreground = Theme.BAD
+        revalidate()
+        repaint()
+    }
+
+    private fun clearRefusal() {
+        if (refusalBanner.isVisible) {
+            refusalBanner.isVisible = false
+            refusalLabel.text = ""
+            revalidate()
+            repaint()
+        }
+    }
+
+    private fun hex(c: java.awt.Color): String = "#%02x%02x%02x".format(c.red, c.green, c.blue)
+
+    private fun escape(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     private fun request(): AttachRequest = AttachRequest(
         pid = pidField.text,
@@ -165,6 +218,15 @@ class AttachPanel(
         hintLabel.foreground = Theme.WARN
         hintLabel.border = BorderFactory.createEmptyBorder(4, 2, 6, 2)
 
+        refusalLabel.font = Theme.sansSmall
+        refusalBanner.background = Theme.BG
+        refusalBanner.isVisible = false
+        refusalBanner.border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Theme.BAD),
+            BorderFactory.createEmptyBorder(8, 10, 8, 10),
+        )
+        refusalBanner.add(refusalLabel, BorderLayout.CENTER)
+
         logArea.apply {
             isEditable = false
             font = Theme.monoSmall
@@ -183,6 +245,7 @@ class AttachPanel(
         stack.add(left(Ui.sectionLabel("command")))
         stack.add(commandArea)
         stack.add(left(hintLabel))
+        stack.add(bannerRow(refusalBanner))
         stack.add(left(Ui.sectionLabel("attach output")))
         stack.add(Ui.scroll(logArea).apply { preferredSize = Dimension(480, 120) })
         return stack
@@ -224,6 +287,19 @@ class AttachPanel(
         maximumSize = Dimension(Int.MAX_VALUE, c.preferredSize.height + 4)
     }
 
+    /** Full-width row that never stretches taller than its content — used for
+     *  the refusal banner so BoxLayout does not balloon it. The max height
+     *  tracks the (variable) banner height, since the text is set later. */
+    private fun bannerRow(c: JComponent): JComponent =
+        object : JPanel(BorderLayout()) {
+            override fun getMaximumSize(): Dimension =
+                Dimension(Int.MAX_VALUE, preferredSize.height)
+        }.apply {
+            background = Theme.BG
+            border = BorderFactory.createEmptyBorder(2, 0, 4, 0)
+            add(c, BorderLayout.CENTER)
+        }
+
     // ---------------------------------------------------------------
     // Behaviour
     // ---------------------------------------------------------------
@@ -247,6 +323,22 @@ class AttachPanel(
         commandArea.text = AttachController.commandLine(req)
         commandArea.caretPosition = 0
         val blocked = AttachController.runBlockedReason(req)
+
+        // Pre-launch: scan the target's argv for flags that make an attach
+        // impossible, and refuse before Run rather than after an opaque failure.
+        // Only when the basic gates (PID / ownership / output) already pass, so
+        // the banner doesn't fight the plain "enter a PID" hint.
+        val preScan = if (blocked == null) {
+            req.pid.trim().toIntOrNull()?.let { AttachDiagnostics.scanCmdline(it) }
+        } else null
+
+        if (preScan != null) {
+            showRefusal(preScan)
+            listenButton.isEnabled = req.output.isNotBlank()
+            return
+        }
+
+        clearRefusal()
         runButton.isEnabled = blocked == null
         listenButton.isEnabled = req.output.isNotBlank()
         hintLabel.text = blocked ?: "Ready to run. This loads the agent; the target keeps writing the trace."
@@ -272,6 +364,18 @@ class AttachPanel(
     private fun runAttach() {
         val req = request()
         if (AttachController.runBlockedReason(req) != null) return
+
+        // Fail before launch: re-run the argv pre-scan at the moment of Run, so a
+        // target that acquired a blocking flag between edits is still refused.
+        val pid = req.pid.trim().toIntOrNull()
+        val preScan = pid?.let { AttachDiagnostics.scanCmdline(it) }
+        if (preScan != null) {
+            showRefusal(preScan)
+            appendLog("refused before launch (reason=${preScan.code.code}); nothing was run.")
+            return
+        }
+
+        clearRefusal()
         runButton.isEnabled = false
         listenButton.isEnabled = false
         appendLog("$ ${AttachController.commandLine(req)}")
@@ -281,12 +385,23 @@ class AttachPanel(
                 appendLog("[exit ${result.exitCode}]")
                 runButton.isEnabled = true
                 listenButton.isEnabled = req.output.isNotBlank()
-                if (result.exitCode == 0) {
-                    appendLog("attached; tailing ${req.output}")
-                    onStartTail(Path.of(req.output.trim()))
-                    onClose()
-                } else {
-                    appendLog("attach did not succeed — see the output above. Nothing was tailed.")
+
+                // Classify any refusal the CLI printed. A refusal, or any
+                // non-zero exit, means the attach did not happen: never tail and
+                // never claim attached in that case.
+                val refusal = AttachDiagnostics.parseRefusal(result.output)
+                when {
+                    refusal != null -> {
+                        showRefusal(refusal)
+                        appendLog("attach refused (reason=${refusal.code.code}) — nothing was tailed.")
+                    }
+                    result.exitCode == 0 -> {
+                        appendLog("attached; tailing ${req.output}")
+                        onStartTail(Path.of(req.output.trim()))
+                        onClose()
+                    }
+                    else ->
+                        appendLog("attach did not succeed — see the output above. Nothing was tailed.")
                 }
             }
         }.apply { isDaemon = true }.start()
