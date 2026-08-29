@@ -91,20 +91,37 @@ class Aarch64Abi(Abi):
         return dst.reg, src.reg
 
     def decode_pc_relative_lea(self, ins: Any) -> int | None:
-        """Fold an ``adrp``/``add`` address-of-constant pair into an absolute
-        VA, returned when the completing ``add`` is decoded.
+        """Fold an AArch64 "address of constant" form into an absolute VA.
 
-        ``adrp xN, #page`` records ``page`` for ``xN`` (capstone already
-        resolves the operand to the absolute page base). A following
-        ``add xDst, xSrc, #lo12`` where ``xSrc`` holds a recorded page yields
-        ``page + lo12``. ``adrp``/``ldr`` (which loads the *value* at the
-        address, not the address) is deliberately not treated as an address.
+        Two encodings materialise an in-image address:
+
+        * ``adr xDst, #label`` — a single instruction that reaches a constant
+          within ``±1 MiB`` of the program counter. capstone resolves the
+          label operand to its absolute VA, so it is returned directly. clang
+          picks this compact form for small images (e.g. a Mach-O arm64
+          ``.dylib`` whose ``JNINativeMethod[]`` sits close to the code).
+        * ``adrp xN, #page`` / ``add xDst, xN, #lo12`` — the wider pair used
+          when the constant may be farther away. ``adrp`` records ``page`` for
+          ``xN`` (capstone already resolves the operand to the absolute page
+          base); the completing ``add`` yields ``page + lo12``. ``adrp``/``ldr``
+          (which loads the *value* at the address, not the address) is
+          deliberately not treated as an address.
         """
         state = self._adrp_state()
         expected = getattr(self, "_adrp_next_addr", None)
         if expected is None or ins.address != expected:
             state.clear()
         self._adrp_next_addr = ins.address + ins.size
+
+        if ins.mnemonic == "adr" and len(ins.operands) == 2:
+            dst, label = ins.operands
+            if dst.type == _OP_REG and label.type == _OP_IMM:
+                # A completed pointer in one instruction; drop any stale page
+                # recorded for the destination so a later add on the same
+                # register is not mis-folded.
+                state.pop(dst.reg, None)
+                return label.imm
+            return None
 
         if ins.mnemonic == "adrp" and len(ins.operands) == 2:
             dst, page = ins.operands
