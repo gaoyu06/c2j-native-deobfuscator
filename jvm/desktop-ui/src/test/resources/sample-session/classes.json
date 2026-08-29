@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "input": {
+    "jarPath": "app-obf.jar",
+    "sha256": "3b1f2c9a4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8"
+  },
+  "loaderClass": "com/example/NativeLoader",
+  "nativeDir": "native",
+  "classes": [
+    {
+      "name": "com/example/Crypto",
+      "superName": "java/lang/Object",
+      "interfaces": [],
+      "version": 61,
+      "access": 33,
+      "signature": null,
+      "sourceFile": "Crypto.java",
+      "fields": [],
+      "methods": [
+        { "name": "<init>", "desc": "()V", "access": 1, "isNative": false, "isObfuscatedNative": false },
+        { "name": "decrypt", "desc": "(Ljava/lang/String;)Ljava/lang/String;", "access": 257, "isNative": true, "isObfuscatedNative": true },
+        { "name": "rounds", "desc": "()I", "access": 257, "isNative": true, "isObfuscatedNative": true },
+        { "name": "checksum", "desc": "([B)J", "access": 257, "isNative": true, "isObfuscatedNative": true }
+      ]
+    },
+    {
+      "name": "com/example/Main",
+      "superName": "java/lang/Object",
+      "interfaces": [],
+      "version": 61,
+      "access": 33,
+      "signature": null,
+      "sourceFile": "Main.java",
+      "fields": [],
+      "methods": [
+        { "name": "main", "desc": "([Ljava/lang/String;)V", "access": 9, "isNative": false, "isObfuscatedNative": false },
+        { "name": "boot", "desc": "()V", "access": 266, "isNative": true, "isObfuscatedNative": true }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "owner": "com/example/Main",
+  "name": "boot",
+  "desc": "()V",
+  "source": "dynamic",
+  "confidence": "low",
+  "instructions": [
+    { "op": "GETSTATIC", "owner": "java/lang/System", "name": "out", "desc": "Ljava/io/PrintStream;" },
+    { "op": "LDC", "value": "booting" },
+    { "op": "INVOKEVIRTUAL", "owner": "java/io/PrintStream", "name": "println", "desc": "(Ljava/lang/String;)V" },
+    { "op": "RETURN" }
+  ],
+  "tryCatchBlocks": [],
+  "exceptionsObserved": ["java/lang/IllegalStateException"]
+}

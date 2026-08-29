@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "input": {
+    "jar": "app-obf.jar",
+    "lib": "native/app.dll"
+  },
+  "loaderClass": "com/example/NativeLoader",
+  "nativeDir": "native",
+  "stringPool": ["key-7f3a", "booting", "invalid length"],
+  "classes": [
+    {
+      "name": "com/example/Crypto",
+      "superName": "java/lang/Object",
+      "interfaces": [],
+      "version": 61,
+      "access": 33,
+      "classId": 1,
+      "fields": [],
+      "methods": [
+        {
+          "name": "<init>",
+          "desc": "()V",
+          "access": 1,
+          "isObfuscatedNative": false
+        },
+        {
+          "name": "decrypt",
+          "desc": "(Ljava/lang/String;)Ljava/lang/String;",
+          "access": 1,
+          "isObfuscatedNative": true,
+          "fnAddr": "0x180001240",
+          "fnSymbol": "Java_com_example_Crypto_decrypt"
+        },
+        {
+          "name": "rounds",
+          "desc": "()I",
+          "access": 1,
+          "isObfuscatedNative": true,
+          "fnAddr": "0x1800012f0",
+          "fnSymbol": "Java_com_example_Crypto_rounds"
+        },
+        {
+          "name": "checksum",
+          "desc": "([B)J",
+          "access": 1,
+          "isObfuscatedNative": true,
+          "fnAddr": null,
+          "fnSymbol": null
+        }
+      ]
+    },
+    {
+      "name": "com/example/Main",
+      "superName": "java/lang/Object",
+      "interfaces": [],
+      "version": 61,
+      "access": 33,
+      "classId": 2,
+      "fields": [],
+      "methods": [
+        {
+          "name": "main",
+          "desc": "([Ljava/lang/String;)V",
+          "access": 9,
+          "isObfuscatedNative": false
+        },
+        {
+          "name": "boot",
+          "desc": "()V",
+          "access": 10,
+          "isObfuscatedNative": true,
+          "fnAddr": "0x180001380",
+          "fnSymbol": "Java_com_example_Main_boot"
+        }
+      ]
+    }
+  ],
+  "hiddenClasses": []
+}
