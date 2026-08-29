@@ -492,7 +492,10 @@ class AttachPanel(
             appendLog("set an output path before listening")
             return
         }
-        onStartTail(Path.of(out))
+        // Tail the same absolute path an attach would write, resolved from one
+        // stable root, so Listen never watches a different file than Run.
+        val path = AttachController.resolveOutput(out) ?: Path.of(out)
+        onStartTail(path)
         onClose()
     }
 
@@ -540,9 +543,13 @@ class AttachPanel(
                         appendLog("attach refused (reason=${outcome.refusal.code.code}) — nothing was tailed.")
                     }
                     outcome.shouldAnnounceAttached -> {
-                        appendLog("attached; tailing ${req.output}")
+                        // Tail the exact absolute path passed to --output, not the
+                        // raw field text — the process wrote there, so the viewer
+                        // must watch there or it would miss the trace.
+                        val tailPath = AttachController.resolvedOutput(req) ?: Path.of(req.output.trim())
+                        appendLog("attached; tailing $tailPath")
                         if (outcome.shouldTail) {
-                            onStartTail(Path.of(req.output.trim()))
+                            onStartTail(tailPath)
                             onClose()
                         }
                     }
