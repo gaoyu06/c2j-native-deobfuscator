@@ -145,6 +145,38 @@ fun main(args: Array<String>) {
         f.startTail(resourceDir("sample-live-nocaps").resolve("trace.jsonl"))
     }
 
+    // A first-class attach refusal: the target's argv carries
+    // -XX:+DisableAttachMechanism, so the form refuses before launch, names the
+    // reason code, gives the one-line meaning, and points at the startup path.
+    // No stealth, no bypass — reaching this banner means no attach happened.
+    componentShot("10-attach-refused", 560, 560) {
+        AttachPanel(
+            defaultOutput = "trace.jsonl",
+            onStartTail = {},
+            onClose = {},
+        ).apply {
+            applyRequest(
+                AttachRequest(
+                    pid = "48213",
+                    output = "trace.jsonl",
+                    iOwnThisProcess = true,
+                    logAll = false,
+                    mechanism = "auto",
+                    agentPath = "",
+                )
+            )
+            showRefusal(AttachRefusal(AttachRefusalCode.ATTACH_DISABLED, RefusalSource.CMDLINE_SCAN))
+        }
+    }
+
+    // The analysis strip on the session viewer: binary.json shown as more than a
+    // count — container format (PE), arch, obfuscator profile + method-discovery
+    // strategy, and a binding gap (checksum left unbound) called out in amber.
+    shot("11-analysis-strip") { f ->
+        f.openDirectory(sample)
+        f.selectTab("Pipeline")
+    }
+
     println("done -> ${outDir.toAbsolutePath()}")
     // Swing keeps AWT threads alive; exit explicitly.
     System.exit(0)
