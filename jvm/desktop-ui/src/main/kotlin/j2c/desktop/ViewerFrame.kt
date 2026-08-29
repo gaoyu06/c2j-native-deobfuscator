@@ -53,6 +53,8 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
     private val notesLabel = JLabel("")
 
     private val artifactsBox = JPanel()
+    private val analysisBox = JPanel()
+    private val analysisSection = Ui.sectionLabel("binary analysis")
     private val nextReason = JLabel(" ")
     private val nextCommand = JTextArea()
     private val emptyBanner = JLabel("", SwingConstants.CENTER)
@@ -346,6 +348,12 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         artifactsBox.alignmentX = JComponent.LEFT_ALIGNMENT
         artifactsBox.border = BorderFactory.createEmptyBorder(4, 10, 8, 10)
 
+        analysisBox.layout = BoxLayout(analysisBox, BoxLayout.Y_AXIS)
+        analysisBox.background = Theme.BG
+        analysisBox.alignmentX = JComponent.LEFT_ALIGNMENT
+        analysisBox.border = BorderFactory.createEmptyBorder(4, 10, 8, 10)
+        analysisSection.alignmentX = JComponent.LEFT_ALIGNMENT
+
         nextReason.font = Theme.sans
         nextReason.foreground = Theme.TEXT
         nextReason.alignmentX = JComponent.LEFT_ALIGNMENT
@@ -381,6 +389,8 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         stack.border = BorderFactory.createEmptyBorder(6, 0, 6, 0)
         stack.add(leftAligned(Ui.sectionLabel("artifacts")))
         stack.add(artifactsBox)
+        stack.add(leftAligned(analysisSection))
+        stack.add(analysisBox)
         stack.add(leftAligned(Ui.sectionLabel("suggested next step")))
         stack.add(nextReason)
         stack.add(cmdWrap)
@@ -628,6 +638,7 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         for (a in session.artifacts) {
             artifactsBox.add(artifactRow(a))
         }
+        renderAnalysis(session.binaryAnalysis)
         val next = session.nextCommand
         if (next != null) {
             nextReason.text = next.reason
@@ -639,6 +650,97 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         artifactsBox.revalidate()
         artifactsBox.repaint()
     }
+
+    /**
+     * Fill the compact analysis strip from binary.json. Hidden entirely when the
+     * session has no binary.json; otherwise it shows the format / arch, the
+     * profile + method-discovery strategy (when present), the registry + string
+     * counts, and any binding gaps (count + a short list) so a run that left
+     * native methods unbound reads at a glance instead of only "N classes".
+     */
+    private fun renderAnalysis(analysis: BinaryAnalysis?) {
+        analysisBox.removeAll()
+        val visible = analysis != null
+        analysisSection.isVisible = visible
+        analysisBox.isVisible = visible
+        if (analysis == null) {
+            analysisBox.revalidate(); analysisBox.repaint()
+            return
+        }
+
+        analysis.format?.let { analysisBox.add(analysisRow("format", it, Theme.TEXT)) }
+        analysis.arch?.let { analysisBox.add(analysisRow("arch", it, Theme.TEXT)) }
+        analysis.profile?.let { analysisBox.add(analysisRow("profile", it, Theme.TEXT)) }
+        analysis.methodDiscovery?.let { analysisBox.add(analysisRow("discovery", it, Theme.TEXT)) }
+
+        val registry = "${analysis.nativeClassCount} native " +
+            "class${if (analysis.nativeClassCount == 1) "" else "es"}  ·  " +
+            "${analysis.stringCount} string${if (analysis.stringCount == 1) "" else "s"}"
+        analysisBox.add(analysisRow("registry", registry, Theme.DIM))
+
+        val gapCount = analysis.bindingGaps.size
+        val gapText = if (gapCount == 0) "none" else
+            "$gapCount binding gap${if (gapCount == 1) "" else "s"}"
+        analysisBox.add(analysisRow("gaps", gapText, if (gapCount == 0) Theme.OK else Theme.WARN))
+        // A short list of the gaps themselves — the reviewer's cue for what
+        // introspection could not place. Cap it so the strip stays compact.
+        for (gap in analysis.bindingGaps.take(3)) {
+            analysisBox.add(analysisGapRow(gap.line))
+        }
+        if (gapCount > 3) {
+            analysisBox.add(analysisGapRow("… and ${gapCount - 3} more"))
+        }
+
+        analysisBox.revalidate()
+        analysisBox.repaint()
+    }
+
+    private fun analysisRow(label: String, value: String, valueColor: java.awt.Color): JComponent {
+        val name = JLabel(label).apply {
+            foreground = Theme.DIM
+            font = Theme.monoSmall
+            preferredSize = Dimension(88, 20)
+            maximumSize = Dimension(88, 20)
+        }
+        val v = JLabel(value).apply {
+            foreground = valueColor
+            font = Theme.mono
+        }
+        return JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.X_AXIS)
+            background = Theme.BG
+            alignmentX = LEFT_ALIGNMENT
+            border = BorderFactory.createEmptyBorder(1, 0, 1, 0)
+            maximumSize = Dimension(Int.MAX_VALUE, 22)
+            add(name)
+            add(v)
+            add(Box.createHorizontalGlue())
+        }
+    }
+
+    private fun analysisGapRow(text: String): JComponent {
+        // Wrap the gap line (kind + the method it could not place) inside a
+        // BorderLayout region so it fills the width and wraps rather than being
+        // clipped. A right inset keeps it clear of the pane edge; a BoxLayout
+        // row would let the label reflow to its natural width and run off.
+        val v = JLabel("<html>${escapeHtml(text)}</html>").apply {
+            foreground = Theme.DIM
+            font = Theme.monoSmall
+            toolTipText = text
+        }
+        return object : JPanel(BorderLayout()) {
+            override fun getMaximumSize(): Dimension =
+                Dimension(Int.MAX_VALUE, preferredSize.height)
+        }.apply {
+            background = Theme.BG
+            alignmentX = LEFT_ALIGNMENT
+            border = BorderFactory.createEmptyBorder(0, 96, 2, 56)
+            add(v, BorderLayout.CENTER)
+        }
+    }
+
+    private fun escapeHtml(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     private fun artifactRow(a: ArtifactState): JComponent {
         val glyph = JLabel(if (a.present) "\u25CF" else "\u25CB")

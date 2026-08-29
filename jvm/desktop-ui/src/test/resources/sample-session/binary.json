@@ -6,6 +6,10 @@
     "arch": "amd64",
     "sha256": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0"
   },
+  "analysis": {
+    "profile": "native_obfuscator",
+    "methodDiscovery": "register-natives-call-site"
+  },
   "stringPool": {
     "base": "0x180040000",
     "totalBytes": 48,
@@ -28,6 +32,14 @@
       "methods": [
         { "name": "boot", "desc": "()V", "fnAddr": "0x180001380", "fnSymbol": "Java_com_example_Main_boot" }
       ]
+    }
+  ],
+  "bindingGaps": [
+    {
+      "kind": "unbound-native-method",
+      "method": "com/example/Crypto.checksum",
+      "desc": "([B)J",
+      "detail": "com/example/Crypto.checksum ([B)J had no RegisterNatives call site match"
     }
   ],
   "hiddenClasses": []

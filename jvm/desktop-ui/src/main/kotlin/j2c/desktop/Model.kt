@@ -48,6 +48,35 @@ data class RecoveredArtifact(
     val listing: String,
 )
 
+/** One native method the introspection could not bind to a call site. */
+data class BindingGap(
+    val kind: String,
+    val detail: String,
+) {
+    /** A single-line form for the compact strip. */
+    val line: String get() = if (detail.isBlank()) kind else "$kind — $detail"
+}
+
+/**
+ * The compact analysis facts from `binary.json` worth surfacing beyond raw
+ * counts: the container format, target arch, the obfuscator profile and
+ * method-discovery strategy the pass used, and any binding gaps (native methods
+ * introspection could not place). Fields it did not find read as null and are
+ * simply omitted from the strip, so this works against older `binary.json`
+ * files that only carry the counts.
+ */
+data class BinaryAnalysis(
+    val format: String?,
+    val arch: String?,
+    val profile: String?,
+    val methodDiscovery: String?,
+    val nativeClassCount: Int,
+    val stringCount: Int,
+    val bindingGaps: List<BindingGap>,
+) {
+    val hasBindingGaps: Boolean get() = bindingGaps.isNotEmpty()
+}
+
 /** One pipeline artifact and whether the session directory has it. */
 data class ArtifactState(
     val id: String,
@@ -103,6 +132,8 @@ data class Session(
     val nextCommand: NextCommand?,
     /** Non-fatal problems hit while reading the folder. */
     val notes: List<String>,
+    /** Parsed facts from binary.json, when the session has one. */
+    val binaryAnalysis: BinaryAnalysis? = null,
 ) {
     val hasAnyArtifact: Boolean get() = artifacts.any { it.present }
 

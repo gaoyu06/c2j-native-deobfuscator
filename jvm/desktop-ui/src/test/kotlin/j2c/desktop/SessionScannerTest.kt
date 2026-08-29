@@ -3,6 +3,7 @@ package j2c.desktop
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.nio.file.Files
@@ -66,6 +67,53 @@ class SessionScannerTest {
         val next = s.nextCommand!!
         assertTrue(next.command.contains("rebuild"), "expected rebuild, got: ${next.command}")
         assertTrue(next.reason.contains("still need bodies"))
+    }
+
+    @Test
+    fun `reads the binary analysis strip from binary json`() {
+        val a = SessionScanner.scan(sampleDir()).binaryAnalysis
+            ?: error("expected a binary analysis")
+        assertEquals("PE", a.format)
+        assertEquals("amd64", a.arch)
+        assertEquals("native_obfuscator", a.profile)
+        assertEquals("register-natives-call-site", a.methodDiscovery)
+        assertEquals(2, a.nativeClassCount)
+        assertEquals(3, a.stringCount)
+        assertEquals(1, a.bindingGaps.size)
+        assertTrue(a.hasBindingGaps)
+        assertEquals("unbound-native-method", a.bindingGaps.first().kind)
+        assertTrue(
+            a.bindingGaps.first().line.contains("checksum"),
+            "got: ${a.bindingGaps.first().line}",
+        )
+    }
+
+    @Test
+    fun `binary json without analysis or gaps still yields format and arch`() {
+        val dir = Files.createTempDirectory("j2c-binonly")
+        dir.resolve("binary.json").writeText(
+            """
+            {
+              "schemaVersion": 1,
+              "input": { "libPath": "x.so", "format": "ELF", "arch": "aarch64", "sha256": "${"0".repeat(64)}" },
+              "stringPool": { "totalBytes": 0, "strings": [] },
+              "nativeRegistry": []
+            }
+            """.trimIndent(),
+        )
+        val a = SessionScanner.scan(dir).binaryAnalysis ?: error("expected a binary analysis")
+        assertEquals("ELF", a.format)
+        assertEquals("aarch64", a.arch)
+        assertNull(a.profile)
+        assertNull(a.methodDiscovery)
+        assertFalse(a.hasBindingGaps)
+    }
+
+    @Test
+    fun `no binary json means no analysis strip`() {
+        val dir = Files.createTempDirectory("j2c-nobinary")
+        dir.resolve("classes.json").writeText("""{"schemaVersion":1,"input":{"jarPath":"a.jar","sha256":"${"0".repeat(64)}"},"classes":[]}""")
+        assertNull(SessionScanner.scan(dir).binaryAnalysis)
     }
 
     @Test

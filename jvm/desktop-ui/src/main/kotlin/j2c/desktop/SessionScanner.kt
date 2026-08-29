@@ -72,6 +72,7 @@ object SessionScanner {
         )
 
         val traceEvents = readTrace(tracePath, notes)
+        val binaryAnalysis = readBinaryAnalysis(binary)
 
         val next = NextCommandPlanner.plan(
             hasClasses = classesPath.exists(),
@@ -82,8 +83,55 @@ object SessionScanner {
             hasTrace = tracePath.exists(),
         )
 
-        return Session(dir, artifacts, methods, traceEvents, next, notes)
+        return Session(dir, artifacts, methods, traceEvents, next, notes, binaryAnalysis)
     }
+
+    // ---------------------------------------------------------------
+    // Binary analysis strip
+    // ---------------------------------------------------------------
+
+    /**
+     * Pull the compact analysis facts out of binary.json. Reads defensively:
+     * `input.format` / `input.arch` are long-standing, while `analysis.profile`,
+     * `analysis.methodDiscovery`, and `bindingGaps` are newer and optional — any
+     * missing field reads as null / empty and is omitted from the strip.
+     */
+    private fun readBinaryAnalysis(binary: JsonNode?): BinaryAnalysis? {
+        if (binary == null) return null
+        val input = binary["input"]
+        val analysis = binary["analysis"]
+        return BinaryAnalysis(
+            format = input?.get("format")?.textOrNull(),
+            arch = input?.get("arch")?.textOrNull(),
+            profile = analysis?.get("profile")?.textOrNull(),
+            methodDiscovery = analysis?.get("methodDiscovery")?.textOrNull(),
+            nativeClassCount = binary["nativeRegistry"]?.size() ?: 0,
+            stringCount = binary["stringPool"]?.get("strings")?.size() ?: 0,
+            bindingGaps = readBindingGaps(binary["bindingGaps"]),
+        )
+    }
+
+    private fun readBindingGaps(node: JsonNode?): List<BindingGap> {
+        if (node == null || !node.isArray) return emptyList()
+        val out = mutableListOf<BindingGap>()
+        for (g in node) {
+            if (g.isTextual) {
+                out += BindingGap(g.asText(), "")
+                continue
+            }
+            val kind = g["kind"]?.textOrNull() ?: g["reason"]?.textOrNull() ?: "binding-gap"
+            val detail = g["detail"]?.textOrNull()
+                ?: buildString {
+                    g["method"]?.textOrNull()?.let { append(it) }
+                    g["desc"]?.textOrNull()?.let { append(it) }
+                }.ifBlank { g["note"]?.textOrNull() ?: "" }
+            out += BindingGap(kind, detail)
+        }
+        return out
+    }
+
+    private fun JsonNode.textOrNull(): String? =
+        if (isNull) null else asText().takeIf { it.isNotBlank() }
 
     // ---------------------------------------------------------------
     // Method table assembly
