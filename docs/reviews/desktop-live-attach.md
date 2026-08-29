@@ -14,6 +14,38 @@ for the changed toolbar.
 
 **Verdict: preview-ok** after the fixes below.
 
+## Update — attach refusals and the analysis strip
+
+A follow-up pass made the viewer show *key attach and analysis data*, not just
+a log tail. Two additions, both read-only, both screenshotted:
+
+- **First-class attach refusals** (`10-attach-refused`). The attach form now
+  refuses honestly instead of quietly appending to the log:
+  - a Linux `/proc/<pid>/cmdline` **pre-scan** (`AttachDiagnostics`) blocks Run
+    before launch when the target's argv carries
+    `-XX:+DisableAttachMechanism` (`attach-disabled`) or
+    `-XX:-EnableDynamicAgentLoading` (`dynamic-agent-disabled`);
+  - a **parser** reads the CLI's `attach failed (reason=<code>): …` line, when
+    present, and maps the code to a banner (code, one-line meaning, and the one
+    honest remedy: use startup `-agentpath` / `recover`).
+  - `-Djdk.attach.allowAttachSelf=false` is intentionally **not** a refusal (it
+    disables self-attach only); it surfaces as a warning and proceeds. On any
+    refusal or non-zero exit the viewer never tails and never claims it
+    attached. This branch parses the CLI's reason code — it does **not**
+    re-implement the CLI's Python classifier in Kotlin.
+- **Binary analysis strip** on the session viewer (`11-analysis-strip`; also
+  visible in the refreshed `04-pipeline`). `binary.json` is shown as more than
+  "N native classes, M strings": the container format (PE/ELF/MachO), arch,
+  the obfuscator `profile` and `methodDiscovery` strategy (when recorded), the
+  registry/string counts, and any `bindingGaps` (count + short list). The
+  bundled `sample-session/binary.json` gained an `analysis` block and one
+  `unbound-native-method` binding gap so the shot proves PE + a real gap.
+
+Both additions are backed by headless tests (`AttachControllerTest` for the
+parser + cmdline scan, `SessionScannerTest` for the analysis parse); the JDK
+21 toolchain stays module-local. `./gradlew :desktop-ui:test` passes (42
+tests) and screenshots were re-exported.
+
 ## Issues found
 
 1. **Gap explanation unreadable — clipped mid-sentence.** In the

@@ -60,7 +60,13 @@ window.
   line, with operands spelled out. Read-only; it prints what the recovery
   stage wrote, it does not assemble bytecode.
 - **Pipeline** — which artifacts are present or missing, and the single
-  CLI command to run next. The command is shown, never run.
+  CLI command to run next. The command is shown, never run. When a
+  `binary.json` is present it also shows a compact **binary analysis** strip:
+  the container format (PE/ELF/MachO), target arch, the obfuscator profile and
+  method-discovery strategy the introspection used (when recorded), the native
+  registry / string counts, and any **binding gaps** — native methods the pass
+  could not bind to a call site — as a count plus a short list. Missing fields
+  are simply omitted, so older `binary.json` files still show format and arch.
 - **Artifact JSON** — the raw recovered JSON for the selected method.
 - **Trace** — the trace events. A static `trace.jsonl` is loaded when the
   session has one; **Tail this trace** follows it live as it grows. Rows are
@@ -104,6 +110,37 @@ an honest front end to the `attach` CLI (see
   target's inspection checks; if the target refuses attach, the CLI output is
   shown as-is. For full method-body recovery, use the startup `-agentpath`
   path (`recover` / `dynamic-trace`), which remains the default.
+- **Refusals are first-class, never silent.** Two honest guardrails, both
+  read-only:
+  - *Before launch*, on Linux, the form scans the target's
+    `/proc/<pid>/cmdline` for `-XX:+DisableAttachMechanism`
+    (`attach-disabled`) and `-XX:-EnableDynamicAgentLoading`
+    (`dynamic-agent-disabled`). If either is present, **Run is blocked** and a
+    banner names the reason. (`-Djdk.attach.allowAttachSelf=false` is *not* a
+    refusal — it governs self-attach only — so it does not block a same-user
+    attach.)
+  - *After a run*, if the CLI printed `attach failed (reason=<code>): …`, the
+    viewer parses that code and shows the same banner. The recognized codes are
+    `attach-disabled`, `dynamic-agent-disabled`, `cross-user`, `not-a-jvm`,
+    `agent-onattach-missing`, `agent-init-failed`, `jcmd-false-success`, and
+    `unknown`. The banner gives the code, a one-line meaning, and the one honest
+    remedy — *use startup `-agentpath` / `recover` for full coverage*. On any
+    refusal or non-zero exit the viewer never tails and never claims it
+    attached; nothing is bypassed.
+
+## What the GUI shows vs what stays CLI-only
+
+The desktop viewer surfaces the recovery/analysis **data** so a run reads at a
+glance; the CLI remains the automation contract and the only thing that
+actually *does* work. Concretely:
+
+| Shown in the GUI | Still CLI-only |
+|---|---|
+| Method table + recovery status, recovered bodies, artifact JSON | Running `parse-jar` / `inspect-binary` / `merge-manifest` / `trace-to-bc` / `static-reverse` / `rebuild` |
+| Pipeline status + the exact next command (shown, not run) | Executing that next command |
+| Binary analysis strip (format, arch, profile, method discovery, binding gaps) | Producing `binary.json` (`inspect-binary`) |
+| Live `trace.jsonl` tail with capability / gap rows | The attach itself — the GUI assembles and runs the same `attach` command, it does not invent a second attach protocol |
+| Attach refusals (argv pre-scan + parsed `reason=<code>`) | The CLI's own refusal classification (the GUI reads the printed code; it does not re-implement the Python classifier) |
 
 ## Visual style (keep it this way)
 
@@ -145,7 +182,10 @@ whole app.
 - `TraceTailer.kt` — follows a trace file as it grows, on a Swing timer.
 - `AttachController.kt` — builds (and, on confirmation, runs) the `attach`
   CLI command. Command building and validation are Swing-free and tested.
-- `AttachPanel.kt` — the attach / listen form.
+- `AttachDiagnostics.kt` — Swing-free refusal classification: the
+  `/proc/<pid>/cmdline` argv pre-scan and the `attach failed (reason=<code>)`
+  output parser. Tested without a live JVM.
+- `AttachPanel.kt` — the attach / listen form, including the refusal banner.
 - `NextCommandPlanner.kt` — picks the next CLI step from which artifacts
   exist.
 - `Listing.kt` — turns a recovered method into a readable listing.
@@ -156,8 +196,10 @@ whole app.
 
 ## Tests
 
-Scanning and status derivation are covered by headless JUnit tests (no
-display needed):
+Scanning, status derivation, the binary-analysis parse, the attach-command
+assembly, the `/proc/<pid>/cmdline` refusal pre-scan, and the
+`attach failed (reason=<code>)` output parser are all covered by headless
+JUnit tests (no display, no live JVM needed):
 
 ```bash
 cd jvm
@@ -169,12 +211,18 @@ cd jvm
 `screenshots/` holds rendered images of each state:
 
 - `01-empty` … `06-trace` — the artifact-session states (empty, missing
-  artifacts, pipeline, method detail, static trace).
+  artifacts, pipeline, method detail, static trace). `04-pipeline` now includes
+  the binary analysis strip.
 - `07-attach-form` — the attach / listen form, with the exact CLI shown.
 - `08-live-tail` — a live tail: bind events plus honest capability / gap rows
   (a reduced-capability live attach: bind only).
 - `09-capability-gap` — the empty case shown plainly: no core capabilities
   granted, nothing usable captured.
+- `10-attach-refused` — a first-class refusal: the target's argv carries
+  `-XX:+DisableAttachMechanism`, so the form refuses before launch with the
+  reason code, meaning, and startup-path remedy. Run stays disabled.
+- `11-analysis-strip` — the binary analysis strip: PE + arch + profile +
+  method discovery, and a binding gap (`checksum` left unbound) called out.
 
 Regenerate them with:
 
