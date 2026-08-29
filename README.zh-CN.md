@@ -315,8 +315,10 @@ guard 跳过。匹配的变体 Profile 可以按需开启这些能力。Ghidra �
 通用发现已由提交入库的 fixture 证明：覆盖三种 x86-64 目标格式（ELF、PE、
 Mach-O）、两种注册族（`RegisterNatives` 静态表与 `Java_*` 导出名），并包含
 符号剥离 ELF、**AArch64** ELF（`adrp`/`add` 取表地址，JNI 分发经 `x16`
-中转寄存器），以及**删除节头表**（section header table）后仅靠 `PT_LOAD`
-程序头兜底恢复的 ELF。完整“已证明/未证明”对照见
+中转寄存器）、**Mach-O arm64** dylib（报告 `format=MachO`/`arch=aarch64` 与
+`_Java_*` 导出；当宿主 Capstone 能反汇编 AArch64 时，静态表还会经紧凑的单条
+`adr` 取表地址方式解出），以及**删除节头表**（section header table）后仅靠
+`PT_LOAD` 程序头兜底恢复的 ELF。完整“已证明/未证明”对照见
 [`docs/generic-recovery.md`](docs/generic-recovery.md)。该路径仍是开发中能力：
 未提升为默认 `recover` 流程，也不声称还原方法字节码。
 
