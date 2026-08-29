@@ -107,6 +107,37 @@ single-accent instrument-panel palette holds.
   it is the default-focused button when the window opens. This is ordinary
   focus state, not a highlight. Left as-is.
 
+## Update — must-fix follow-up (independent re-review)
+
+A second independent pass raised five must-fix items; all are addressed on
+`cursor/desktop-viewer-live-attach-c9be`, re-tested and re-screenshotted:
+
+1. **Clipped intro copy.** Screenshots `07`/`10` cut *confirmation* to
+   *confir*. The intro and every banner now wrap through one shared width
+   (`AttachPanel.WRAP_PX`) kept comfortably inside the packed dialog's content
+   column, so words stay complete. The attach-form shots are now taken at the
+   real packed dialog size (`dialogShot`), so the image matches the app. `09`'s
+   gap sentence is unchanged and still complete.
+2. **Attach CLI absent on this branch.** The form detects that this checkout
+   has no `attach` subcommand (it inspects the same `main.py` the run path
+   would launch) and shows an honest amber notice — *attach CLI not in this
+   checkout* — while keeping Run disabled. Listen and the `/proc` pre-scan
+   still work. No PR #9 code was copied.
+3. **Panel outcome path tested.** The tail / announce decision is now a pure
+   function (`AttachController.outcomeFor`) with tests proving a non-zero exit
+   *or* a parsed refusal never tails and never claims attached — not just the
+   `showRefusal` screenshot hook.
+4. **`allowAttachSelf=false` warning wired.** The refresh/pre-scan reads the
+   target argv once and surfaces `warningsForTokens` as an amber warning line
+   (not a refusal). Shown in the real UI in `12-attach-self-warning`.
+5. **bindingGaps source of truth.** The strip reads `bindingGaps` from
+   `manifest.json` (falling back to `binary.json`) while keeping format / arch /
+   analysis from `binary.json`. The sample session moves its gap onto
+   `manifest.json` to match that layout.
+
+`./gradlew :desktop-ui:test` passes (52 tests). No stealth or bypass was added;
+`DisableAttachMechanism` remains a hard refusal.
+
 ## Build / test notes
 
 - The module targets JDK 21 while the rest of `jvm/` targets JDK 17. On a

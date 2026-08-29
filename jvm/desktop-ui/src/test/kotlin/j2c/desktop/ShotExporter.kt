@@ -53,12 +53,19 @@ fun main(args: Array<String>) {
         println("wrote $name.png")
     }
 
-    fun componentShot(name: String, w: Int, h: Int, build: () -> JComponent) {
+    /**
+     * Render a standalone component to a PNG, sizing the window to the panel's
+     * own preferred size — exactly what ViewerFrame.openAttachDialog does with
+     * pack(). This makes the attach-form shots match the real dialog a user
+     * sees, so the intro / banner wrapping in the image is the wrapping in the
+     * app.
+     */
+    fun dialogShot(name: String, build: () -> JComponent) {
         var frame: JFrame? = null
         SwingUtilities.invokeAndWait {
             val f = JFrame(name)
             f.contentPane = build()
-            f.setSize(w, h)
+            f.pack()
             f.isVisible = true
             frame = f
         }
@@ -68,7 +75,6 @@ fun main(args: Array<String>) {
             val content = f.contentPane
             val cw = content.width.coerceAtLeast(1)
             val ch = content.height.coerceAtLeast(1)
-            println("PROBE $name content=${cw}x$ch")
             val img = BufferedImage(cw, ch, BufferedImage.TYPE_INT_RGB)
             val g = img.createGraphics()
             content.printAll(g)
@@ -118,7 +124,7 @@ fun main(args: Array<String>) {
     // preview CLI is absent, so the form says so and keeps Run disabled — it
     // never pretends the displayed command would run. Listen and the pre-scan
     // still work.
-    componentShot("07-attach-form", 560, 620) {
+    dialogShot("07-attach-form") {
         AttachPanel(
             defaultOutput = "trace.jsonl",
             onStartTail = {},
@@ -153,7 +159,7 @@ fun main(args: Array<String>) {
     // -XX:+DisableAttachMechanism, so the form refuses before launch, names the
     // reason code, gives the one-line meaning, and points at the startup path.
     // No stealth, no bypass — reaching this banner means no attach happened.
-    componentShot("10-attach-refused", 560, 620) {
+    dialogShot("10-attach-refused") {
         AttachPanel(
             defaultOutput = "trace.jsonl",
             onStartTail = {},
@@ -177,7 +183,7 @@ fun main(args: Array<String>) {
     // -Djdk.attach.allowAttachSelf=false, which governs self-attach only and
     // does NOT block this same-user attach, so the form warns (amber) and does
     // not refuse. Same scan/classification the live refresh runs.
-    componentShot("12-attach-self-warning", 560, 620) {
+    dialogShot("12-attach-self-warning") {
         AttachPanel(
             defaultOutput = "trace.jsonl",
             onStartTail = {},

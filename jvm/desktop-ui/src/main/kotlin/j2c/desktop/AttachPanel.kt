@@ -345,7 +345,9 @@ class AttachPanel(
         stack.add(left(hintLabel))
         stack.add(bannerRow(noticeBanner))
         stack.add(bannerRow(refusalBanner))
-        stack.add(left(warningLabel))
+        // A growable row (not left(), which freezes the height to one line) so a
+        // two-line warning that appears after the dialog is sized shows in full.
+        stack.add(bannerRow(warningLabel))
         stack.add(left(Ui.sectionLabel("attach output")))
         stack.add(Ui.scroll(logArea).apply { preferredSize = Dimension(480, 120) })
         return stack
@@ -548,9 +550,12 @@ class AttachPanel(
     private companion object {
         /**
          * The wrap width (px) shared by the intro paragraph and every banner so
-         * they line up and, crucially, wrap with complete words inside the
-         * form's fixed content column instead of clipping the last word.
+         * they line up and, crucially, wrap with *complete* words. A Swing HTML
+         * label whose fixed div width sits too close to its allocated width
+         * reflows text wider than it paints and clips the last word; keeping the
+         * wrap comfortably inside the dialog's ~570px content column (packed, as
+         * openAttachDialog does) avoids that.
          */
-        const val WRAP_PX = 452
+        const val WRAP_PX = 400
     }
 }

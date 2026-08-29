@@ -65,8 +65,11 @@ window.
   the container format (PE/ELF/MachO), target arch, the obfuscator profile and
   method-discovery strategy the introspection used (when recorded), the native
   registry / string counts, and any **binding gaps** — native methods the pass
-  could not bind to a call site — as a count plus a short list. Missing fields
-  are simply omitted, so older `binary.json` files still show format and arch.
+  could not bind to a call site — as a count plus a short list. Format, arch,
+  and the analysis facts come from `binary.json`; binding gaps are read from
+  `manifest.json` (where the merge step records them), falling back to
+  `binary.json`. Missing fields are simply omitted, so older reports still show
+  format and arch.
 - **Artifact JSON** — the raw recovered JSON for the selected method.
 - **Trace** — the trace events. A static `trace.jsonl` is loaded when the
   session has one; **Tail this trace** follows it live as it grows. Rows are
@@ -100,6 +103,11 @@ an honest front end to the `attach` CLI (see
   inspect this process*. That box adds the required `--i-own-this-process`
   flag; without it the CLI refuses before touching the target, and so does the
   GUI. Attach is for a same-user JVM you are authorized to inspect.
+- **If this checkout has no `attach` subcommand, Run is disabled and says so.**
+  The form inspects the same CLI it would launch; when the `attach` preview
+  subcommand is absent it shows an honest notice instead of pretending the
+  displayed command works. **Listen** and the `/proc` pre-scan still work, so
+  you can tail a trace and inspect a target's flags regardless.
 - On a successful attach the viewer starts tailing the trace. **Listen (tail
   only)** skips running anything and just follows a trace file — useful when
   you started the attach from a terminal.
@@ -115,10 +123,10 @@ an honest front end to the `attach` CLI (see
   - *Before launch*, on Linux, the form scans the target's
     `/proc/<pid>/cmdline` for `-XX:+DisableAttachMechanism`
     (`attach-disabled`) and `-XX:-EnableDynamicAgentLoading`
-    (`dynamic-agent-disabled`). If either is present, **Run is blocked** and a
-    banner names the reason. (`-Djdk.attach.allowAttachSelf=false` is *not* a
+    (    `dynamic-agent-disabled`). If either is present, **Run is blocked** and a
+    banner names the reason. `-Djdk.attach.allowAttachSelf=false` is *not* a
     refusal — it governs self-attach only — so it does not block a same-user
-    attach.)
+    attach; the form surfaces it as an amber **warning** and proceeds.
   - *After a run*, if the CLI printed `attach failed (reason=<code>): …`, the
     viewer parses that code and shows the same banner. The recognized codes are
     `attach-disabled`, `dynamic-agent-disabled`, `cross-user`, `not-a-jvm`,
@@ -181,7 +189,9 @@ whole app.
   capability / gap / lifecycle). Shared by the scanner and the tailer.
 - `TraceTailer.kt` — follows a trace file as it grows, on a Swing timer.
 - `AttachController.kt` — builds (and, on confirmation, runs) the `attach`
-  CLI command. Command building and validation are Swing-free and tested.
+  CLI command, detects whether this checkout has an `attach` subcommand, and
+  decides the post-run tail / announce outcome. Command building, validation,
+  availability detection, and the outcome rule are Swing-free and tested.
 - `AttachDiagnostics.kt` — Swing-free refusal classification: the
   `/proc/<pid>/cmdline` argv pre-scan and the `attach failed (reason=<code>)`
   output parser. Tested without a live JVM.
@@ -213,7 +223,9 @@ cd jvm
 - `01-empty` … `06-trace` — the artifact-session states (empty, missing
   artifacts, pipeline, method detail, static trace). `04-pipeline` now includes
   the binary analysis strip.
-- `07-attach-form` — the attach / listen form, with the exact CLI shown.
+- `07-attach-form` — the attach / listen form, with the exact CLI shown. On a
+  checkout without the `attach` subcommand (this one) it also shows the honest
+  "attach CLI not in this checkout" notice and keeps Run disabled.
 - `08-live-tail` — a live tail: bind events plus honest capability / gap rows
   (a reduced-capability live attach: bind only).
 - `09-capability-gap` — the empty case shown plainly: no core capabilities
@@ -223,6 +235,9 @@ cd jvm
   reason code, meaning, and startup-path remedy. Run stays disabled.
 - `11-analysis-strip` — the binary analysis strip: PE + arch + profile +
   method discovery, and a binding gap (`checksum` left unbound) called out.
+- `12-attach-self-warning` — the non-fatal warning path: the target sets
+  `-Djdk.attach.allowAttachSelf=false`, which the form flags in amber without
+  refusing (it governs self-attach only).
 
 Regenerate them with:
 
