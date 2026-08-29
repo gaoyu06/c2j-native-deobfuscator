@@ -146,6 +146,24 @@ else
     skip "no C compiler ($CC) — keeping committed libjni_exports_only.so"
 fi
 
+echo "[ELF] libjni_unreadable_table.so (visible-but-unreadable RegisterNatives table — honest gap)"
+# A RegisterNatives call site whose in-image JNINativeMethod[] is VISIBLE (right
+# stride, nMethods immediate 2) but whose name/descriptor bytes are high-bit /
+# XOR-looking garbage that is not valid UTF-8 (an encrypted-string-table model).
+# Generic discovery must record this as an HONEST GAP — the site was seen but
+# the table did not decode — rather than silently dropping it or fabricating
+# method names/addresses. Built with the host cc from committed C; no cross
+# toolchain and no mingw are required. This is a genuine ELF x86-64 image, not a
+# renamed copy of any other fixture. The committed .so lets the suite run with
+# no compiler.
+if command -v "$CC" >/dev/null 2>&1; then
+    "$CC" -O2 -shared -fPIC -nostdlib \
+        -o libjni_unreadable_table.so jni_unreadable_table.c
+    log "built libjni_unreadable_table.so ($CC)"
+else
+    skip "no C compiler ($CC) — keeping committed libjni_unreadable_table.so"
+fi
+
 echo "[ELF] libjni_registrar.noshdr.so + libjni_exports_only.noshdr.so (section header table removed)"
 # Derive PT_LOAD-only images (no section header table) from the committed base
 # binaries, mirroring what `sstrip` produces. Pure-Python so it needs no extra
