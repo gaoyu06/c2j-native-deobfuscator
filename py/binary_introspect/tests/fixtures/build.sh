@@ -77,6 +77,19 @@ else
     skip "no C compiler ($CC) — keeping committed libjni_exports_only.so"
 fi
 
+echo "[ELF] libjni_registrar.noshdr.so + libjni_exports_only.noshdr.so (section header table removed)"
+# Derive PT_LOAD-only images (no section header table) from the committed base
+# binaries, mirroring what `sstrip` produces. Pure-Python so it needs no extra
+# toolchain. Addresses are preserved, so the registrar's table assertions and
+# the exports-only names both hold on the stripped image.
+if command -v python3 >/dev/null 2>&1; then
+    python3 strip_section_headers.py libjni_registrar.so libjni_registrar.noshdr.so
+    python3 strip_section_headers.py libjni_exports_only.so libjni_exports_only.noshdr.so
+    log "built libjni_registrar.noshdr.so and libjni_exports_only.noshdr.so"
+else
+    skip "no python3 — keeping committed *.noshdr.so"
+fi
+
 echo "[PE] jni_registrar.dll (Microsoft x64 ABI)"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 if command -v "$MINGW" >/dev/null 2>&1; then

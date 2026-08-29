@@ -274,6 +274,74 @@ def test_introspect_exports_only_elf_uses_export_family_not_table() -> None:
     }
 
 
+def _assert_section_header_removed(path: Path):
+    """Parse a section-header-removed ELF and return the report, or drive the
+    honest-failure contract when this LIEF cannot map it.
+
+    Returns ``(report, binary)`` when LIEF parses the PT_LOAD-only image (with
+    ``binary.sections`` confirmed empty), or ``None`` after asserting that
+    ``introspect`` raises rather than silently returning an empty result.
+    """
+    binary = lief.parse(str(path))
+    if binary is None:
+        # Honest failure: no section headers AND this LIEF build cannot fall
+        # back to the program headers, so introspection must raise, never
+        # return a silent empty success.
+        with pytest.raises((IOError, OSError)):
+            introspect(path)
+        return None
+    # The image genuinely has no section header table — the fallback is
+    # exercising the program headers, not surviving sections.
+    assert list(binary.sections) == []
+    return introspect(path), binary
+
+
+def test_section_header_removed_registrar_recovers_table_via_ptload() -> None:
+    """A registrar ELF with its section header table removed (``sstrip``-style,
+    only ``PT_LOAD`` segments remain) still yields the RegisterNatives static
+    table through the PT_LOAD fallback: executable ranges come from ``PF_X``
+    segments and the zeroed fnPtr slots are filled from dynamic relocations.
+    Silent empty success is not allowed."""
+    result = _assert_section_header_removed(FIXTURES / "libjni_registrar.noshdr.so")
+    if result is None:
+        return
+    report, _binary = result
+    assert report.fmt == "ELF"
+    assert report.arch == "x86_64"
+
+    tables = _static_tables(report)
+    assert len(tables) == 1, "PT_LOAD fallback must not silently yield nothing"
+    table = tables[0]
+    assert table["abi"] == "amd64-sysv"
+    assert [(m["name"], m["desc"], m["fnAddr"]) for m in table["methods"]] == [
+        ("alpha", "()V", "0x1000"),
+        ("beta", "(I)I", "0x1010"),
+    ]
+
+
+def test_section_header_removed_exports_only_recovers_java_exports_via_ptload() -> None:
+    """The explicit requirement: a section-header-removed, PT_LOAD-only ELF
+    whose methods register purely by ``Java_*`` name still surfaces those
+    dynamic exports (read from ``PT_DYNAMIC``), so the fallback finds the
+    export family with no sections at all."""
+    result = _assert_section_header_removed(
+        FIXTURES / "libjni_exports_only.noshdr.so"
+    )
+    if result is None:
+        return
+    report, _binary = result
+    assert report.fmt == "ELF"
+    assert report.arch == "x86_64"
+
+    assert _static_tables(report) == []
+    exported = {e["fnSymbol"] for e in _jni_exports(report)}
+    assert exported == {
+        "Java_com_example_Widget_init",
+        "Java_com_example_Widget_compute",
+        "Java_com_example_Widget_hashOf__Ljava_lang_String_2",
+    }
+
+
 def test_real_pe_table_binds_through_manifest_merge_without_silent_gap() -> None:
     """End-to-end: the PE-discovered named table binds to the matching class by
     (name, desc), and an ambiguous duplicate leaves the table unbound with a

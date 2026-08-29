@@ -42,6 +42,35 @@ from .profile import Profile, JNI_REGISTER_NATIVES_INDEX, detect_profile
 # Executable / readable section discovery
 # --------------------------------------------------------------------
 
+def _elf_load_segments(b: lief.Binary) -> list[tuple[int, int, bytes]]:
+    """Return ``(virtual_address, flags, raw)`` for every ``PT_LOAD`` segment.
+
+    This is the fallback source of addressable bytes when an ELF has had its
+    section header table removed (``sstrip`` or an equivalent that zeroes
+    ``e_shoff``/``e_shnum``). The program headers still map the image, so
+    ``PT_LOAD`` segments recover both the executable ranges and the data that
+    holds a ``JNINativeMethod[]`` and its ``Java_*`` dynamic symbols.
+    ``PT_LOAD`` is type id ``1`` and ``PF_X`` is flag bit ``0x1`` in every ELF
+    revision, so integer comparisons keep this working across LIEF versions.
+    """
+    out: list[tuple[int, int, bytes]] = []
+    for seg in getattr(b, "segments", []):
+        try:
+            if int(seg.type) != 1:  # PT_LOAD
+                continue
+        except (TypeError, ValueError):
+            continue
+        raw = bytes(seg.content)
+        if not raw:
+            continue
+        try:
+            flags = int(seg.flags)
+        except (TypeError, ValueError):
+            flags = 0
+        out.append((seg.virtual_address, flags, raw))
+    return out
+
+
 def _exec_ranges(b: lief.Binary, image_base: int) -> list[tuple[int, int, bytes]]:
     """Return ``(start_va, end_va_exclusive, raw_bytes)`` for every
     executable section."""
@@ -63,6 +92,10 @@ def _exec_ranges(b: lief.Binary, image_base: int) -> list[tuple[int, int, bytes]
                 continue
             raw = bytes(sec.content)
             out.append((sec.virtual_address, sec.virtual_address + len(raw), raw))
+        if not out:  # section-header-removed ELF: fall back to PT_LOAD PF_X
+            for va, flags, raw in _elf_load_segments(b):
+                if flags & 0x1:  # PF_X
+                    out.append((va, va + len(raw), raw))
     else:
         for sec in b.sections:
             if "TEXT" in (getattr(sec, "segment_name", "") or "").upper() and sec.size > 0:
@@ -101,6 +134,13 @@ def _mapped_ranges(b: lief.Binary, image_base: int) -> list[tuple[int, int, byte
         if b.format == lief.Binary.FORMATS.PE:
             start += image_base
         out.append((start, start + len(raw), raw))
+    if b.format == lief.Binary.FORMATS.ELF and not out:
+        # Section-header-removed ELF: every PT_LOAD segment is load-addressable
+        # by definition, so use them as the mapped image. The first PT_LOAD
+        # maps virtual address 0 (the ELF header); a zeroed, relocation-backed
+        # pointer slot is kept honest by the null guard in ``_read_pointer``.
+        for va, _flags, raw in _elf_load_segments(b):
+            out.append((va, va + len(raw), raw))
     return out
 
 
@@ -182,7 +222,12 @@ def _read_pointer(
         inline = _resolve_pointer(
             int.from_bytes(raw, "little", signed=False), ranges, image_base
         )
-        if _in_any_range(inline, ranges):
+        # A null on-disk value is never a valid name/desc/fn pointer; it marks a
+        # slot the loader fills from a relocation. Trusting it as "in range"
+        # would resolve to virtual address 0 whenever a PT_LOAD segment maps the
+        # ELF header (the section-header-removed fallback), so require a
+        # non-null inline value before short-circuiting the relocation lookup.
+        if inline and _in_any_range(inline, ranges):
             return inline
     if relocations and va in relocations:
         return relocations[va]
