@@ -354,7 +354,8 @@ Every stage has its own subcommand under `j2c-dumper`; see
 `generic` is the default fallback and depends on JNI specification facts:
 
 - `RegisterNatives` vtable index 215;
-- ABI-specific argument registers for Microsoft x64 and System V x86-64;
+- ABI-specific argument registers for Microsoft x64, System V x86-64, and
+  AArch64 AAPCS64 (`x2` for the method table, `w3`/`x3` for `nMethods`);
 - valid `JNINativeMethod` names/descriptors and executable function pointers;
 - specification-defined `Java_*` exports;
 - optional registration capture through binary emulation.
@@ -368,7 +369,10 @@ discovery.
 Generic discovery is proven by committed fixtures across all three x86-64
 object formats (ELF, PE, Mach-O) and both registration families (a
 `RegisterNatives` static table and `Java_*` export names), including a
-symbol-stripped ELF. See the proven/unproven matrix in
+symbol-stripped ELF, an **AArch64** ELF (`adrp`/`add` table addressing, JNI
+dispatch reached through the `x16` veneer register), and **section-header-removed
+ELF** images recovered through a `PT_LOAD` program-header fallback. See the
+proven/unproven matrix in
 [`docs/generic-recovery.md`](docs/generic-recovery.md). This remains a
 development path: it is not promoted to the default `recover` flow, and it does
 not claim to restore method bytecode.

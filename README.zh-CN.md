@@ -302,7 +302,8 @@ python -m j2c_dumper_cli.main emulate natives.bin --operation call --fn 0x<addr>
 `generic` 是默认兜底，只依赖 JNI 规范中的结构事实：
 
 - `RegisterNatives` 的 vtable 索引 215；
-- Microsoft x64 与 System V x86-64 的参数寄存器；
+- Microsoft x64、System V x86-64 与 AArch64 AAPCS64 的参数寄存器
+  （方法表用 `x2`，`nMethods` 用 `w3`/`x3`）；
 - 合法的 `JNINativeMethod` 名称/descriptor 与可执行函数指针；
 - 规范定义的 `Java_*` 导出；
 - 可选的二进制模拟注册捕获。
@@ -310,6 +311,14 @@ python -m j2c_dumper_cli.main emulate natives.bin --operation call --fn 0x<addr>
 它不会开启异常文案正则、反编译器输出重写、缓存表命名假设或异常/缓存
 guard 跳过。匹配的变体 Profile 可以按需开启这些能力。Ghidra 脚本是可选的
 方法体插件，不参与通用方法发现。
+
+通用发现已由提交入库的 fixture 证明：覆盖三种 x86-64 目标格式（ELF、PE、
+Mach-O）、两种注册族（`RegisterNatives` 静态表与 `Java_*` 导出名），并包含
+符号剥离 ELF、**AArch64** ELF（`adrp`/`add` 取表地址，JNI 分发经 `x16`
+中转寄存器），以及**删除节头表**（section header table）后仅靠 `PT_LOAD`
+程序头兜底恢复的 ELF。完整“已证明/未证明”对照见
+[`docs/generic-recovery.md`](docs/generic-recovery.md)。该路径仍是开发中能力：
+未提升为默认 `recover` 流程，也不声称还原方法字节码。
 
 通用能力有明确边界：不支持的 ABI、模拟无法触达的非标准或加密注册流程、
 自定义方法体布局仍需扩展 Profile 或 backend。详见
