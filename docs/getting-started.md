@@ -155,9 +155,27 @@ path.
 
 ## When you can't run the jar
 
-Use the **emulation fallback** — no JVM and no Ghidra. It runs the native code
-under a CPU emulator with a mock JNI, so it can list the native methods, dump
-decrypted constants, and call methods as pure-function oracles:
+Start with the generic, Ghidra-free discovery pipeline. It combines the JAR's
+native declarations with standard JNI entry-point evidence: direct `Java_*`
+exports and dynamic `RegisterNatives` registrations.
+
+```bash
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
+```
+
+These three steps do **not** require a live run or Ghidra. They produce the
+method-discovery manifest, not recovered method bodies. The generic discovery
+implementation lives in
+[`py/binary_introspect`](../py/binary_introspect); broader generic-first
+coverage is being completed on
+[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+
+For executable behavior and C-only constants, use the **emulation fallback**.
+It also needs no JVM or Ghidra: it runs the native code under a CPU emulator
+with a mock JNI, so it can list the native methods, dump decrypted constants,
+and call methods as pure-function oracles.
 
 Install `unicorn` into the interpreter setup used, and run the harness with it
 (the launcher only wraps the CLI subcommands):
@@ -169,6 +187,6 @@ py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-js
 
 Full walkthrough: [`emulation-recovery.md`](emulation-recovery.md).
 
-The **static path** (Ghidra) is an *advanced, optional* route for offline
-per-method coverage; see the "Advanced" section of the
-[README](../README.md#advanced-static-recovery-offline-needs-ghidra).
+Ghidra Headless is an **optional later step** when the JAR cannot run and you
+want pseudo-C to lift into static method bodies. See the "Advanced" section of
+the [README](../README.md#advanced-static-recovery-offline-needs-ghidra).

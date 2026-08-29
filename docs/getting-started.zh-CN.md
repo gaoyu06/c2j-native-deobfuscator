@@ -138,9 +138,23 @@ Java 版本够新，但 `JAVA_HOME` 没设；native agent 构建需要它。这�
 
 ## 目标跑不起来时怎么办
 
-改用**模拟兜底** —— 无需 JVM、无需 Ghidra。它在 CPU 模拟器 + mock JNI 下直接执行
-native 代码，因此能列出 native 方法、dump 解密后的常量，并把方法当纯函数 oracle
-来调用：
+先运行通用、无需 Ghidra 的发现管线。它把 JAR 中的 native 声明与 JNI 标准入口证据
+合并起来：直接导出的 `Java_*` 符号和 `RegisterNatives` 动态注册。
+
+```bash
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
+```
+
+这三步既不需要真实运行，也不需要 Ghidra；它们产出的是方法发现 manifest，而不是
+恢复后的方法体。通用发现实现位于
+[`py/binary_introspect`](../py/binary_introspect)；更完整的 generic-first 覆盖正在
+[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4) 中完成。
+
+如果要获得可执行行为和纯 C 常量，再使用**模拟兜底**。它同样无需 JVM、无需 Ghidra：
+在 CPU 模拟器 + mock JNI 下直接执行 native 代码，因此能列出 native 方法、dump
+解密后的常量，并把方法当纯函数 oracle 来调用。
 
 把 `unicorn` 装进 setup 所用的那个解释器，并用它来跑 harness（启动器只包装 CLI 子命令）：
 
@@ -151,5 +165,6 @@ py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-js
 
 完整步骤见 [`emulation-recovery.md`](emulation-recovery.md)。
 
-**静态路径**（Ghidra）是用于离线逐方法覆盖的**进阶、可选**路线；见
+当 JAR 无法运行、而你又希望得到可抬升为静态方法体的 pseudo-C 时，Ghidra Headless
+才是一个**可选的后续步骤**；见
 [README](../README.zh-CN.md) 里的"进阶：静态恢复"一节。

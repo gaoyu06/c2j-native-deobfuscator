@@ -13,8 +13,17 @@ Three complementary recovery paths:
 | Path | Input | Approach |
 |---|---|---|
 | **Dynamic** | obfuscated jar + a runnable command | Attach a JVMTI agent, observe the JNI call stream, lift it back to JVM bytecode |
-| **Static** | obfuscated jar + Ghidra | Locate the JNI method tables in the native blob, decompile each function, lift pseudo-C to JVM bytecode |
+| **Static** | offline manifest + optional Ghidra | Start with generic JNI discovery; when static bodies are needed, decompile each function and lift pseudo-C to JVM bytecode |
 | **Emulation** | obfuscated blob (no run, no Ghidra) | Run the native code under a CPU emulator + mock JNI; recover the method table, dump decrypted constants, and call methods as pure-function oracles |
+
+Offline discovery is a common, **Ghidra-free** first step:
+`parse-jar` reads the JAR declarations, `inspect-binary` inspects JNI entry
+points (direct `Java_*` exports and `RegisterNatives` registrations), and
+`merge-manifest` combines the evidence. The discovery boundary lives in
+[`py/binary_introspect`](py/binary_introspect); broader generic-first coverage
+is being completed on [PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+Ghidra is only a later option when the JAR cannot run and you want pseudo-C
+from which to recover static method bodies.
 
 The dynamic/static paths emit an `out.jar` whose native-method stubs are
 replaced with *best-effort recovered bodies* and whose loader / native-blob
@@ -90,17 +99,23 @@ fine on its own.
   `POP` / `CHECKCAST` / `ACONST_NULL` corrections so the emitted
   sequence verifies under ASM `COMPUTE_FRAMES`.
 
-### Static path
+### Offline discovery (no Ghidra)
 
-- **Disassembly-level table discovery** (`py/binary_introspect/`,
-  `capstone`). Walks the native blob's executable sections, locates
-  every `call qword ptr [reg + 0x6B8]` (the `RegisterNatives` JNI vtable
-  slot), backscans the preceding instructions for PC-relative `lea`s
-  whose targets land in `.text` (= function pointers in the
-  `JNINativeMethod[]` being built on the stack) plus the most recent
-  `mov <nMethods-reg>, imm` (= the table size).
+- **JAR and JNI discovery** (`jar-parser`, `py/binary_introspect/`,
+  `manifest-merge`). `parse-jar`, `inspect-binary`, and `merge-manifest`
+  build `manifest.json` from the JAR declarations and the JNI mechanisms
+  defined by the specification: direct `Java_*` exports and dynamic
+  `RegisterNatives` registrations. This stage does not require a live JVM or
+  Ghidra. The generic discovery implementation lives in
+  [`py/binary_introspect`](py/binary_introspect); broader generic-first
+  coverage is being completed on
+  [PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+
+### Static body recovery (optional Ghidra step)
+
 - **Ghidra decompiler** (`ghidra/scripts/DumpFromManifest.java`,
-  Ghidra Headless). Reads the `(class, method, fnAddr)` triples from
+  Ghidra Headless). Use this later when the JAR cannot run and you want static
+  method bodies. It reads the `(class, method, fnAddr)` triples from
   `manifest.json` and runs Ghidra's p-code decompiler on each address,
   yielding a single `ghidra-dump.json` with one pseudo-C body per
   method.
@@ -348,6 +363,23 @@ completion on hard targets (see the human-pass note above).
 > (`py\.venv\Scripts\python` on Windows). If setup fell back to `pip`, use the
 > interpreter it installed into instead.
 
+### Offline discovery (no live run, no Ghidra)
+
+Start here when the JAR cannot run. These generic discovery stages inspect
+standard JNI exports and `RegisterNatives` registration evidence and produce a
+merged manifest; they do **not** require Ghidra:
+
+```bash
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
+```
+
+The generic discovery implementation lives in
+[`py/binary_introspect`](py/binary_introspect); broader generic-first coverage
+is being completed on
+[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+
 ### Fallback: emulation (no live run, no Ghidra)
 
 **Use this when the jar won't run in your environment** — e.g. you only have the
@@ -382,17 +414,18 @@ Every stage has its own subcommand; see
 
 ## Advanced: static recovery (offline, needs Ghidra)
 
-The static path is **optional** and only needed when you cannot run the jar
-**and** want per-method coverage the emulation fallback doesn't auto-emit. It
-requires **Ghidra 11.x**:
+This is an **optional later step** after the Ghidra-free discovery above. Use
+it only when you cannot run the JAR and want pseudo-C for static method bodies
+that the emulation fallback does not auto-emit. This step requires
+**Ghidra 11.x**:
 
 ```bash
-# 1. Parse jar + introspect binary (no --run-cmd needed)
+# 1. Generic JNI discovery (no --run-cmd and no Ghidra needed)
 scripts/j2c parse-jar      in.jar      -o classes.json
 scripts/j2c inspect-binary natives.bin -o binary.json
 scripts/j2c merge-manifest classes.json binary.json -o manifest.json
 
-# 2. Run Ghidra headless against the native blob
+# 2. Optional: lift static bodies through Ghidra headless
 <GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
     -import natives.bin \
     -scriptPath <repo>/ghidra/scripts \

@@ -12,8 +12,16 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 | 路径 | 输入 | 思路 |
 |---|---|---|
 | **动态** | 混淆后的 JAR + 一条可运行的命令 | 加载 JVMTI agent，观察 JNI 调用流，把它重新拼回 JVM 字节码 |
-| **静态** | 混淆后的 JAR + Ghidra | 在 native blob 里定位 JNI method table，逐函数反编译，把 pseudo-C 抬升回 JVM 字节码 |
+| **静态** | 离线 manifest + 可选 Ghidra | 先做通用 JNI 发现；需要静态方法体时再逐函数反编译，把 pseudo-C 抬升回 JVM 字节码 |
 | **模拟** | 混淆后的 blob（不需运行、不需 Ghidra） | 用 CPU 模拟器 + mock JNI 直接跑 native 代码：恢复方法表、dump 解密后的常量、把方法当纯函数来调用 |
+
+离线发现是各路径共用的第一步，**不需要 Ghidra**：`parse-jar` 读取 JAR 声明，
+`inspect-binary` 按 JNI 规范检查入口（直接导出的 `Java_*` 符号和
+`RegisterNatives` 动态注册），`merge-manifest` 再合并这些证据。发现边界位于
+[`py/binary_introspect`](py/binary_introspect)；更完整的 generic-first 覆盖正在
+[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4) 中完成。
+只有当 JAR 无法运行、而你又希望从 pseudo-C 恢复静态方法体时，才需要在后续
+可选地使用 Ghidra。
 
 动态/静态路径会输出一个 `out.jar`：原先的 native 方法桩被替换成*尽力恢复出的方法体*，loader / native blob 资源条目被剥离。覆盖度是按方法计的 —— 动态路径只能恢复本次运行真正执行到的分支，静态路径只能恢复反编译结果能干净抬升的部分，因此未被观察到或未能抬升的方法可能仍是桩或只有部分方法体。请检查产物，难度较大的目标要预期人工补齐。模拟路径则负责挖出另外两条路看不到的"纯 C 秘密"（被内联的比较、`<clinit>` 字符串表），并给你一个可执行的 oracle。
 
@@ -126,18 +134,23 @@ scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
   / `ACONST_NULL`，让最终的字节码可以通过 ASM 的
   `COMPUTE_FRAMES` 校验。
 
-### 静态路径
+### 离线发现（无需 Ghidra）
 
-- **反汇编层的 native 表发现**（`py/binary_introspect/`，`capstone`）。
-  扫描 native blob 的可执行节，定位所有
-  `call qword ptr [reg + 0x6B8]`（`RegisterNatives` 在 JNI vtable 中的偏移）
-  调用点，往前回扫 PC 相对的 `lea`（指向 `.text`，即栈上构造的
-  `JNINativeMethod[]` 里的函数指针）以及最近的
-  `mov <nMethods-reg>, imm`（表长度）。
+- **JAR 与 JNI 发现**（`jar-parser`、`py/binary_introspect/`、
+  `manifest-merge`）。`parse-jar`、`inspect-binary`、`merge-manifest`
+  从 JAR 声明以及 JNI 规范定义的机制构建 `manifest.json`：直接导出的
+  `Java_*` 符号和 `RegisterNatives` 动态注册。这个阶段既不需要活 JVM，也不
+  需要 Ghidra。通用发现实现位于
+  [`py/binary_introspect`](py/binary_introspect)；更完整的 generic-first
+  覆盖正在
+  [PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4) 中完成。
+
+### 静态方法体恢复（可选 Ghidra 步骤）
+
 - **Ghidra 反编译器**（`ghidra/scripts/DumpFromManifest.java`，Ghidra
-  Headless）。读取 `manifest.json` 中的 `(class, method, fnAddr)`，对每个
-  地址跑一次 p-code 反编译，结果汇总到 `ghidra-dump.json`，每个方法对应
-  一段 pseudo-C。
+  Headless）。当 JAR 无法运行、而你又需要静态方法体时，才在后续使用它。
+  它读取 `manifest.json` 中的 `(class, method, fnAddr)`，对每个地址跑一次
+  p-code 反编译，结果汇总到 `ghidra-dump.json`，每个方法对应一段 pseudo-C。
 - **tree-sitter-c AST 解析**（`py/ast_matcher/`，`tree-sitter-c`）。把
   Ghidra 输出的 pseudo-C 解析成 AST，再由按 feature flag 控制的 driver
   识别 `env->FnName(args)` 形式的 JNI 调用（这是从 Ghidra 的
@@ -288,6 +301,21 @@ scripts/j2c recover \
 > 本文写作 `py/.venv/bin/python`（Windows 上为 `py\.venv\Scripts\python`）。如果
 > setup 走的是 `pip` 兜底，就换成它安装到的那个解释器。
 
+### 离线发现（无需运行、无需 Ghidra）
+
+当 JAR 无法运行时先从这里开始。下面的通用发现步骤会检查标准 JNI 导出符号和
+`RegisterNatives` 注册证据，再生成合并后的 manifest；它们**不需要 Ghidra**：
+
+```bash
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
+```
+
+通用发现实现位于 [`py/binary_introspect`](py/binary_introspect)；更完整的
+generic-first 覆盖正在
+[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4) 中完成。
+
 ### 兜底：模拟恢复（无需运行、无需 Ghidra）
 
 **当目标在你环境里跑不起来时用这条** —— 例如你只有 blob，或者你需要那些只藏在
@@ -321,16 +349,17 @@ py/.venv/bin/python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> 
 
 ## 进阶：静态恢复（离线，需要 Ghidra）
 
-静态路径是**可选**的，只有在目标跑不起来**且**你需要模拟兜底不会自动产出的
-逐方法覆盖时才用得上。它需要 **Ghidra 11.x**：
+这是上面无 Ghidra 发现之后的**可选后续步骤**。只有当 JAR 无法运行、而你又需要
+模拟兜底不会自动产出的静态方法体 pseudo-C 时才使用它；这一步需要
+**Ghidra 11.x**：
 
 ```bash
-# 1. 解析 jar + 内省二进制（不需要 --run-cmd）
+# 1. 通用 JNI 发现（不需要 --run-cmd，也不需要 Ghidra）
 scripts/j2c parse-jar      in.jar      -o classes.json
 scripts/j2c inspect-binary natives.bin -o binary.json
 scripts/j2c merge-manifest classes.json binary.json -o manifest.json
 
-# 2. 用 Ghidra Headless 跑 native blob
+# 2. 可选：通过 Ghidra Headless 抬升静态方法体
 <GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
     -import natives.bin \
     -scriptPath <repo>/ghidra/scripts \
