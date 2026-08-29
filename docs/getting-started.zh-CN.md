@@ -149,8 +149,8 @@ scripts/j2c merge-manifest classes.json binary.json -o manifest.json
 
 这三步既不需要真实运行，也不需要 Ghidra；它们产出的是方法发现 manifest，而不是
 恢复后的方法体。通用发现实现位于
-[`py/binary_introspect`](../py/binary_introspect)；更完整的 generic-first 覆盖正在
-[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4) 中完成。
+[`py/binary_introspect`](../py/binary_introspect)；详见
+[`docs/generic-recovery.md`](generic-recovery.md)。
 
 如果要获得可执行行为和纯 C 常量，再使用**模拟兜底**。它同样无需 JVM、无需 Ghidra：
 在 CPU 模拟器 + mock JNI 下直接执行 native 代码，因此能列出 native 方法、dump

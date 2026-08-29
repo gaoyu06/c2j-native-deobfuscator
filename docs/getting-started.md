@@ -168,9 +168,8 @@ scripts/j2c merge-manifest classes.json binary.json -o manifest.json
 These three steps do **not** require a live run or Ghidra. They produce the
 method-discovery manifest, not recovered method bodies. The generic discovery
 implementation lives in
-[`py/binary_introspect`](../py/binary_introspect); broader generic-first
-coverage is being completed on
-[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+[`py/binary_introspect`](../py/binary_introspect); see
+[`docs/generic-recovery.md`](generic-recovery.md).
 
 For executable behavior and C-only constants, use the **emulation fallback**.
 It also needs no JVM or Ghidra: it runs the native code under a CPU emulator
