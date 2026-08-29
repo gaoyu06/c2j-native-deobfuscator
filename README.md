@@ -532,6 +532,21 @@ py/.venv/bin/python -m ast_matcher.cli --list-flags
 
 ---
 
+## Experimental: `native-x86/`
+
+[`native-x86/`](native-x86/) is an **experimental skeleton**, separate
+from everything above: a small user-mode plugin ABI for generic x86
+process inspection (modules, symbols, call sites), with no JVM or JNI
+concepts in it. It is **not required for JAR recovery** — the dynamic,
+static and emulation paths ignore it entirely, and the directory can be
+deleted without affecting them.
+
+Today it ships a versioned C ABI, a host stub that loads a sample
+plugin, and documentation. It implements no instrumentation. See
+[`docs/native-x86-module.md`](docs/native-x86-module.md).
+
+---
+
 ## Repository layout
 
 ```
@@ -541,6 +556,8 @@ py/.venv/bin/python -m ast_matcher.cli --list-flags
 │   ├── class-rebuilder/        input.jar + recovered/ → output.jar
 │   └── common/                 shared schema types
 ├── native/                     C++ JVMTI agent (zig c++ build)
+├── native-x86/                 experimental user-mode x86 plugin ABI skeleton
+│                               (not used by any recovery path)
 ├── ghidra/scripts/             Ghidra headless scripts (Java)
 ├── py/                         Python modules (uv workspace)
 │   ├── jar_parser/             —
@@ -579,6 +596,10 @@ py/.venv/bin/python -m ast_matcher.cli --list-flags
   to register a new obfuscator variant
 - [static-reverse-approach.md](docs/static-reverse-approach.md) — design
   notes for the Ghidra-based path
+- [native-x86-module.md](docs/native-x86-module.md) — experimental
+  user-mode x86 module: boundary and non-goals
+  ([plugin ABI](docs/plugin-abi.md),
+  [privileged observer](docs/privileged-observer.md))
 - [`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md) —
   the agent playbook (load this into your coding agent)
 

@@ -13,6 +13,7 @@ uv.lock
 
 # Native
 native/build/
+native-x86/build/
 
 # OS
 .DS_Store
