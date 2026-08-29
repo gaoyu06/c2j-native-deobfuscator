@@ -72,6 +72,11 @@ object SessionScanner {
         )
 
         val traceEvents = readTrace(tracePath, notes)
+        // bindingGaps live on manifest.json (PR #4 writes them there); read the
+        // manifest as a tree too so they can be lifted onto the analysis strip.
+        // Quiet read — the typed manifest read above already reports any problem.
+        val manifestTree = tryReadTreeQuiet(manifestPath)
+        val binaryAnalysis = readBinaryAnalysis(binary, manifestTree)
 
         val next = NextCommandPlanner.plan(
             hasClasses = classesPath.exists(),
@@ -82,8 +87,61 @@ object SessionScanner {
             hasTrace = tracePath.exists(),
         )
 
-        return Session(dir, artifacts, methods, traceEvents, next, notes)
+        return Session(dir, artifacts, methods, traceEvents, next, notes, binaryAnalysis)
     }
+
+    // ---------------------------------------------------------------
+    // Binary analysis strip
+    // ---------------------------------------------------------------
+
+    /**
+     * Pull the compact analysis facts out of the reports. Reads defensively and
+     * from the source each field actually lives in:
+     *  - `input.format` / `input.arch` and `analysis.*` come from `binary.json`;
+     *  - `bindingGaps` come from `manifest.json` (PR #4 writes them on the
+     *    manifest), and only fall back to `binary.json` when a run put them
+     *    there instead.
+     * Any missing field reads as null / empty and is omitted from the strip, so
+     * this still works against older reports that only carry the counts.
+     */
+    private fun readBinaryAnalysis(binary: JsonNode?, manifest: JsonNode?): BinaryAnalysis? {
+        if (binary == null) return null
+        val input = binary["input"]
+        val analysis = binary["analysis"]
+        val bindingGaps = readBindingGaps(manifest?.get("bindingGaps"))
+            .ifEmpty { readBindingGaps(binary["bindingGaps"]) }
+        return BinaryAnalysis(
+            format = input?.get("format")?.textOrNull(),
+            arch = input?.get("arch")?.textOrNull(),
+            profile = analysis?.get("profile")?.textOrNull(),
+            methodDiscovery = analysis?.get("methodDiscovery")?.textOrNull(),
+            nativeClassCount = binary["nativeRegistry"]?.size() ?: 0,
+            stringCount = binary["stringPool"]?.get("strings")?.size() ?: 0,
+            bindingGaps = bindingGaps,
+        )
+    }
+
+    private fun readBindingGaps(node: JsonNode?): List<BindingGap> {
+        if (node == null || !node.isArray) return emptyList()
+        val out = mutableListOf<BindingGap>()
+        for (g in node) {
+            if (g.isTextual) {
+                out += BindingGap(g.asText(), "")
+                continue
+            }
+            val kind = g["kind"]?.textOrNull() ?: g["reason"]?.textOrNull() ?: "binding-gap"
+            val detail = g["detail"]?.textOrNull()
+                ?: buildString {
+                    g["method"]?.textOrNull()?.let { append(it) }
+                    g["desc"]?.textOrNull()?.let { append(it) }
+                }.ifBlank { g["note"]?.textOrNull() ?: "" }
+            out += BindingGap(kind, detail)
+        }
+        return out
+    }
+
+    private fun JsonNode.textOrNull(): String? =
+        if (isNull) null else asText().takeIf { it.isNotBlank() }
 
     // ---------------------------------------------------------------
     // Method table assembly
@@ -209,23 +267,8 @@ object SessionScanner {
             Files.newBufferedReader(path).use { r ->
                 var i = 0
                 r.lineSequence().forEach { line ->
-                    val l = line.trim()
-                    if (l.isEmpty()) return@forEach
-                    val node = try {
-                        JsonIO.mapper.readTree(l)
-                    } catch (e: Exception) {
-                        null
-                    }
-                    if (node == null) {
-                        out += TraceEvent(i, "?", "?", "malformed line")
-                    } else {
-                        out += TraceEvent(
-                            index = i,
-                            ev = node["ev"]?.asText() ?: "?",
-                            thread = node["thr"]?.asText() ?: "",
-                            summary = summarizeEvent(node),
-                        )
-                    }
+                    val event = TraceParser.parse(i, line) ?: return@forEach
+                    out += event
                     i++
                 }
             }
@@ -233,13 +276,6 @@ object SessionScanner {
             notes += "could not read ${path.name}: ${e.message}"
         }
         return out
-    }
-
-    private fun summarizeEvent(node: JsonNode): String = when (node["ev"]?.asText()) {
-        "enter", "exit" -> node["fn"]?.asText() ?: ""
-        "jni" -> node["call"]?.asText() ?: ""
-        "slot" -> "${node["kind"]?.asText()} slot ${node["slot"]?.asText()}"
-        else -> ""
     }
 
     // ---------------------------------------------------------------
@@ -262,6 +298,17 @@ object SessionScanner {
             JsonIO.mapper.readTree(Files.readString(path))
         } catch (e: Exception) {
             notes += "could not read ${path.name}: ${e.message}"
+            null
+        }
+    }
+
+    /** Read a JSON file as a tree without recording a note on failure — used
+     *  when a typed read of the same file already reports any problem. */
+    private fun tryReadTreeQuiet(path: Path): JsonNode? {
+        if (!path.exists()) return null
+        return try {
+            JsonIO.mapper.readTree(Files.readString(path))
+        } catch (e: Exception) {
             null
         }
     }

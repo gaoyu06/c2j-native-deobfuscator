@@ -11,9 +11,11 @@ import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JTable
+import javax.swing.JTextArea
 import javax.swing.SwingConstants
 import javax.swing.table.AbstractTableModel
 import javax.swing.table.DefaultTableCellRenderer
+import javax.swing.table.TableCellRenderer
 
 /** Method table backing model. */
 class MethodTableModel(private var rows: List<MethodRow> = emptyList()) : AbstractTableModel() {
@@ -66,10 +68,34 @@ class MethodCellRenderer(private val model: MethodTableModel) : DefaultTableCell
     }
 }
 
-/** Trace event table model. */
-class TraceTableModel(private var rows: List<TraceEvent> = emptyList()) : AbstractTableModel() {
+/** Trace event table model. Supports both a static set and live appends. */
+class TraceTableModel(rows: List<TraceEvent> = emptyList()) : AbstractTableModel() {
+    private val rows = rows.toMutableList()
     private val cols = listOf("#", "event", "thread", "detail")
-    fun setRows(newRows: List<TraceEvent>) { rows = newRows; fireTableDataChanged() }
+
+    fun setRows(newRows: List<TraceEvent>) {
+        rows.clear()
+        rows.addAll(newRows)
+        fireTableDataChanged()
+    }
+
+    fun clear() {
+        val n = rows.size
+        if (n == 0) return
+        rows.clear()
+        fireTableRowsDeleted(0, n - 1)
+    }
+
+    /** Append tailed events, keeping the incremental fire cheap. */
+    fun addRows(newRows: List<TraceEvent>) {
+        if (newRows.isEmpty()) return
+        val first = rows.size
+        rows.addAll(newRows)
+        fireTableRowsInserted(first, rows.size - 1)
+    }
+
+    fun kindAt(r: Int): TraceKind = rows[r].kind
+
     override fun getRowCount() = rows.size
     override fun getColumnCount() = cols.size
     override fun getColumnName(c: Int) = cols[c]
@@ -82,6 +108,62 @@ class TraceTableModel(private var rows: List<TraceEvent> = emptyList()) : Abstra
             3 -> e.summary
             else -> ""
         }
+    }
+}
+
+/**
+ * Tints a trace row by its kind: capability-unavailable and gap rows are
+ * called out so reduced coverage is obvious, binds get the accent, lifecycle
+ * markers stay dim. Ordinary events read as plain text.
+ */
+class TraceCellRenderer(private val model: TraceTableModel) : DefaultTableCellRenderer() {
+    override fun getTableCellRendererComponent(
+        table: JTable, value: Any?, isSelected: Boolean,
+        hasFocus: Boolean, row: Int, column: Int,
+    ): Component {
+        val c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
+        font = Theme.monoSmall
+        // Top-align and pad to match the wrapping detail renderer, so a row
+        // that grew taller keeps its short cells lined up with the first line
+        // of the wrapped detail instead of floating in the middle.
+        border = BorderFactory.createEmptyBorder(3, 8, 3, 8)
+        verticalAlignment = SwingConstants.TOP
+        toolTipText = value?.toString()
+        val kind = model.kindAt(table.convertRowIndexToModel(row))
+        foreground = when (column) {
+            0, 2 -> Theme.DIM
+            else -> Theme.inkFor(kind)
+        }
+        horizontalAlignment = SwingConstants.LEFT
+        return c
+    }
+}
+
+/**
+ * Renders the trace "detail" column as wrapped text. Capability and gap lines
+ * carry the whole story of what an attach could and could not observe; a
+ * single truncated line hides exactly the sentence a reviewer needs, so this
+ * wraps and the table grows the row (see ViewerFrame.fitTraceRowHeights).
+ */
+class TraceDetailRenderer(private val model: TraceTableModel) : JTextArea(), TableCellRenderer {
+    init {
+        lineWrap = true
+        wrapStyleWord = true
+        font = Theme.monoSmall
+        isOpaque = true
+        border = BorderFactory.createEmptyBorder(3, 8, 3, 8)
+    }
+
+    override fun getTableCellRendererComponent(
+        table: JTable, value: Any?, isSelected: Boolean,
+        hasFocus: Boolean, row: Int, column: Int,
+    ): Component {
+        text = value?.toString() ?: ""
+        toolTipText = text.ifBlank { null }
+        val kind = model.kindAt(table.convertRowIndexToModel(row))
+        background = if (isSelected) table.selectionBackground else Theme.BG
+        foreground = Theme.inkFor(kind)
+        return this
     }
 }
 

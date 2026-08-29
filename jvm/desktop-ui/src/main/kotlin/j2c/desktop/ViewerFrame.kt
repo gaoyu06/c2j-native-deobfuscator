@@ -4,11 +4,14 @@ import java.awt.BorderLayout
 import java.awt.CardLayout
 import java.awt.Dimension
 import java.nio.file.Path
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JButton
 import javax.swing.JComponent
+import javax.swing.JDialog
 import javax.swing.JFileChooser
 import javax.swing.JFrame
 import javax.swing.JLabel
@@ -22,6 +25,7 @@ import javax.swing.JTextField
 import javax.swing.ListSelectionModel
 import javax.swing.RowFilter
 import javax.swing.SwingConstants
+import javax.swing.SwingUtilities
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 import javax.swing.table.TableRowSorter
@@ -49,14 +53,24 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
     private val notesLabel = JLabel("")
 
     private val artifactsBox = JPanel()
+    private val analysisBox = JPanel()
+    private val analysisSection = Ui.sectionLabel("binary analysis")
     private val nextReason = JLabel(" ")
     private val nextCommand = JTextArea()
     private val emptyBanner = JLabel("", SwingConstants.CENTER)
 
     private val cards = CardLayout()
     private val centerCards = JPanel(cards)
+    private lateinit var sessionSplit: JSplitPane
+
+    private val traceStateLabel = JLabel(" ")
+    private val traceTailButton = JButton("Tail this trace")
+    private val traceStopButton = JButton("Stop")
+    private var traceTailer: TraceTailer? = null
 
     private var current: Session? = null
+
+    private val clock = DateTimeFormatter.ofPattern("HH:mm:ss")
 
     init {
         defaultCloseOperation = EXIT_ON_CLOSE
@@ -69,6 +83,7 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         add(buildStatusBar(), BorderLayout.SOUTH)
 
         showEmpty()
+        updateTraceState()
         pack()
         setLocationRelativeTo(null)
     }
@@ -99,11 +114,17 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
 
         val open = JButton("Open session…").apply { addActionListener { chooseDirectory() } }
         val reload = JButton("Reload").apply { addActionListener { reload() } }
+        val attach = JButton("Attach / Listen…").apply {
+            toolTipText = "Show the attach CLI, or tail a live trace"
+            addActionListener { openAttachDialog() }
+        }
 
         val right = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.X_AXIS)
             background = Theme.PANEL
             border = BorderFactory.createEmptyBorder(6, 8, 6, 8)
+            add(attach)
+            add(Box.createHorizontalStrut(6))
             add(open)
             add(Box.createHorizontalStrut(6))
             add(reload)
@@ -146,6 +167,7 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         split.resizeWeight = 0.5
         split.border = null
         split.background = Theme.BG
+        sessionSplit = split
         return split
     }
 
@@ -199,6 +221,9 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         // pull the split over on first layout). The columns above sum to a
         // little under this, so nothing is clipped.
         p.preferredSize = Dimension(548, 640)
+        // Allow the pane to collapse to zero so a session-less live tail can
+        // hand the whole window to the trace (see startTail).
+        p.minimumSize = Dimension(0, 0)
         return p
     }
 
@@ -223,20 +248,98 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
             background = Theme.BG
             gridColor = Theme.LINE
             tableHeader.reorderingAllowed = false
+            setDefaultRenderer(Any::class.java, TraceCellRenderer(traceModel))
+            // The detail column is the last one and soaks up all spare width so
+            // long capability / gap lines get the most room — critical when a
+            // live tail runs full width (no session) and a gap row explains why
+            // coverage is thin.
+            autoResizeMode = JTable.AUTO_RESIZE_LAST_COLUMN
         }
-        traceTable.columnModel.getColumn(0).preferredWidth = 50
-        traceTable.columnModel.getColumn(1).preferredWidth = 70
-        traceTable.columnModel.getColumn(2).preferredWidth = 90
+        // Hard-pin the three fixed columns so the flexible detail column keeps
+        // every spare pixel instead of the width bleeding into #/event/thread.
+        pinColumn(0, 34, 44, 60)
+        // Wide enough for the longest event label ("agent-attached").
+        pinColumn(1, 104, 128, 150)
+        pinColumn(2, 48, 58, 74)
         traceTable.columnModel.getColumn(3).preferredWidth = 360
+        // Wrap the detail so a long gap line stays fully readable rather than
+        // being clipped with an ellipsis.
+        traceTable.columnModel.getColumn(3).cellRenderer = TraceDetailRenderer(traceModel)
+        traceTable.addComponentListener(object : java.awt.event.ComponentAdapter() {
+            override fun componentResized(e: java.awt.event.ComponentEvent) = fitTraceRowHeights()
+        })
         Ui.leftAlignHeader(traceTable)
 
         tabs.font = Theme.sansSmall
         tabs.addTab("Detail", Ui.scroll(detailArea))
         tabs.addTab("Pipeline", buildPipelinePanel())
         tabs.addTab("Artifact JSON", Ui.scroll(jsonArea))
-        tabs.addTab("Trace", Ui.scroll(traceTable))
+        tabs.addTab("Trace", buildTracePanel())
         tabs.preferredSize = Dimension(556, 640)
         return tabs
+    }
+
+    private fun pinColumn(index: Int, min: Int, pref: Int, max: Int) {
+        traceTable.columnModel.getColumn(index).apply {
+            minWidth = min
+            preferredWidth = pref
+            maxWidth = max
+        }
+    }
+
+    /**
+     * Grow each trace row to fit its wrapped detail cell at the current column
+     * width. Called after the rows change and whenever the table is resized
+     * (the divider collapse for a session-less live tail resizes it), so a
+     * multi-line gap explanation is shown in full instead of being clipped.
+     */
+    private fun fitTraceRowHeights() {
+        val detailCol = 3
+        if (traceTable.columnCount <= detailCol) return
+        val width = traceTable.columnModel.getColumn(detailCol).width
+        if (width <= 1) return
+        val base = traceTable.rowHeight.coerceAtLeast(22)
+        for (r in 0 until traceTable.rowCount) {
+            val renderer = traceTable.getCellRenderer(r, detailCol)
+            val comp = traceTable.prepareRenderer(renderer, r, detailCol)
+            comp.setSize(width, Short.MAX_VALUE.toInt())
+            val h = comp.preferredSize.height.coerceAtLeast(base)
+            if (traceTable.getRowHeight(r) != h) traceTable.setRowHeight(r, h)
+        }
+    }
+
+    private fun buildTracePanel(): JComponent {
+        traceStateLabel.font = Theme.monoSmall
+        traceStateLabel.foreground = Theme.DIM
+        traceStateLabel.border = BorderFactory.createEmptyBorder(0, 8, 0, 8)
+
+        traceTailButton.apply {
+            toolTipText = "Follow this session's trace.jsonl as it grows"
+            addActionListener { current?.let { startTail(it.dir.resolve("trace.jsonl")) } }
+        }
+        traceStopButton.apply {
+            isEnabled = false
+            addActionListener { stopTail() }
+        }
+
+        val head = JPanel(BorderLayout()).apply {
+            background = Theme.PANEL
+            border = BorderFactory.createMatteBorder(0, 0, 1, 0, Theme.LINE)
+            add(traceStateLabel, BorderLayout.CENTER)
+            add(JPanel().apply {
+                layout = BoxLayout(this, BoxLayout.X_AXIS)
+                background = Theme.PANEL
+                border = BorderFactory.createEmptyBorder(4, 4, 4, 6)
+                add(traceTailButton)
+                add(Box.createHorizontalStrut(6))
+                add(traceStopButton)
+            }, BorderLayout.EAST)
+        }
+
+        val p = JPanel(BorderLayout()).apply { background = Theme.BG }
+        p.add(head, BorderLayout.NORTH)
+        p.add(Ui.scroll(traceTable), BorderLayout.CENTER)
+        return p
     }
 
     private fun buildPipelinePanel(): JComponent {
@@ -244,6 +347,12 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         artifactsBox.background = Theme.BG
         artifactsBox.alignmentX = JComponent.LEFT_ALIGNMENT
         artifactsBox.border = BorderFactory.createEmptyBorder(4, 10, 8, 10)
+
+        analysisBox.layout = BoxLayout(analysisBox, BoxLayout.Y_AXIS)
+        analysisBox.background = Theme.BG
+        analysisBox.alignmentX = JComponent.LEFT_ALIGNMENT
+        analysisBox.border = BorderFactory.createEmptyBorder(4, 10, 8, 10)
+        analysisSection.alignmentX = JComponent.LEFT_ALIGNMENT
 
         nextReason.font = Theme.sans
         nextReason.foreground = Theme.TEXT
@@ -280,6 +389,8 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         stack.border = BorderFactory.createEmptyBorder(6, 0, 6, 0)
         stack.add(leftAligned(Ui.sectionLabel("artifacts")))
         stack.add(artifactsBox)
+        stack.add(leftAligned(analysisSection))
+        stack.add(analysisBox)
         stack.add(leftAligned(Ui.sectionLabel("suggested next step")))
         stack.add(nextReason)
         stack.add(cmdWrap)
@@ -339,11 +450,15 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
     }
 
     fun openSession(session: Session) {
+        // Opening a different session ends any live tail from the previous one.
+        stopTail()
         current = session
         pathLabel.text = session.dir.toString()
 
         methodModel.setRows(session.methods)
         traceModel.setRows(session.traceEvents)
+        SwingUtilities.invokeLater { fitTraceRowHeights() }
+        updateTraceState()
         renderArtifacts(session)
 
         val c = session.counts
@@ -352,10 +467,6 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
             "missing ${c[RecoveryStatus.MISSING] ?: 0}   ·   " +
             "${session.methods.size} methods   ·   ${session.traceEvents.size} trace events"
         notesLabel.text = if (session.notes.isEmpty()) "" else "${session.notes.size} read problem(s)"
-
-        // Trace tab only makes sense with data; keep it but hint when empty.
-        val traceIdx = tabs.indexOfTab("Trace")
-        if (traceIdx >= 0) tabs.setEnabledAt(traceIdx, session.traceEvents.isNotEmpty())
 
         if (!session.hasAnyArtifact) {
             detailArea.text = "This folder has no pipeline artifacts.\n\n" +
@@ -369,6 +480,10 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         }
         jsonArea.text = ""
         cards.show(centerCards, "session")
+        // A real session gets the balanced split back (a prior session-less
+        // live tail may have collapsed the methods pane to zero).
+        sessionSplit.resizeWeight = 0.5
+        SwingUtilities.invokeLater { sessionSplit.setDividerLocation(0.5) }
 
         if (session.methods.isNotEmpty()) {
             methodTable.rowSorter = methodSorter
@@ -379,6 +494,91 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         cards.show(centerCards, "empty")
         statusLabel.text = " "
         notesLabel.text = ""
+    }
+
+    // ---------------------------------------------------------------
+    // Attach / live tail
+    // ---------------------------------------------------------------
+
+    private fun openAttachDialog() {
+        val defaultOutput = current?.dir?.resolve("trace.jsonl")?.toString() ?: "trace.jsonl"
+        val dialog = JDialog(this, "Attach / Listen", true)
+        val panel = AttachPanel(
+            defaultOutput = defaultOutput,
+            onStartTail = { path -> startTail(path) },
+            onClose = { dialog.dispose() },
+        )
+        dialog.contentPane = panel
+        dialog.pack()
+        dialog.setLocationRelativeTo(this)
+        dialog.isVisible = true
+    }
+
+    /** Begin following a trace file live. Works with or without an open
+     *  session — the events land in the Trace tab as the target writes them. */
+    fun startTail(path: Path) {
+        stopTail()
+        traceModel.clear()
+        cards.show(centerCards, "session")
+        // With no session open there are no methods to list, so give the whole
+        // window to the trace. This keeps long capability / gap detail readable
+        // instead of squeezing it beside an empty methods table.
+        if (current == null) {
+            methodModel.setRows(emptyList())
+            sessionSplit.resizeWeight = 0.0
+            SwingUtilities.invokeLater { sessionSplit.setDividerLocation(0) }
+        }
+        selectTab("Trace")
+        val tailer = TraceTailer(
+            path = path,
+            onEvents = { events ->
+                traceModel.addRows(events)
+                fitTraceRowHeights()
+                val last = traceTable.rowCount - 1
+                if (last >= 0) traceTable.scrollRectToVisible(traceTable.getCellRect(last, 0, true))
+            },
+            onStatus = { status -> renderTailStatus(path, status) },
+        )
+        traceTailer = tailer
+        traceTailButton.isEnabled = false
+        traceStopButton.isEnabled = true
+        tailer.start()
+    }
+
+    fun stopTail() {
+        traceTailer?.stop()
+        val wasTailing = traceTailer != null
+        traceTailer = null
+        traceStopButton.isEnabled = false
+        if (wasTailing) updateTraceState()
+    }
+
+    private fun renderTailStatus(path: Path, status: TraceTailer.TailStatus) {
+        val updated = if (status.lastUpdateMillis > 0)
+            "  ·  updated ${LocalTime.now().format(clock)}" else ""
+        traceStateLabel.foreground = if (status.fileExists) Theme.OK else Theme.WARN
+        traceStateLabel.text = if (status.fileExists) {
+            "tailing $path  ·  ${status.totalEvents} events$updated"
+        } else {
+            "waiting for $path — not created yet (the agent writes it once attached)"
+        }
+    }
+
+    /** Refresh the static (not-tailing) Trace tab header for the open session. */
+    private fun updateTraceState() {
+        val session = current
+        val hasTrace = session != null && session.dir.resolve("trace.jsonl").let {
+            it.toFile().exists()
+        }
+        traceTailButton.isEnabled = hasTrace && traceTailer == null
+        traceStateLabel.foreground = Theme.DIM
+        traceStateLabel.text = when {
+            session == null -> "no session — use Attach / Listen to tail a trace"
+            session.traceEvents.isNotEmpty() ->
+                "static: ${session.traceEvents.size} events${if (hasTrace) "  ·  Tail to follow live" else ""}"
+            hasTrace -> "trace.jsonl present but empty — Tail to follow live"
+            else -> "no trace in this session — use Attach / Listen to capture one"
+        }
     }
 
     /** Select the first method whose name matches (test / screenshot hook). */
@@ -438,6 +638,7 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         for (a in session.artifacts) {
             artifactsBox.add(artifactRow(a))
         }
+        renderAnalysis(session.binaryAnalysis)
         val next = session.nextCommand
         if (next != null) {
             nextReason.text = next.reason
@@ -449,6 +650,97 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         artifactsBox.revalidate()
         artifactsBox.repaint()
     }
+
+    /**
+     * Fill the compact analysis strip from binary.json. Hidden entirely when the
+     * session has no binary.json; otherwise it shows the format / arch, the
+     * profile + method-discovery strategy (when present), the registry + string
+     * counts, and any binding gaps (count + a short list) so a run that left
+     * native methods unbound reads at a glance instead of only "N classes".
+     */
+    private fun renderAnalysis(analysis: BinaryAnalysis?) {
+        analysisBox.removeAll()
+        val visible = analysis != null
+        analysisSection.isVisible = visible
+        analysisBox.isVisible = visible
+        if (analysis == null) {
+            analysisBox.revalidate(); analysisBox.repaint()
+            return
+        }
+
+        analysis.format?.let { analysisBox.add(analysisRow("format", it, Theme.TEXT)) }
+        analysis.arch?.let { analysisBox.add(analysisRow("arch", it, Theme.TEXT)) }
+        analysis.profile?.let { analysisBox.add(analysisRow("profile", it, Theme.TEXT)) }
+        analysis.methodDiscovery?.let { analysisBox.add(analysisRow("discovery", it, Theme.TEXT)) }
+
+        val registry = "${analysis.nativeClassCount} native " +
+            "class${if (analysis.nativeClassCount == 1) "" else "es"}  ·  " +
+            "${analysis.stringCount} string${if (analysis.stringCount == 1) "" else "s"}"
+        analysisBox.add(analysisRow("registry", registry, Theme.DIM))
+
+        val gapCount = analysis.bindingGaps.size
+        val gapText = if (gapCount == 0) "none" else
+            "$gapCount binding gap${if (gapCount == 1) "" else "s"}"
+        analysisBox.add(analysisRow("gaps", gapText, if (gapCount == 0) Theme.OK else Theme.WARN))
+        // A short list of the gaps themselves — the reviewer's cue for what
+        // introspection could not place. Cap it so the strip stays compact.
+        for (gap in analysis.bindingGaps.take(3)) {
+            analysisBox.add(analysisGapRow(gap.line))
+        }
+        if (gapCount > 3) {
+            analysisBox.add(analysisGapRow("… and ${gapCount - 3} more"))
+        }
+
+        analysisBox.revalidate()
+        analysisBox.repaint()
+    }
+
+    private fun analysisRow(label: String, value: String, valueColor: java.awt.Color): JComponent {
+        val name = JLabel(label).apply {
+            foreground = Theme.DIM
+            font = Theme.monoSmall
+            preferredSize = Dimension(88, 20)
+            maximumSize = Dimension(88, 20)
+        }
+        val v = JLabel(value).apply {
+            foreground = valueColor
+            font = Theme.mono
+        }
+        return JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.X_AXIS)
+            background = Theme.BG
+            alignmentX = LEFT_ALIGNMENT
+            border = BorderFactory.createEmptyBorder(1, 0, 1, 0)
+            maximumSize = Dimension(Int.MAX_VALUE, 22)
+            add(name)
+            add(v)
+            add(Box.createHorizontalGlue())
+        }
+    }
+
+    private fun analysisGapRow(text: String): JComponent {
+        // Wrap the gap line (kind + the method it could not place) inside a
+        // BorderLayout region so it fills the width and wraps rather than being
+        // clipped. A right inset keeps it clear of the pane edge; a BoxLayout
+        // row would let the label reflow to its natural width and run off.
+        val v = JLabel("<html>${escapeHtml(text)}</html>").apply {
+            foreground = Theme.DIM
+            font = Theme.monoSmall
+            toolTipText = text
+        }
+        return object : JPanel(BorderLayout()) {
+            override fun getMaximumSize(): Dimension =
+                Dimension(Int.MAX_VALUE, preferredSize.height)
+        }.apply {
+            background = Theme.BG
+            alignmentX = LEFT_ALIGNMENT
+            border = BorderFactory.createEmptyBorder(0, 96, 2, 56)
+            add(v, BorderLayout.CENTER)
+        }
+    }
+
+    private fun escapeHtml(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     private fun artifactRow(a: ArtifactState): JComponent {
         val glyph = JLabel(if (a.present) "\u25CF" else "\u25CB")
