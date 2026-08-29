@@ -91,6 +91,53 @@ else
     skip "no arm cross cc ($ARM_CC) or zig — keeping committed libjni_registrar_arm.so"
 fi
 
+echo "[ELF] libjni_dispatch_shared.so (shared-dispatch registrar — one call site, two tables)"
+# A second registration FAMILY (not just another architecture): one shared
+# initClass()-style RegisterNatives call site reached by two branches, each
+# building its own stack JNINativeMethod[] with its own nMethods (2 and 3).
+# Hand-written x86-64 assembly on purpose — a stack-built shared dispatcher's
+# instruction shape is not stable across C compilers (PIC routes function
+# pointers through the GOT, stores get vectorised, and one if/else branch lands
+# after the merged call, outside the back-scan window). The committed .so lets
+# the suite run with no assembler step; the test cross-checks recovered fnAddrs
+# against export addresses, so a rebuild that shifts addresses still holds.
+if command -v "$CC" >/dev/null 2>&1; then
+    "$CC" -shared -nostdlib -o libjni_dispatch_shared.so jni_dispatch_shared.s
+    log "built libjni_dispatch_shared.so ($CC)"
+else
+    skip "no C compiler ($CC) — keeping committed libjni_dispatch_shared.so"
+fi
+
+echo "[ELF/i386] libjni_registrar_i386.so (i386 SysV cdecl static table + Java_* export)"
+# The 32-bit x86 sibling of the x86-64/AArch64/ARM .so fixtures: a genuine
+# (ELF, EM_386) image, NOT a renamed 64-bit .so. cdecl passes RegisterNatives'
+# arguments on the stack and PIC forms the table address through the GOT base
+# register; the i386-sysv backend folds both back. Prefer a dedicated i686 cross
+# gcc, then zig, then a real 32-bit target from the host clang/gcc. If none can
+# emit i386, the committed binary is kept and no 64-bit .so is renamed. The test
+# cross-checks function pointers against the export addresses rather than
+# hard-coding VAs, so a rebuild that shifts addresses does not break it.
+I386_CC="${I386_CC:-i686-linux-gnu-gcc}"
+if command -v "$I386_CC" >/dev/null 2>&1; then
+    "$I386_CC" -O2 -shared -fPIC -nostdlib \
+        -o libjni_registrar_i386.so jni_registrar_i386.c
+    log "built libjni_registrar_i386.so ($I386_CC)"
+elif command -v zig >/dev/null 2>&1; then
+    zig cc -target x86-linux-gnu -O2 -shared -fPIC -nostdlib \
+        -o libjni_registrar_i386.so jni_registrar_i386.c
+    log "built libjni_registrar_i386.so (zig cc)"
+elif command -v clang >/dev/null 2>&1; then
+    clang --target=i386-linux-gnu -O2 -shared -fPIC -nostdlib \
+        -o libjni_registrar_i386.so jni_registrar_i386.c
+    log "built libjni_registrar_i386.so (clang --target=i386-linux-gnu)"
+elif command -v gcc >/dev/null 2>&1 && gcc -m32 -E - </dev/null >/dev/null 2>&1; then
+    gcc -m32 -O2 -shared -fPIC -nostdlib \
+        -o libjni_registrar_i386.so jni_registrar_i386.c
+    log "built libjni_registrar_i386.so (gcc -m32)"
+else
+    skip "no i386 toolchain (i686-linux-gnu-gcc / zig / clang / gcc -m32) — keeping committed libjni_registrar_i386.so"
+fi
+
 echo "[ELF] libjni_exports_only.so (Java_* exports, no table)"
 if command -v "$CC" >/dev/null 2>&1; then
     "$CC" -O2 -shared -fPIC -nostdlib -o libjni_exports_only.so jni_exports_only.c
