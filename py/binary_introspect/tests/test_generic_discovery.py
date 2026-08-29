@@ -41,6 +41,31 @@ def _jni_exports(report) -> list[dict]:
     ]
 
 
+def _stack_tables(report) -> list[dict]:
+    return [
+        entry
+        for entry in report.native_registry
+        if entry.get("source") == "register-natives-stack"
+    ]
+
+
+def _capstone_disassembles_x86_32() -> bool:
+    """True when the host capstone can decode 32-bit x86. This is the base x86
+    backend that every capstone build carries, so it is effectively always
+    available; the guard mirrors the AArch64/ARM ones for honesty and keeps the
+    i386 assertions from masking a genuinely broken capstone as a table loss."""
+    try:
+        from capstone import CS_ARCH_X86, CS_MODE_32, Cs
+    except ImportError:
+        return False
+    try:
+        cs = Cs(CS_ARCH_X86, CS_MODE_32)
+    except Exception:
+        return False
+    # push 0x2 ; ret  — a smoke check that the 32-bit x86 decoder works.
+    return any(cs.disasm(bytes.fromhex("6a02c3"), 0))
+
+
 def _export_addr(report, name: str) -> str | None:
     """Address of an exported symbol, tolerating a Mach-O leading underscore."""
     for export in report.exported_functions:
@@ -752,3 +777,248 @@ def test_specific_profile_wins_when_its_detector_matches() -> None:
     )
 
     assert detect_profile(binary) is get_profile("j2cc")
+
+
+def test_introspect_shared_dispatch_elf_recovers_two_tables_from_one_call_site() -> None:
+    """Second registration FAMILY (not just another architecture): a shared
+    initClass()-style dispatcher that reuses ONE RegisterNatives call site for
+    two classes, each with its own stack-built table and its own nMethods.
+
+    The generic profile (``harvest_strategy="auto"``) must recover BOTH branches
+    from the single call site — two independently sized nMethods groups (2 and
+    3) — instead of collapsing them into a single silent bind. Proven on a
+    committed x86-64 ELF whose branch layout puts both tables before the shared
+    call. This exercises the ``auto`` → shared-dispatch harvest on a real
+    binary, the gap the j2cc profile (Windows/PE only) previously left with no
+    fixture.
+    """
+    report = introspect(FIXTURES / "libjni_dispatch_shared.so")
+
+    assert report.fmt == "ELF"
+    assert report.arch == "x86_64"
+    # A genuinely generic recovery: no obfuscator-variant detector fires, so the
+    # shared-dispatch split is driven by the spec-based auto harvest, not a
+    # profile that hard-codes the shape.
+    assert report.analysis == {"profile": "generic", "methodDiscovery": "jni-spec"}
+
+    tables = _stack_tables(report)
+    assert len(tables) == 2, (
+        "shared dispatch must yield two tables, not one collapsed bind"
+    )
+
+    # Both branches were harvested from the SAME RegisterNatives call site.
+    call_sites = {t["registerNativesCallSite"] for t in tables}
+    assert len(call_sites) == 1
+
+    # Stack-built tables expose ordered function pointers and a per-branch
+    # nMethods but no decoded names — and crucially NO fabricated methods.
+    assert all("methods" not in t for t in tables)
+    assert all(t["abi"] == "amd64-sysv" for t in tables)
+
+    by_count = {t["nMethods"]: t["fnAddrs"] for t in tables}
+    assert set(by_count) == {2, 3}
+
+    # Each recovered fnAddr cross-checks against its export address; a collapsed
+    # or misordered harvest would desync these.
+    assert by_count[2] == [
+        _export_addr(report, "fixture_alpha"),
+        _export_addr(report, "fixture_beta"),
+    ]
+    assert by_count[3] == [
+        _export_addr(report, "fixture_gamma"),
+        _export_addr(report, "fixture_delta"),
+        _export_addr(report, "fixture_epsilon"),
+    ]
+
+    # The dispatcher's own Java_* exports (initClass/bootstrap) are recorded via
+    # the export family; the per-method natives register through the tables.
+    exported = {e["fnSymbol"] for e in _jni_exports(report)}
+    assert exported == {
+        "Java_com_example_Boot_initClass",
+        "Java_com_example_Boot_bootstrap",
+    }
+
+
+def test_shared_dispatch_tables_bind_by_count_and_gap_when_ambiguous() -> None:
+    """End-to-end merge of the shared-dispatch tables against a classes.json.
+
+    When each branch's method count uniquely identifies a class, the two tables
+    bind by count with no gaps. When counts are ambiguous (several classes share
+    a branch's method count), the tables are left UNBOUND and a ``bindingGaps``
+    entry is emitted for each — never a silent, arbitrary bind.
+    """
+    import copy
+
+    from manifest_merge.core import merge
+
+    report = introspect(FIXTURES / "libjni_dispatch_shared.so")
+    # merge() mutates the native-registry site dicts (stamping ``boundTo``), so
+    # give each merge call its own deep copy to keep the two scenarios isolated.
+    binary = report.to_json_obj()
+
+    def _classes(specs: list[tuple[str, int]]) -> dict:
+        return {
+            "input": {"jarPath": "input.jar"},
+            "classes": [
+                {
+                    "name": name,
+                    "methods": [
+                        {
+                            "name": f"m{index}",
+                            "desc": "()V",
+                            "access": 0x0100,
+                            "isObfuscatedNative": True,
+                        }
+                        for index in range(count)
+                    ],
+                }
+                for name, count in specs
+            ],
+        }
+
+    # Unambiguous: exactly one 2-method class and one 3-method class. Each shared
+    # branch binds to its unique count match, and no gap remains.
+    unique = merge(
+        _classes([("com/example/ClassA", 2), ("com/example/ClassB", 3)]),
+        copy.deepcopy(binary),
+    )
+    bound = {
+        cls["name"]: [m.get("fnAddr") for m in cls["methods"]]
+        for cls in unique["classes"]
+    }
+    assert all(bound["com/example/ClassA"]), "2-method class must bind by count"
+    assert all(bound["com/example/ClassB"]), "3-method class must bind by count"
+    assert bound["com/example/ClassA"] == [
+        _export_addr(report, "fixture_alpha"),
+        _export_addr(report, "fixture_beta"),
+    ]
+    assert bound["com/example/ClassB"] == [
+        _export_addr(report, "fixture_gamma"),
+        _export_addr(report, "fixture_delta"),
+        _export_addr(report, "fixture_epsilon"),
+    ]
+    assert unique["bindingGaps"] == []
+
+    # Ambiguous: two classes share each branch's count, so neither branch can be
+    # attributed by count alone. Both stay unbound and both raise a gap.
+    ambiguous = merge(
+        _classes(
+            [
+                ("com/example/First", 2),
+                ("com/example/Second", 2),
+                ("com/example/Third", 3),
+                ("com/example/Fourth", 3),
+            ]
+        ),
+        copy.deepcopy(binary),
+    )
+    assert all(
+        "fnAddr" not in method
+        for cls in ambiguous["classes"]
+        for method in cls["methods"]
+    )
+    gaps = ambiguous["bindingGaps"]
+    assert [g["kind"] for g in gaps] == [
+        "ambiguous-count-only-table",
+        "ambiguous-count-only-table",
+    ]
+    assert {g["nMethods"] for g in gaps} == {2, 3}
+    assert {tuple(g["candidateClasses"]) for g in gaps} == {
+        ("com/example/First", "com/example/Second"),
+        ("com/example/Third", "com/example/Fourth"),
+    }
+    # Every gap points back at the shared RegisterNatives call site.
+    assert all(g["source"] == "register-natives-stack" for g in gaps)
+    assert {g["registerNativesCallSite"] for g in gaps} == {
+        table["registerNativesCallSite"] for table in _stack_tables(report)
+    }
+
+
+def test_introspect_real_i386_elf_recovers_static_table_and_export() -> None:
+    """i386 / System V cdecl proven end-to-end on a committed 32-bit ELF ``.so``.
+
+    A genuine ``(ELF, EM_386)`` image — not a renamed 64-bit ``.so``. cdecl
+    passes RegisterNatives' arguments on the stack (``push $nMethods`` /
+    ``push methods``), and position-independent i386 forms the table address
+    through the GOT-base register (``call``/``pop``/``add`` PC thunk, then
+    ``lea disp(%ebx), %edx``). The i386-sysv backend detects the machine, reads
+    the pushed count, and folds the GOT-relative ``lea`` back to the table VA so
+    the static table decodes with names/descriptors whose function pointers
+    cross-check the export addresses. The ``Java_*`` export is recovered on
+    every host from the LIEF symbol table; when capstone somehow cannot decode
+    32-bit x86, no table is claimed and no methods are fabricated.
+    """
+    path = FIXTURES / "libjni_registrar_i386.so"
+
+    binary = lief.parse(str(path))
+    assert binary.format == lief.Binary.FORMATS.ELF
+    assert int(binary.header.machine_type) == 0x03  # EM_386
+
+    from binary_introspect.arch import detect_abi
+
+    abi = detect_abi(binary)
+    assert abi is not None and abi.name == "i386-sysv"
+
+    report = introspect(path)
+    assert report.fmt == "ELF"
+    assert report.arch == "x86"
+    assert report.analysis == {"profile": "generic", "methodDiscovery": "jni-spec"}
+
+    # The specification-defined Java_* export is recovered on every host — it
+    # comes from the LIEF symbol table, not disassembly.
+    exports = _jni_exports(report)
+    assert [e["fnSymbol"] for e in exports] == ["Java_com_example_Sample_ping"]
+    assert exports[0]["fnAddr"] == _export_addr(
+        report, "Java_com_example_Sample_ping"
+    )
+
+    tables = _static_tables(report)
+    if not _capstone_disassembles_x86_32():
+        # Honest fallback: no 32-bit x86 disassembler means no table is claimed,
+        # and crucially no fabricated methods. The export above still holds.
+        assert tables == []
+        return
+
+    assert len(tables) == 1, "i386 table must not silently yield nothing"
+    table = tables[0]
+    assert table["abi"] == "i386-sysv"
+    assert table["nMethods"] == 2
+    assert [(m["name"], m["desc"]) for m in table["methods"]] == [
+        ("alpha", "()V"),
+        ("beta", "(I)I"),
+    ]
+    # Function pointers resolve through R_386_32 relocations on the table's fnPtr
+    # slots and cross-check against the exported addresses; a broken GOT-base
+    # fold or relocation read would desync these.
+    assert table["methods"][0]["fnAddr"] == _export_addr(report, "fixture_alpha")
+    assert table["methods"][1]["fnAddr"] == _export_addr(report, "fixture_beta")
+
+
+def test_i386_got_relative_lea_table_address_is_folded() -> None:
+    """Position-independent i386 forms an in-image constant's address through the
+    GOT base: a ``call``/``pop``/``add`` PC thunk materialises
+    ``_GLOBAL_OFFSET_TABLE_`` in a register, then ``lea disp(%ebx), %edx``
+    reaches the table. The i386-sysv backend must fold that back to the absolute
+    VA — a regression here silently loses every PIC i386 table."""
+    from binary_introspect.arch.i386_sysv import I386_SYSV
+
+    cs = I386_SYSV.disassembler()
+    if cs is None or not _capstone_disassembles_x86_32():
+        pytest.skip("host capstone cannot decode 32-bit x86")
+
+    # call .Lnext ; pop %ebx ; add $0x2fbb, %ebx ; lea -0x88(%ebx), %edx
+    # This is the exact clang sequence emitted for libjni_registrar_i386.so.
+    # ebx = 0x1039 + 0x2fbb = 0x3ff4 (the GOT base); table = 0x3ff4 - 0x88.
+    code = bytes.fromhex(
+        "e800000000"      # 0x1034: call 0x1039
+        "5b"              # 0x1039: pop  %ebx
+        "81c3bb2f0000"    # 0x103a: add  $0x2fbb, %ebx
+        "8d9378ffffff"    # 0x1040: lea  -0x88(%ebx), %edx
+    )
+    I386_SYSV.begin_scan(None)
+    folded = None
+    for ins in cs.disasm(code, 0x1034):
+        result = I386_SYSV.decode_pc_relative_lea(ins)
+        if result is not None:
+            folded = result
+    assert folded == 0x3F6C
