@@ -1517,4 +1517,8 @@ nx86_status nx86_observe_run(nx86_event_bus *bus,
     return NX86_OK;
 }
 
+#else /* !__linux__ : this translation unit is intentionally empty */
+
+typedef int nx86_observe_linux_unused;
+
 #endif /* __linux__ */

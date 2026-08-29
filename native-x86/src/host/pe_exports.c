@@ -33,6 +33,13 @@ static int range_ok(size_t offset, size_t length, size_t size)
     return offset <= size && length <= size - offset;
 }
 
+static int array_range_ok(size_t offset, uint32_t count, size_t element_size,
+                          size_t size)
+{
+    return element_size != 0u && offset <= size &&
+           (size_t)count <= (size - offset) / element_size;
+}
+
 static uint16_t read_u16(const unsigned char *p)
 {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
@@ -98,7 +105,8 @@ static int rva_to_offset(const pe_view *view, uint32_t rva, size_t *out)
         if (delta >= raw_size) {
             return -1;
         }
-        if ((size_t)raw_offset > SIZE_MAX - (size_t)delta) {
+        if ((size_t)raw_offset > view->size ||
+            (size_t)delta > view->size - (size_t)raw_offset) {
             return -1;
         }
         offset = (size_t)raw_offset + (size_t)delta;
@@ -233,15 +241,12 @@ int nx86_pe_visit_exports(const unsigned char *image, size_t image_size,
         return 0;
     }
     if (function_count == 0u ||
-        (size_t)function_count > SIZE_MAX / 4u ||
-        (size_t)name_count > SIZE_MAX / 4u ||
-        (size_t)name_count > SIZE_MAX / 2u ||
         rva_to_offset(&view, functions_rva, &functions_offset) != 0 ||
         rva_to_offset(&view, names_rva, &names_offset) != 0 ||
         rva_to_offset(&view, ordinals_rva, &ordinals_offset) != 0 ||
-        !range_ok(functions_offset, (size_t)function_count * 4u, image_size) ||
-        !range_ok(names_offset, (size_t)name_count * 4u, image_size) ||
-        !range_ok(ordinals_offset, (size_t)name_count * 2u, image_size)) {
+        !array_range_ok(functions_offset, function_count, 4u, image_size) ||
+        !array_range_ok(names_offset, name_count, 4u, image_size) ||
+        !array_range_ok(ordinals_offset, name_count, 2u, image_size)) {
         return -1;
     }
 
