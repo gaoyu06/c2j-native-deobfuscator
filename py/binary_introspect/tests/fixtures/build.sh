@@ -173,6 +173,28 @@ else
     skip "no $MINGW — keeping committed jni_registrar.dll"
 fi
 
+echo "[PE] jni_dispatch_j2cc.dll (named j2cc detector + shared_dispatch harvest)"
+# The Windows sibling of libjni_dispatch_shared.so: a genuine PE x86-64 image
+# (DOS/PE magic, machine 0x8664 — never a renamed ELF) whose two Java_* exports
+# (initClass + bootstrap, <=4) and "Cannot invoke " literal make the NAMED j2cc
+# detector fire, after which the shared_dispatch harvest recovers both stack
+# tables (nMethods 2 and 3) from the one Microsoft x64 RegisterNatives call site.
+# Hand-written assembly on purpose (same reasoning as the ELF sibling: a C
+# compiler will not keep both branches before the merged call). Exports are
+# declared through a .drectve section so exactly the intended symbols leave the
+# image. Same image-base-pinned flags as jni_registrar.dll above.
+if command -v "$MINGW" >/dev/null 2>&1; then
+    "$MINGW" -shared -o jni_dispatch_j2cc.dll jni_dispatch_j2cc.s \
+        -nostdlib \
+        -Wl,--entry=0 \
+        -Wl,--no-insert-timestamp \
+        -Wl,--image-base,0x180000000 \
+        -Wl,--disable-dynamicbase
+    log "built jni_dispatch_j2cc.dll"
+else
+    skip "no $MINGW — keeping committed jni_dispatch_j2cc.dll"
+fi
+
 echo "[Mach-O] libjni_registrar.dylib (System V ABI)"
 # clang needs to find ld64.lld; on Debian/Ubuntu it lives in the llvm bindir.
 for d in /usr/lib/llvm-*/bin; do
