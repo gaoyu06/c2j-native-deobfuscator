@@ -55,6 +55,7 @@ assertion in `test_generic_discovery.py`:
 | ELF x86-64 | System V | `RegisterNatives` static table decoded to names/descriptors/addresses via relocations | `libjni_registrar.so` |
 | ELF x86-64 (symbols stripped) | System V | Same table still recovered after `strip --strip-all` (no `.symtab`); no silent empty result | `libjni_registrar.stripped.so` |
 | ELF x86-64 (exports only) | System V | Second registration family: methods registered purely by `Java_*` export names, **no** table | `libjni_exports_only.so` |
+| **ELF x86-64 (visible-but-unreadable table, honest gap)** | System V | A `RegisterNatives` call site whose in-image `JNINativeMethod[]` is **visible** (right stride, `nMethods` immediate 2) but whose name/descriptor bytes are high-bit / XOR-looking garbage that is not valid UTF-8 (an encrypted-string-table model). Discovery records this as an **honest gap, not a recovery**: a `register-natives-unreadable` registry record carrying the call site, `nMethods`, and table address, plus an `analysis.unreadableTables` count — and `manifest-merge` emits an `unreadable-table` binding gap instead of binding anything. **No** method names or fnAddrs are fabricated from the garbage; a genuine `Java_*` export on the same image is still recorded. This proves only that a visible-but-unreadable table is **not silently dropped** — it does not decode/decrypt the table | `libjni_unreadable_table.so` |
 | **ELF x86-64 (shared dispatch, generic `auto`)** | System V | Second registration **family** beyond a single obfuscator: one shared `RegisterNatives` call site reached by two branches registers two classes with different `nMethods` (2 and 3). The **generic `auto` harvest** (no named detector fires — `analysis.profile` stays `generic`) recovers **both** stack-built tables from the one site — two independently sized `nMethods` groups whose fnAddrs cross-check the export addresses — instead of collapsing them into one silent bind. No names are decoded and no methods are fabricated for the stack tables | `libjni_dispatch_shared.so` (asm) |
 | **PE x86-64 (named `j2cc`, `shared_dispatch`)** | Microsoft x64 | The **named `j2cc` profile detector** (`_detect_j2cc`) firing on a real Windows image — not a mocked LIEF object. Two Java_* exports (`initClass` + `bootstrap`, ≤4) plus a `Cannot invoke ` literal make `_detect_j2cc` win over the generic fallback, so `analysis.profile` is `j2cc`. That profile's `harvest_strategy="shared_dispatch"` then **always** calls `_harvest_dispatch` (not the `auto` fallback) and recovers **both** stack tables (`nMethods` 2 and 3) from the one Microsoft x64 `RegisterNatives` call site (env in `rcx`, `methods*` in `r8`, `nMethods` in `r9d`, `call *0x6b8(%rax)`). Recovered fnAddrs cross-check the `fixture_*` export addresses; no names are fabricated on the stack tables. A genuine PE (MZ/PE magic, machine `0x8664`) — never a renamed ELF | `jni_dispatch_j2cc.dll` (asm) |
 | **ELF 32-bit x86 (i386)** | System V (cdecl) | A genuine `(ELF, EM_386)` image: `format=ELF`/`arch=x86` reported, `detect_abi` selects `i386-sysv`, and a `Java_*` export is recorded. cdecl passes `RegisterNatives` arguments on the stack (`push $nMethods` / `push methods`); PIC forms the table address through the GOT-base register (`call`/`pop`/`add` PC thunk, then `lea disp(%ebx), %edx`), which the backend folds back so the static table decodes to names/descriptors whose fnPtrs (from `R_386_32` relocations) cross-check the export addresses. Not a renamed 64-bit `.so` | `libjni_registrar_i386.so` |
@@ -198,6 +199,24 @@ section-header-removed image at all, introspection **raises** rather than
 returning an empty result; the tests assert that honest failure explicitly, so
 this case is never a silent empty success.
 
+### Visible-but-unreadable RegisterNatives table (honest gap)
+
+Some obfuscators keep the `JNINativeMethod[]` in the image with the correct
+stride and a visible `nMethods`, but store the method names and descriptors
+encrypted (XOR'd / high-bit bytes) and decrypt them only at runtime. The call
+site and the table are structurally present, yet the names/descriptors cannot be
+read out statically. Discovery does **not** silently skip such a site and does
+**not** fabricate names or function pointers from the garbage. Instead it emits a
+first-class `register-natives-unreadable` registry record — with the
+`registerNativesCallSite`, `nMethods` (when known), `tableAddress` (when known),
+and a `reason` such as `invalid-method-descriptors` — and surfaces the count on
+`binary.json`'s `analysis.unreadableTables`. `inspect-binary`'s human output
+reports `unreadableTables=<n>`, and `manifest-merge` turns each such record into
+an `unreadable-table` binding gap rather than binding a class by count. This is
+an **honest gap**, not a recovery: it proves only that a visible-but-unreadable
+table is never silently dropped. Decrypting the table's contents stays out of
+scope (see the next section).
+
 ### Still unproven / out of scope
 
 These are acknowledged gaps, not silent successes — the code either records an
@@ -216,7 +235,15 @@ binding:
   `__stdcall` rather than the ELF cdecl proven above. `detect_abi` matches only
   ELF `EM_386`, so a PE i386 image yields an empty registry with no fabricated
   methods until a dedicated backend is added.
-- Encrypted or runtime-decrypted method tables that emulation cannot reach.
+- Encrypted or runtime-decrypted method tables remain unproven for *recovery*:
+  a table whose name/descriptor bytes are decrypted only at runtime cannot have
+  its method names/descriptors read out statically, and emulation cannot reach
+  it. A **visible-but-unreadable** static table (present with the right stride
+  and count but with garbage name/descriptor bytes) is now recorded as an
+  **honest gap** — a `register-natives-unreadable` record plus an
+  `unreadable-table` binding gap — rather than silently dropped (see the
+  `libjni_unreadable_table.so` matrix row and the honest-gap section above), but
+  the table contents themselves are still not decoded.
 - Custom dispatch that does not preserve `JNINativeMethod[]` order. (A shared
   `initClass()` dispatcher that *does* preserve per-branch table order is now
   proven — see the shared-dispatch fixture above.)
