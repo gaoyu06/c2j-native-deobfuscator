@@ -244,13 +244,14 @@ class AttachControllerTest {
     }
 
     @Test
-    fun `this checkout has no attach subcommand`() {
-        // This branch is stacked only on the parse/introspect pipeline; the
-        // attach preview CLI lands separately. The GUI relies on this being
-        // false to show its honest banner and keep Run disabled.
-        assertFalse(
+    fun `this checkout has the wired-in attach subcommand`() {
+        // The attach preview CLI (the `attach` subcommand + attach_support) is
+        // merged into this branch, so `py/j2c_dumper_cli` declares it. The GUI
+        // relies on this reading as available to hide the CLI-missing notice and
+        // let Run enable once a PID and ownership are set.
+        assertTrue(
             AttachController.attachSubcommandAvailable(),
-            "attach must read as unavailable on this branch",
+            "attach must read as available on this merged branch",
         )
     }
 

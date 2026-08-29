@@ -110,9 +110,12 @@ object AttachController {
 
     /**
      * Whether the CLI this GUI would actually run has an `attach` subcommand.
-     * This branch is stacked only on the parse/introspect pipeline; the attach
-     * preview CLI lands on a separate change, so here the shown command would
-     * fail. The form must say so instead of pretending it works.
+     * On this branch the attach preview CLI is wired in (the `attach`
+     * subcommand + `attach_support` from the JVMTI live-attach change), so this
+     * returns true and Run can enable once a PID and ownership are set. It stays
+     * honest for checkouts that lack it: if a build is run against a tree with
+     * no `attach` subcommand it returns false and the form shows the CLI-missing
+     * notice instead of pretending the displayed command works.
      *
      * Read-only: it inspects the same `main.py` the run path launches
      * (`py/j2c_dumper_cli`). When the project root cannot be located the CLI

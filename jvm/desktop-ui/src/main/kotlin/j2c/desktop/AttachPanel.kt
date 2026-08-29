@@ -55,9 +55,9 @@ class AttachPanel(
     private val refusalLabel = JLabel()
     private val refusalBanner = JPanel(BorderLayout())
 
-    // An honest notice for the checkout where the attach preview CLI is absent
-    // (this branch): Run cannot work, but Listen and the /proc pre-scan still
-    // do. Shown instead of pretending the displayed command runs.
+    // An honest notice for a checkout where the attach preview CLI is absent
+    // (not this one — this branch wires it in): Run cannot work, but Listen and
+    // the /proc pre-scan still do. Shown instead of pretending the command runs.
     private val noticeLabel = JLabel()
     private val noticeBanner = JPanel(BorderLayout())
 
@@ -66,8 +66,10 @@ class AttachPanel(
     private val warningLabel = JLabel(" ")
 
     /** True when the CLI this GUI would launch actually has an `attach`
-     *  subcommand. Fixed for the panel's life; drives the notice + Run gate. */
-    private val attachAvailable = AttachController.attachSubcommandAvailable()
+     *  subcommand. Read from the checkout at construction; drives the notice +
+     *  Run gate. A `var` only so [previewAttachAvailability] can pin it for
+     *  deterministic screenshots / tests. */
+    private var attachAvailable = AttachController.attachSubcommandAvailable()
 
     private val copyButton = JButton("Copy command")
     private val runButton = JButton("Run attach")
@@ -91,6 +93,19 @@ class AttachPanel(
         logAllCheck.isSelected = req.logAll
         mechanismCombo.selectedItem = req.mechanism
         agentField.text = req.agentPath
+        refresh()
+    }
+
+    /**
+     * Pin whether the attach subcommand is considered available, then re-render.
+     * A screenshot / test hook so the ready-to-run form (available = true) and
+     * the honest CLI-absent notice (available = false) both render
+     * deterministically, independent of what the running checkout contains. It
+     * flips the same flag the constructor reads from [AttachController]; nothing
+     * about the gate logic changes.
+     */
+    fun previewAttachAvailability(available: Boolean) {
+        attachAvailable = available
         refresh()
     }
 

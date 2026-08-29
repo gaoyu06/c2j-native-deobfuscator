@@ -103,7 +103,11 @@ an honest front end to the `attach` CLI (see
   inspect this process*. That box adds the required `--i-own-this-process`
   flag; without it the CLI refuses before touching the target, and so does the
   GUI. Attach is for a same-user JVM you are authorized to inspect.
-- **If this checkout has no `attach` subcommand, Run is disabled and says so.**
+- **This checkout wires the `attach` subcommand in**, so once a PID is entered,
+  ownership is confirmed, and the `/proc` pre-scan finds no blocker, **Run is
+  enabled** and launches the real CLI. (The subcommand + `attach_support` come
+  from the JVMTI live-attach change; see [`docs/jvm-attach.md`](../../docs/jvm-attach.md).)
+- **If a checkout has no `attach` subcommand, Run is disabled and says so.**
   The form inspects the same CLI it would launch; when the `attach` preview
   subcommand is absent it shows an honest notice instead of pretending the
   displayed command works. **Listen** and the `/proc` pre-scan still work, so
@@ -223,9 +227,10 @@ cd jvm
 - `01-empty` … `06-trace` — the artifact-session states (empty, missing
   artifacts, pipeline, method detail, static trace). `04-pipeline` now includes
   the binary analysis strip.
-- `07-attach-form` — the attach / listen form, with the exact CLI shown. On a
-  checkout without the `attach` subcommand (this one) it also shows the honest
-  "attach CLI not in this checkout" notice and keeps Run disabled.
+- `07-attach-form` — the attach / listen form, with the exact CLI shown, pinned
+  to the honest fallback for a checkout *without* the `attach` subcommand: the
+  "attach CLI not in this checkout" notice is shown and Run stays disabled. (See
+  `13-attach-ready` for the live state on this branch, which does have it.)
 - `08-live-tail` — a live tail: bind events plus honest capability / gap rows
   (a reduced-capability live attach: bind only).
 - `09-capability-gap` — the empty case shown plainly: no core capabilities
@@ -238,6 +243,9 @@ cd jvm
 - `12-attach-self-warning` — the non-fatal warning path: the target sets
   `-Djdk.attach.allowAttachSelf=false`, which the form flags in amber without
   refusing (it governs self-attach only).
+- `13-attach-ready` — the ready-to-run form on a checkout that *has* the
+  `attach` subcommand (this branch): a PID and ownership are set, the pre-scan
+  finds no blocker, there is no "CLI missing" notice, and **Run is enabled**.
 
 Regenerate them with:
 

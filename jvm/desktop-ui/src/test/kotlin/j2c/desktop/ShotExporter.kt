@@ -119,11 +119,12 @@ fun main(args: Array<String>) {
         f.selectTab("Trace")
     }
 
-    // The honest attach form. A PID and the ownership box are set so the shown
-    // command carries --i-own-this-process, but on this checkout the attach
-    // preview CLI is absent, so the form says so and keeps Run disabled — it
-    // never pretends the displayed command would run. Listen and the pre-scan
-    // still work.
+    // The honest CLI-absent fallback. A PID and the ownership box are set so the
+    // shown command carries --i-own-this-process, but the form is pinned to the
+    // "attach subcommand not in this checkout" state to document that path: Run
+    // is disabled and the amber notice says so — it never pretends the displayed
+    // command would run. Listen and the /proc pre-scan still work. (This branch
+    // itself wires the attach CLI in; see 13-attach-ready for the live state.)
     dialogShot("07-attach-form") {
         AttachPanel(
             defaultOutput = "trace.jsonl",
@@ -140,6 +141,7 @@ fun main(args: Array<String>) {
                     agentPath = "",
                 )
             )
+            previewAttachAvailability(false)
         }
     }
 
@@ -211,6 +213,30 @@ fun main(args: Array<String>) {
     shot("11-analysis-strip") { f ->
         f.openDirectory(sample)
         f.selectTab("Pipeline")
+    }
+
+    // The ready-to-run form on a checkout that HAS the attach subcommand (this
+    // merged branch). A PID and the ownership box are set, the pre-scan finds no
+    // blocker, and the attach CLI is present — so there is no "CLI missing"
+    // notice and Run is enabled. This is the state deliverable (4) asks for.
+    dialogShot("13-attach-ready") {
+        AttachPanel(
+            defaultOutput = "trace.jsonl",
+            onStartTail = {},
+            onClose = {},
+        ).apply {
+            applyRequest(
+                AttachRequest(
+                    pid = "48213",
+                    output = "trace.jsonl",
+                    iOwnThisProcess = true,
+                    logAll = false,
+                    mechanism = "auto",
+                    agentPath = "",
+                )
+            )
+            previewAttachAvailability(true)
+        }
     }
 
     println("done -> ${outDir.toAbsolutePath()}")
