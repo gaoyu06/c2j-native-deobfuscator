@@ -1,5 +1,6 @@
 package j2c.desktop
 
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -39,6 +40,20 @@ class NextCommandPlannerTest {
     fun `remaining stubs suggest rebuild`() {
         val n = NextCommandPlanner.plan(true, true, true, 2, 1, true)!!
         assertTrue(n.command.contains("rebuild"))
+    }
+
+    @Test
+    fun `remaining stubs lead with capturing more of the run, not Ghidra`() {
+        val n = NextCommandPlanner.plan(true, true, true, 2, 1, true)!!
+        // The headline recommendation is to capture more of the run, never a
+        // Ghidra dump. Ghidra may appear only as a subordinate last resort.
+        assertFalse(n.reason.contains("lift a Ghidra dump"))
+        assertTrue(n.reason.contains("dynamic-trace"))
+        assertTrue(n.reason.contains("-agentpath"))
+        assertTrue(n.reason.contains("recover"))
+        val traceIdx = n.reason.indexOf("dynamic-trace")
+        val ghidraIdx = n.reason.indexOf("Ghidra")
+        assertTrue(ghidraIdx == -1 || traceIdx < ghidraIdx)
     }
 
     @Test

@@ -304,6 +304,24 @@ scripts/j2c recover \
 > 本文写作 `py/.venv/bin/python`（Windows 上为 `py\.venv\Scripts\python`）。如果
 > setup 走的是 `pip` 兜底，就换成它安装到的那个解释器。
 
+### 进程附加（预览 —— 可选、仅限同一用户）
+
+如果目标 JVM 是你自己的、且已经在运行、无法重启，可以把同一个 JVMTI agent
+附加到活动进程上，而不必用 `-agentpath`：
+
+```bash
+scripts/j2c attach --pid <pid> --i-own-this-process -o trace.jsonl
+```
+
+这是**预览**级诊断路径，**不是**默认路径 —— `recover` 仍走启动期 `-agentpath`
+注入（观测更完整）。进程附加只能看到附加之后发生的行为，且能获得多少覆盖取决于
+JDK 在附加*之后*还允许申请哪些 JVMTI 能力。在不少 JDK 上（**已在 OpenJDK 21
+上实测**），活动附加只能拿到 native-method-bind，因此 trace 只有 `bind` 事件，
+方法进入/退出、局部变量、异常等事件**不会**被捕获；agent 的 `capability` /
+`gap` 记录会如实说明实际获得了什么。要完整恢复方法体请改用启动期路径。
+进程附加必须显式提供 `--pid` 和 `--i-own-this-process` 确认标志，并且拒绝跨用户
+目标。详见 [`docs/jvm-attach.md`](docs/jvm-attach.md)。
+
 ### 离线发现与轻量静态（无需运行、无需 Ghidra）
 
 当 JAR 无法运行时先从这里开始。下面的通用发现步骤会检查标准 JNI 导出符号和

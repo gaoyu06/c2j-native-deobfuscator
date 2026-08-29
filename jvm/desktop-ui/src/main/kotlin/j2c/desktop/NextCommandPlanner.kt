@@ -48,7 +48,11 @@ object NextCommandPlanner {
         }
         if (stubCount > 0) {
             return NextCommand(
-                "$stubCount method(s) still need bodies. Trace more paths or lift a Ghidra dump, then rebuild.",
+                "$stubCount method(s) still need bodies. First capture more of the run — " +
+                    "j2c-dumper dynamic-trace, a startup -agentpath launch, or the one-shot " +
+                    "j2c-dumper recover — then rebuild. inspect-binary and merge-manifest are " +
+                    "already done, so what's left is binding gaps to close offline, with a " +
+                    "Ghidra static-reverse lift only as an optional last resort.",
                 "j2c-dumper rebuild --input <input.jar> --recovered recovered/ --manifest manifest.json -o out.jar",
             )
         }

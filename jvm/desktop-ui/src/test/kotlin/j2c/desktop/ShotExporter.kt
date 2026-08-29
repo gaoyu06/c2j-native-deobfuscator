@@ -87,6 +87,13 @@ fun main(args: Array<String>) {
 
     val sample = sampleSessionDir()
 
+    // The attach form resolves its output to an absolute path so the launched
+    // CLI and the viewer's tail agree on one file. Use a fixed, representative
+    // absolute path here (already-absolute inputs are shown unchanged) so the
+    // command preview in these shots is deterministic — the same path a real
+    // session-open dialog shows — instead of a build-machine-specific one.
+    val attachOut = "/home/you/session/trace.jsonl"
+
     shot("01-empty") { /* opens with no session */ }
 
     shot("02-no-artifacts") { f ->
@@ -119,27 +126,29 @@ fun main(args: Array<String>) {
         f.selectTab("Trace")
     }
 
-    // The honest attach form. A PID and the ownership box are set so the shown
-    // command carries --i-own-this-process, but on this checkout the attach
-    // preview CLI is absent, so the form says so and keeps Run disabled — it
-    // never pretends the displayed command would run. Listen and the pre-scan
-    // still work.
+    // The honest CLI-absent fallback. A PID and the ownership box are set so the
+    // shown command carries --i-own-this-process, but the form is pinned to the
+    // "attach subcommand not in this checkout" state to document that path: Run
+    // is disabled and the amber notice says so — it never pretends the displayed
+    // command would run. Listen and the /proc pre-scan still work. (This branch
+    // itself wires the attach CLI in; see 13-attach-ready for the live state.)
     dialogShot("07-attach-form") {
         AttachPanel(
-            defaultOutput = "trace.jsonl",
+            defaultOutput = attachOut,
             onStartTail = {},
             onClose = {},
         ).apply {
             applyRequest(
                 AttachRequest(
                     pid = "48213",
-                    output = "trace.jsonl",
+                    output = attachOut,
                     iOwnThisProcess = true,
                     logAll = false,
                     mechanism = "auto",
                     agentPath = "",
                 )
             )
+            previewAttachAvailability(false)
         }
     }
 
@@ -161,14 +170,14 @@ fun main(args: Array<String>) {
     // No stealth, no bypass — reaching this banner means no attach happened.
     dialogShot("10-attach-refused") {
         AttachPanel(
-            defaultOutput = "trace.jsonl",
+            defaultOutput = attachOut,
             onStartTail = {},
             onClose = {},
         ).apply {
             applyRequest(
                 AttachRequest(
                     pid = "48213",
-                    output = "trace.jsonl",
+                    output = attachOut,
                     iOwnThisProcess = true,
                     logAll = false,
                     mechanism = "auto",
@@ -185,14 +194,14 @@ fun main(args: Array<String>) {
     // not refuse. Same scan/classification the live refresh runs.
     dialogShot("12-attach-self-warning") {
         AttachPanel(
-            defaultOutput = "trace.jsonl",
+            defaultOutput = attachOut,
             onStartTail = {},
             onClose = {},
         ).apply {
             applyRequest(
                 AttachRequest(
                     pid = "48213",
-                    output = "trace.jsonl",
+                    output = attachOut,
                     iOwnThisProcess = true,
                     logAll = false,
                     mechanism = "auto",
@@ -211,6 +220,30 @@ fun main(args: Array<String>) {
     shot("11-analysis-strip") { f ->
         f.openDirectory(sample)
         f.selectTab("Pipeline")
+    }
+
+    // The ready-to-run form on a checkout that HAS the attach subcommand (this
+    // merged branch). A PID and the ownership box are set, the pre-scan finds no
+    // blocker, and the attach CLI is present — so there is no "CLI missing"
+    // notice and Run is enabled. This is the state deliverable (4) asks for.
+    dialogShot("13-attach-ready") {
+        AttachPanel(
+            defaultOutput = attachOut,
+            onStartTail = {},
+            onClose = {},
+        ).apply {
+            applyRequest(
+                AttachRequest(
+                    pid = "48213",
+                    output = attachOut,
+                    iOwnThisProcess = true,
+                    logAll = false,
+                    mechanism = "auto",
+                    agentPath = "",
+                )
+            )
+            previewAttachAvailability(true)
+        }
     }
 
     println("done -> ${outDir.toAbsolutePath()}")

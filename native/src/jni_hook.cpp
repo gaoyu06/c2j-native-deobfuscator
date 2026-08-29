@@ -59,6 +59,10 @@ thread_local const char* t_current_method = nullptr;
 // Configurable via the `max-frame-events=N` agent option; 0 = unlimited.
 int g_max_frame_events = 50000;
 
+// When true, JNI-call wrappers emit even when not inside a user native frame.
+// Wired to the `log-all=true` agent option (see set_log_all). Off by default.
+std::atomic<bool> g_log_all{false};
+
 // Parse a method descriptor into a list of arg-type tokens.
 // Example: "(ILjava/lang/String;[I)V" -> ["I", "Ljava/lang/String;", "[I"].
 std::vector<std::string> parse_arg_types(const std::string& desc) {
@@ -235,8 +239,15 @@ std::string hex_ptr(const void* p) {
 
 void emit(const std::string& call, const std::string& args, const std::string& ret,
           jmethodID mid = nullptr, const std::string& ret_str = std::string()) {
-    if (!in_native_frame() || t_suppress_depth > 0) return;
-    if (g_max_frame_events > 0 && t_frame_event_count >= g_max_frame_events) {
+    if (t_suppress_depth > 0) return;
+    const bool inframe = in_native_frame();
+    // Outside a user native frame we normally stay silent (those JNI calls are
+    // noise for recovery). The `log-all` agent option opts into logging them.
+    if (!inframe && !g_log_all.load(std::memory_order_relaxed)) return;
+    // The per-frame event budget only applies inside a frame (the counter is
+    // reset on outermost frame entry); log-all events outside a frame are not
+    // budgeted here.
+    if (inframe && g_max_frame_events > 0 && t_frame_event_count >= g_max_frame_events) {
         if (!t_frame_truncated) {
             t_frame_truncated = true;
             // emit a single truncation marker once per frame
@@ -248,7 +259,7 @@ void emit(const std::string& call, const std::string& args, const std::string& r
         }
         return;
     }
-    ++t_frame_event_count;
+    if (inframe) ++t_frame_event_count;
     std::ostringstream os;
     os << "{\"ev\":\"jni\",\"ts\":" << TraceWriter::ts_now()
        << ",\"thr\":" << TraceWriter::tid()
@@ -397,7 +408,7 @@ std::string read_jstring(JNIEnv* env, jobject obj) {
 }
 
 void emit_propagate(const char* call, jobject from, jobject to) {
-    if (!in_native_frame()) return;
+    if (!in_native_frame() && !g_log_all.load(std::memory_order_relaxed)) return;
     std::ostringstream os;
     os << "{\"ev\":\"jni\",\"ts\":" << TraceWriter::ts_now()
        << ",\"thr\":" << TraceWriter::tid()
@@ -1062,6 +1073,9 @@ void exit_native_frame()  { if (t_frame_depth > 0) --t_frame_depth; }
 bool in_native_frame()    { return t_frame_depth > 0; }
 
 void set_max_frame_events(int n) { g_max_frame_events = n; }
+
+void set_log_all(bool on) { g_log_all.store(on, std::memory_order_relaxed); }
+bool log_all() { return g_log_all.load(std::memory_order_relaxed); }
 
 void enter_suppress_frame() { ++t_suppress_depth; }
 void exit_suppress_frame()  { if (t_suppress_depth > 0) --t_suppress_depth; }

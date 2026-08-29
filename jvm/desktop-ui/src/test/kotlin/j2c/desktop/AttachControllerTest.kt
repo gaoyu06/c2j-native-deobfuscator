@@ -39,7 +39,11 @@ class AttachControllerTest {
         val cmd = AttachController.commandLine(req())
         assertTrue(cmd.contains("-m j2c_dumper_cli.main attach"), "got: $cmd")
         assertTrue(cmd.contains("--pid 1234"), "got: $cmd")
-        assertTrue(cmd.contains("-o trace.jsonl"), "got: $cmd")
+        // The output is resolved to an absolute path (see the resolve-output
+        // tests below); the preview shows that same path, ending in the file.
+        val out = AttachController.resolvedOutput(req())!!.toString()
+        assertTrue(cmd.contains("-o $out"), "got: $cmd")
+        assertTrue(out.endsWith("trace.jsonl"), "got: $out")
     }
 
     @Test
@@ -66,6 +70,66 @@ class AttachControllerTest {
     private fun List<String>.containsInOrder(a: String, b: String): Boolean {
         val i = indexOf(a)
         return i >= 0 && i + 1 < size && this[i + 1] == b
+    }
+
+    // ---------------------------------------------------------------
+    // Output resolution — the fix for the relative-path mismatch. run()
+    // launches the CLI with cwd py/j2c_dumper_cli, so a relative `-o` would
+    // land there while the viewer tails relative to its own cwd. Resolving
+    // to one absolute path up front makes the two agree. No live JVM needed.
+    // ---------------------------------------------------------------
+
+    /** The value passed to `-o` in the argv the process is actually launched with. */
+    private fun outputInArgv(req: AttachRequest): String {
+        val argv = AttachController.argv(req)
+        val i = argv.indexOf("-o")
+        assertTrue(i >= 0 && i + 1 < argv.size, "argv has no -o value: $argv")
+        return argv[i + 1]
+    }
+
+    @Test
+    fun `a relative output becomes an absolute path`() {
+        val resolved = AttachController.resolvedOutput(req(output = "trace.jsonl"))!!
+        assertTrue(resolved.isAbsolute, "expected absolute, got: $resolved")
+        assertTrue(resolved.toString().endsWith("trace.jsonl"), "got: $resolved")
+    }
+
+    @Test
+    fun `the run argv output and the viewer tail path are the same absolute path`() {
+        val req = req(output = "trace.jsonl")
+
+        // The path the process is told to write (argv -o) …
+        val argvOutput = outputInArgv(req)
+        // … and the path the viewer would tail after a successful attach both
+        // come from resolvedOutput, so they cannot drift apart.
+        val tailPath = AttachController.resolvedOutput(req)!!
+
+        assertTrue(tailPath.isAbsolute, "tail path must be absolute, got: $tailPath")
+        assertEquals(
+            tailPath.toString(),
+            argvOutput,
+            "launch --output and tail path must be the same absolute path",
+        )
+    }
+
+    @Test
+    fun `an already-absolute output is preserved through argv and tail`() {
+        val abs = java.nio.file.Path.of(System.getProperty("java.io.tmpdir"))
+            .toAbsolutePath().resolve("j2c-trace.jsonl").toString()
+        val req = req(output = abs)
+
+        val argvOutput = outputInArgv(req)
+        val tailPath = AttachController.resolvedOutput(req)!!
+        assertEquals(abs, argvOutput, "absolute output must reach argv unchanged")
+        assertEquals(abs, tailPath.toString(), "absolute output must reach the tail unchanged")
+    }
+
+    @Test
+    fun `a blank output leaves the command preview output empty`() {
+        assertNull(AttachController.resolvedOutput(req(output = "   ")))
+        val cmd = AttachController.commandLine(req(output = ""))
+        // `-o` with nothing after it, not a bare root path.
+        assertTrue(cmd.contains("-o ") || cmd.endsWith("-o"), "got: $cmd")
     }
 
     // ---------------------------------------------------------------
@@ -244,13 +308,14 @@ class AttachControllerTest {
     }
 
     @Test
-    fun `this checkout has no attach subcommand`() {
-        // This branch is stacked only on the parse/introspect pipeline; the
-        // attach preview CLI lands separately. The GUI relies on this being
-        // false to show its honest banner and keep Run disabled.
-        assertFalse(
+    fun `this checkout has the wired-in attach subcommand`() {
+        // The attach preview CLI (the `attach` subcommand + attach_support) is
+        // merged into this branch, so `py/j2c_dumper_cli` declares it. The GUI
+        // relies on this reading as available to hide the CLI-missing notice and
+        // let Run enable once a PID and ownership are set.
+        assertTrue(
             AttachController.attachSubcommandAvailable(),
-            "attach must read as unavailable on this branch",
+            "attach must read as available on this merged branch",
         )
     }
 

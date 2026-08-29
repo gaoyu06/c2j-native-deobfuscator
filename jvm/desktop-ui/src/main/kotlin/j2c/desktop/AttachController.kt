@@ -63,7 +63,7 @@ object AttachController {
     fun attachArgs(req: AttachRequest): List<String> {
         val args = mutableListOf("attach", "--pid", req.pid.trim())
         if (req.iOwnThisProcess) args += CONFIRM_FLAG
-        args += listOf("-o", req.output.trim())
+        args += listOf("-o", outputArg(req))
         if (req.logAll) args += "--log-all"
         if (req.mechanism.isNotBlank() && req.mechanism != "auto") {
             args += listOf("--mechanism", req.mechanism)
@@ -71,6 +71,42 @@ object AttachController {
         if (req.agentPath.isNotBlank()) args += listOf("--agent", req.agentPath.trim())
         return args
     }
+
+    /**
+     * The single output path both the launched process and the viewer's tail
+     * must agree on. Resolving here is the whole fix for the relative-path
+     * mismatch: [run] starts the CLI with its working directory set to
+     * `py/j2c_dumper_cli`, so a relative `-o trace.jsonl` would be written *there*,
+     * while the viewer tails paths relative to its own working directory — the two
+     * disagree and the tail misses the file. By resolving the output to an
+     * absolute path against one stable root (the project root, or `user.dir` when
+     * the root can't be located) before it reaches either side, the `--output`
+     * the process writes and the path the viewer tails are byte-for-byte the same.
+     *
+     * An already-absolute output is returned normalized and otherwise unchanged.
+     * A blank output is left blank (callers gate on it separately), so the
+     * command preview shows `-o` with nothing rather than a bare root path.
+     */
+    fun resolveOutput(output: String): Path? {
+        val trimmed = output.trim()
+        if (trimmed.isEmpty()) return null
+        val raw = Path.of(trimmed)
+        val base = if (raw.isAbsolute) {
+            raw
+        } else {
+            val root = projectRoot() ?: Path.of(System.getProperty("user.dir"))
+            root.resolve(raw)
+        }
+        return base.toAbsolutePath().normalize()
+    }
+
+    /** The resolved absolute output for a request, or null when it is blank. */
+    fun resolvedOutput(req: AttachRequest): Path? = resolveOutput(req.output)
+
+    /** The `--output` token: the resolved absolute path, or "" when blank so the
+     *  preview and argv stay in step with an unfinished form. */
+    private fun outputArg(req: AttachRequest): String =
+        resolvedOutput(req)?.toString() ?: ""
 
     /**
      * A copy-pasteable command line. Reflects the current form state so an
@@ -110,9 +146,12 @@ object AttachController {
 
     /**
      * Whether the CLI this GUI would actually run has an `attach` subcommand.
-     * This branch is stacked only on the parse/introspect pipeline; the attach
-     * preview CLI lands on a separate change, so here the shown command would
-     * fail. The form must say so instead of pretending it works.
+     * On this branch the attach preview CLI is wired in (the `attach`
+     * subcommand + `attach_support` from the JVMTI live-attach change), so this
+     * returns true and Run can enable once a PID and ownership are set. It stays
+     * honest for checkouts that lack it: if a build is run against a tree with
+     * no `attach` subcommand it returns false and the form shows the CLI-missing
+     * notice instead of pretending the displayed command works.
      *
      * Read-only: it inspects the same `main.py` the run path launches
      * (`py/j2c_dumper_cli`). When the project root cannot be located the CLI

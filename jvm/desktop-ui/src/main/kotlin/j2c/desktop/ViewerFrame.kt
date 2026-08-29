@@ -55,7 +55,13 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
     private val artifactsBox = JPanel()
     private val analysisBox = JPanel()
     private val analysisSection = Ui.sectionLabel("binary analysis")
-    private val nextReason = JLabel(" ")
+    // A JTextArea (not a JLabel) so a longer recommendation wraps; the max-size
+    // override keeps BoxLayout from stretching it into the trailing glue, so it
+    // hugs the wrapped text height just above the command box.
+    private val nextReason = object : JTextArea(" ") {
+        override fun getMaximumSize(): Dimension =
+            Dimension(Int.MAX_VALUE, preferredSize.height)
+    }
     private val nextCommand = JTextArea()
     private val emptyBanner = JLabel("", SwingConstants.CENTER)
 
@@ -354,10 +360,19 @@ class ViewerFrame : JFrame("recovery artifact viewer") {
         analysisBox.border = BorderFactory.createEmptyBorder(4, 10, 8, 10)
         analysisSection.alignmentX = JComponent.LEFT_ALIGNMENT
 
-        nextReason.font = Theme.sans
-        nextReason.foreground = Theme.TEXT
-        nextReason.alignmentX = JComponent.LEFT_ALIGNMENT
-        nextReason.border = BorderFactory.createEmptyBorder(2, 10, 6, 10)
+        nextReason.apply {
+            isEditable = false
+            isFocusable = false
+            font = Theme.sans
+            foreground = Theme.TEXT
+            background = Theme.BG
+            // A longer, honest recommendation needs to reflow rather than run
+            // off the pane, so wrap at word boundaries like the command box.
+            lineWrap = true
+            wrapStyleWord = true
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = BorderFactory.createEmptyBorder(2, 10, 6, 10)
+        }
 
         nextCommand.apply {
             isEditable = false

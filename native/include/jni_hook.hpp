@@ -28,6 +28,12 @@ void exit_suppress_frame();
 // Configure the max events per outermost-native-frame budget. <=0 disables.
 void set_max_frame_events(int n);
 
+// When enabled, JNI-call wrappers also log calls made *outside* a user native
+// frame (normally suppressed as noise). Wired to the `log-all=true` agent
+// option. Off by default.
+void set_log_all(bool on);
+bool log_all();
+
 // Current method being entered (for "fn" field of enter/exit events).
 void set_current_native_method(const char* sig);
 const char* current_native_method();
