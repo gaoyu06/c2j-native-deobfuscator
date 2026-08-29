@@ -117,6 +117,37 @@ def _run_inspect_binary(
                     json.loads(captured.read_text(encoding="utf-8")),
                 )
     write_report(report, output)
+    # Surface the selected profile and registry size so the user can see which
+    # obfuscator variant was detected. bindingGaps are intentionally NOT printed
+    # here: they live on the manifest, not binary.json, and only exist after the
+    # merge stage binds tables to jar classes.
+    selected_profile = (report.analysis or {}).get("profile", "?")
+    console.print(
+        f"inspect-binary: {output} "
+        f"format={report.fmt} arch={report.arch} "
+        f"profile={selected_profile} "
+        f"registry-records={len(report.native_registry)}"
+    )
+
+
+def _print_binding_gaps(manifest: Path) -> None:
+    """Print the manifest's bindingGaps count and kinds to the console.
+
+    bindingGaps are a manifest-level fact (a native table that could not be
+    unambiguously bound to a jar class); they never appear on binary.json.
+    """
+    try:
+        doc = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    gaps = doc.get("bindingGaps") or []
+    if not gaps:
+        console.print("merge-manifest: bindingGaps=0")
+        return
+    kinds = sorted({str(gap.get("kind", "unknown")) for gap in gaps})
+    console.print(
+        f"merge-manifest: bindingGaps={len(gaps)} kinds={','.join(kinds)}"
+    )
 
 
 def _run_merge_manifest(classes: Path, binary: Optional[Path], output: Path) -> None:
@@ -130,6 +161,7 @@ def _run_merge_manifest(classes: Path, binary: Optional[Path], output: Path) -> 
         mm_main(standalone_mode=False)
     except SystemExit:
         pass
+    _print_binding_gaps(output)
 
 
 def _run_dynamic_trace(run_cmd: str, output: Path) -> None:

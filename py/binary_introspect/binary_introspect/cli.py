@@ -39,7 +39,8 @@ def introspect_cmd(lib: Path, output: Path, profile_name: str | None,
     write_report(report, output)
     click.echo(
         f"Wrote {output}\n"
-        f"  format={report.fmt} arch={report.arch}\n"
+        f"  format={report.fmt} arch={report.arch} "
+        f"profile={report.analysis.get('profile')}\n"
         f"  strings={len(report.string_pool)} hidden-classes={len(report.hidden_classes)} "
         f"exports={len(report.exported_functions)} "
         f"registry-records={len(report.native_registry)}",
@@ -67,7 +68,8 @@ def main(lib: Path, output: Path, profile_name: str | None) -> None:
     write_report(report, output)
     click.echo(
         f"Wrote {output}\n"
-        f"  format={report.fmt} arch={report.arch}\n"
+        f"  format={report.fmt} arch={report.arch} "
+        f"profile={report.analysis.get('profile')}\n"
         f"  strings={len(report.string_pool)} hidden-classes={len(report.hidden_classes)} "
         f"exports={len(report.exported_functions)} "
         f"registry-records={len(report.native_registry)}",
