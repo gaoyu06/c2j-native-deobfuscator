@@ -229,6 +229,23 @@ def _capstone_disassembles_aarch64() -> bool:
     return any(cs.disasm(bytes.fromhex("845c43f9"), 0))
 
 
+def _capstone_disassembles_arm() -> bool:
+    """True when the host capstone can actually decode 32-bit ARM. As with
+    AArch64, exports still parse via LIEF without this, so the ARM table
+    assertions are guarded on it while the export assertion is not."""
+    try:
+        from capstone import CS_ARCH_ARM, CS_MODE_ARM, Cs
+    except ImportError:
+        return False
+    try:
+        cs = Cs(CS_ARCH_ARM, CS_MODE_ARM)
+    except Exception:
+        return False
+    # ldr lr, [ip, #860]  (little-endian bytes) — a smoke check that this
+    # capstone build carries the 32-bit ARM backend.
+    return any(cs.disasm(bytes.fromhex("5ce39ce5"), 0))
+
+
 def test_introspect_real_aarch64_elf_recovers_static_table_and_export() -> None:
     """AArch64 / AAPCS64 proven end-to-end on a committed ELF .so.
 
@@ -278,6 +295,115 @@ def test_introspect_real_aarch64_elf_recovers_static_table_and_export() -> None:
     # broken adrp/add fold or relocation read would desync these.
     assert table["methods"][0]["fnAddr"] == _export_addr(report, "fixture_alpha")
     assert table["methods"][1]["fnAddr"] == _export_addr(report, "fixture_beta")
+
+
+def test_introspect_real_arm_elf_reports_format_arch_export_and_table() -> None:
+    """32-bit ARM / AAPCS proven on a committed ELF ``.so``.
+
+    This is the 32-bit sibling of the AArch64 ``.so``: a genuine
+    ``(ELF, EM_ARM)`` image built with ``arm-linux-gnueabi-gcc``, not a renamed
+    aarch64 or x86 binary. LIEF confirms the ELF magic and the ``EM_ARM``
+    machine type, so ``introspect`` reports ``format=ELF`` and this project's
+    existing ARM arch string, ``arm``.
+
+    The specification-defined ``Java_*`` export is recovered on every host via
+    the LIEF symbol table. When the host capstone can decode 32-bit ARM the
+    static ``RegisterNatives`` table is additionally recovered: the dispatch
+    reaches its slot through the ``ip`` veneer register (``ldr lr, [ip, #860]``
+    / ``mov ip, lr`` / ``bx ip``) and the position-independent table address is
+    formed with a literal-pool load plus ``add r2, pc, r2``, which the AAPCS32
+    backend folds back so names/descriptors decode and their function pointers
+    cross-check the export addresses. When capstone cannot decode ARM, no table
+    is claimed and no methods are fabricated.
+    """
+    path = FIXTURES / "libjni_registrar_arm.so"
+
+    binary = lief.parse(str(path))
+    assert binary.format == lief.Binary.FORMATS.ELF
+    assert int(binary.header.machine_type) == 0x28  # EM_ARM
+
+    report = introspect(path)
+    assert report.fmt == "ELF"
+    assert report.arch == "arm"
+    assert report.analysis == {"profile": "generic", "methodDiscovery": "jni-spec"}
+
+    # The specification-defined Java_* export is recovered on every host,
+    # capstone or not — it comes from the LIEF symbol table, not disassembly.
+    exports = _jni_exports(report)
+    assert [e["fnSymbol"] for e in exports] == ["Java_com_example_Sample_ping"]
+    assert exports[0]["fnAddr"] == _export_addr(
+        report, "Java_com_example_Sample_ping"
+    )
+
+    tables = _static_tables(report)
+    if not _capstone_disassembles_arm():
+        # Honest fallback: no 32-bit ARM disassembler means no table is
+        # claimed, and crucially no fabricated methods. The export above holds.
+        assert tables == []
+        return
+
+    assert len(tables) == 1, "ARM table must not silently yield nothing"
+    table = tables[0]
+    assert table["abi"] == "arm-aapcs32"
+    assert table["nMethods"] == 2
+    assert [(m["name"], m["desc"]) for m in table["methods"]] == [
+        ("alpha", "()V"),
+        ("beta", "(I)I"),
+    ]
+    # Function pointers resolve through R_ARM_ABS32 relocations on the zeroed
+    # fnPtr slots and cross-check against the exported addresses; a broken
+    # literal-pool/add-pc fold or relocation read would desync these.
+    assert table["methods"][0]["fnAddr"] == _export_addr(report, "fixture_alpha")
+    assert table["methods"][1]["fnAddr"] == _export_addr(report, "fixture_beta")
+
+
+def test_arm_pc_relative_literal_pool_table_address_is_folded() -> None:
+    """Position-independent 32-bit ARM reaches its ``JNINativeMethod[]`` by
+    loading a link-time-constant offset from the literal pool and adding the
+    program counter (``ldr r2, [pc, #k]`` / ``add r2, pc, r2``). The AAPCS32
+    backend must read the pooled word and fold the pair back to the absolute
+    table VA — a regression here silently loses every ARM table (the shape
+    ``-fPIC`` ARM emits)."""
+    from binary_introspect.arch.arm_aapcs32 import ARM_AAPCS32
+
+    cs = ARM_AAPCS32.disassembler()
+    if cs is None or not _capstone_disassembles_arm():
+        pytest.skip("host capstone cannot decode 32-bit ARM")
+
+    # ldr r2, [pc, #0x14] ; add r2, pc, r2  — the exact encodings emitted for
+    # the committed libjni_registrar_arm.so. The literal at pc+8+0x14 holds a
+    # PC-relative offset; supply it through the begin_scan reader.
+    buf = bytes.fromhex("14209fe5" "02208fe0")
+    ARM_AAPCS32.begin_scan(lambda va, size=4: 0x3FF4 if va == 0x101C else None)
+
+    folded = None
+    for ins in cs.disasm(buf, 0x1000):
+        result = ARM_AAPCS32.decode_pc_relative_lea(ins)
+        if result is not None:
+            folded = result
+    # add is at 0x1004: (0x1004 + 8) + 0x3ff4 == 0x5000.
+    assert folded == 0x5000
+
+
+def test_arm_split_call_is_found_through_veneer_register() -> None:
+    """The RegisterNatives dispatch on 32-bit ARM loads the vtable slot into a
+    general register, copies it into the ``ip`` veneer, and tail-``bx``s
+    through it. The split-call scanner must follow the ``mov ip, lr`` to still
+    recognise the site — a regression here silently loses every ARM table."""
+    from binary_introspect.arch.arm_aapcs32 import ARM_AAPCS32
+
+    cs = ARM_AAPCS32.disassembler()
+    if cs is None or not _capstone_disassembles_arm():
+        pytest.skip("host capstone cannot decode 32-bit ARM")
+
+    code = bytes.fromhex(
+        "5ce39ce5"  # 0x00: ldr lr, [ip, #860]   (215 * 4)
+        "0ec0a0e1"  # 0x04: mov ip, lr
+        "1cff2fe1"  # 0x08: bx  ip
+    )
+    ranges = [(0x1000, 0x1000 + len(code), code)]
+    sites = _find_register_natives_calls(cs, ARM_AAPCS32, ranges, 215)
+    assert sites == [0x1008]
 
 
 def test_aarch64_split_call_is_found_through_veneer_register() -> None:
