@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import lief
 
@@ -34,6 +33,10 @@ class Abi:
     #: Tuple to accept both 32- and 64-bit aliases (e.g. ``r9`` / ``r9d``).
     n_methods_arg_regs: tuple[int, ...]
 
+    #: Register(s) used for the third argument, ``JNINativeMethod *methods``.
+    #: Pointer arguments only use the architecture's full-width register.
+    methods_arg_regs: tuple[int, ...]
+
     #: capstone register id used by the calling convention for the
     #: PC-relative argument addressing (``RIP`` on x86_64). Used by
     #: :meth:`decode_pc_relative_lea` to recognise "load address of
@@ -48,6 +51,17 @@ class Abi:
     # Methods (overridable but with sensible defaults).
     # ----------------------------------------------------------------
 
+    def begin_scan(self, read_word=None) -> None:
+        """Hook called once before a disassembly scan of a binary.
+
+        ``read_word(va, size)`` returns a little-endian integer read from the
+        mapped image at ``va`` (or ``None`` when the address is not mapped).
+        Only architectures whose "address of constant" form dereferences a
+        literal pool (32-bit ARM) need it; the default just records it so a
+        subclass can consume it, and is otherwise a no-op.
+        """
+        self._scan_read_word = read_word
+
     def disassembler(self):
         """Construct a configured capstone Cs object. Lazy import so
         capstone is only required for arches that actually use it."""
@@ -60,22 +74,75 @@ class Abi:
             return None
 
     def is_indirect_vtable_call(self, ins: Any) -> int | None:
-        """If ``ins`` is an ``call qword ptr [reg + 0xN]`` (or arch
-        equivalent), return ``N``. Otherwise return ``None``.
+        """Return the displacement of an indirect memory call.
 
-        Default implementation matches x86 Intel-syntax indirect calls.
-        Override for non-x86 arches.
+        This deliberately inspects Capstone operands rather than rendered
+        instruction text. Intel/AT&T syntax selection and register naming are
+        presentation details; the memory operand and its displacement are the
+        structural facts relevant to a JNI vtable slot.
         """
-        if ins.mnemonic != "call":
+        from capstone import x86_const
+
+        if ins.mnemonic not in ("call", "jmp"):
             return None
-        m = re.search(r"\[\w+\s*\+\s*(0x[0-9a-fA-F]+|\d+)\]", ins.op_str)
-        if not m:
+        if len(ins.operands) != 1:
             return None
-        off = m.group(1)
-        try:
-            return int(off, 16) if off.startswith("0x") else int(off)
-        except ValueError:
+        operand = ins.operands[0]
+        if operand.type != x86_const.X86_OP_MEM or operand.mem.base == 0:
             return None
+        return operand.mem.disp
+
+    def vtable_slot_load(self, ins: Any) -> tuple[int, int] | None:
+        """Return ``(destination_register, displacement)`` for a vtable load.
+
+        Optimizing compilers may split ``call [table + slot]`` into
+        ``mov tmp, [table + slot]`` followed by ``call tmp`` or tail ``jmp
+        tmp``. PC-relative loads are excluded because they address globals,
+        not a function slot through ``JNIEnv``.
+        """
+        from capstone import x86_const
+
+        if ins.mnemonic != "mov" or len(ins.operands) != 2:
+            return None
+        dst, src = ins.operands
+        if (
+            dst.type != x86_const.X86_OP_REG
+            or src.type != x86_const.X86_OP_MEM
+            or src.mem.base in (0, self.pc_register)
+        ):
+            return None
+        return dst.reg, src.mem.disp
+
+    def indirect_branch_register(self, ins: Any) -> int | None:
+        """Return the register used by an indirect call or tail jump."""
+        from capstone import x86_const
+
+        if ins.mnemonic not in ("call", "jmp") or len(ins.operands) != 1:
+            return None
+        operand = ins.operands[0]
+        return operand.reg if operand.type == x86_const.X86_OP_REG else None
+
+    def register_move(self, ins: Any) -> tuple[int, int] | None:
+        """If ``ins`` copies one register straight into another
+        (``mov dst, src``), return ``(dst_reg, src_reg)``; otherwise
+        ``None``.
+
+        This lets the split-call detector follow a ``JNIEnv`` vtable slot
+        pointer through a veneer register before the indirect branch. GCC's
+        AArch64 tail-call sequence, for instance, loads the slot into a
+        general register and then ``mov x16, <reg>`` / ``br x16`` through the
+        IP0 intra-procedure-call scratch register. The register-operand kind
+        id is ``1`` in both capstone's ``x86`` and ``arm64`` namespaces, so
+        the default recognises the plain register-to-register move on either
+        architecture; loads (``mov reg, [mem]``) and immediates are excluded
+        because their source operand is not a register.
+        """
+        if ins.mnemonic != "mov" or len(ins.operands) != 2:
+            return None
+        dst, src = ins.operands
+        if dst.type != 1 or src.type != 1:
+            return None
+        return dst.reg, src.reg
 
     def decode_pc_relative_lea(self, ins: Any) -> int | None:
         """If ``ins`` is a "load effective address of a constant"
@@ -133,6 +200,24 @@ class Abi:
         if dst.reg not in self.n_methods_arg_regs:
             return None
         return src.imm
+
+    def methods_address_load(self, ins: Any) -> int | None:
+        """Return a statically known method-table address loaded into arg 3.
+
+        On x86-64 this recognises ``lea <methods-arg>, [rip + disp]``. Stack
+        tables use ``rsp``/``rbp`` addressing and are handled by the stack
+        store harvester instead.
+        """
+        from capstone import x86_const
+
+        if ins.mnemonic != "lea" or len(ins.operands) != 2:
+            return None
+        dst, src = ins.operands
+        if dst.type != x86_const.X86_OP_REG or dst.reg not in self.methods_arg_regs:
+            return None
+        if src.type != x86_const.X86_OP_MEM or src.mem.base != self.pc_register:
+            return None
+        return ins.address + ins.size + src.mem.disp
 
     def applies_to(self, binary: lief.Binary) -> bool:
         """Default: match by (binary format, machine id) against the

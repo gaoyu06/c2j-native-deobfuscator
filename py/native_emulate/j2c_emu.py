@@ -37,7 +37,8 @@ NUL = bytes([0])
 
 # ---- canonical JNI function-table indices (offset = index*8) -------------
 JNI = dict(
-    AllocObject=27, GetObjectClass=31, IsInstanceOf=32, GetMethodID=33,
+    FindClass=6, NewGlobalRef=21, AllocObject=27, GetObjectClass=31,
+    IsInstanceOf=32, GetMethodID=33,
     CallObjectMethod=34, CallBooleanMethod=37, CallIntMethod=49,
     CallVoidMethod=61, CallNonvirtualObjectMethod=88, CallNonvirtualVoidMethod=91,
     GetFieldID=94, GetObjectField=95, GetIntField=100,
@@ -421,8 +422,12 @@ class Emu:
 
         if name in ("ExceptionCheck", "ExceptionOccurred"):
             rv = 0
+        elif name == "FindClass":
+            rv = self._new("class", meta=self._cstr(A(2)))
+        elif name == "NewGlobalRef":
+            rv = A(2)
         elif name == "RegisterNatives":
-            self._capture_register(A(3), A(4) & 0xffffffff)
+            self._capture_register(A(2), A(3), A(4) & 0xffffffff)
         elif name in ("GetStringLength", "GetStringUTFLength"):
             h = self.handles.get(A(2)); rv = len(h[1]) if h else 0
         elif name == "GetArrayLength":
@@ -465,14 +470,25 @@ class Emu:
         uc.reg_write(UC_X86_REG_RAX, rv)
         uc.reg_write(UC_X86_REG_RIP, ret)
 
-    def _capture_register(self, tbl, n):
+    def _capture_register(self, clazz, tbl, n):
+        class_handle = self.handles.get(clazz)
+        class_name = (
+            class_handle[2]
+            if class_handle and class_handle[0] == "class"
+            else None
+        )
         for m in range(min(n, 64)):
             base = tbl + m * 24
             try:
                 np_, sp_, fp = struct.unpack("<QQQ", self.uc.mem_read(base, 24))
             except UcError:
                 break
-            self.methods.append((self._cstr(np_), self._cstr(sp_), fp))
+            self.methods.append({
+                "className": class_name,
+                "name": self._cstr(np_),
+                "desc": self._cstr(sp_),
+                "fnAddr": fp,
+            })
 
     def _region_get(self, arr, start, ln, buf, name):
         h = self.handles.get(arr)
@@ -592,11 +608,17 @@ def demangle(sym):
 
 def discover(em, registrars):
     """Populate em.methods via the most reliable available route."""
-    # 1) Java_* export symbols (native-obfuscator standard exports)
+    # 1) Specification-defined Java_* export symbols.
     jx = [(n, va) for n, va in em.fmt.exports.items() if n.startswith("Java_")]
     if jx:
         for n, va in sorted(jx, key=lambda x: x[1]):
-            em.methods.append((demangle(n), None, va))
+            em.methods.append({
+                "className": None,
+                "name": demangle(n),
+                "desc": None,
+                "fnAddr": va,
+                "fnSymbol": n,
+            })
         return "Java_* exports"
     # 2) JNI_OnLoad emulation (registers via RegisterNatives)
     if "JNI_OnLoad" in em.fmt.exports:
@@ -624,13 +646,30 @@ def c_recover(a):
     em = Emu(a.dll, verbose=a.verbose)
     src = discover(em, _registrars(a))
     if not em.methods:
-        print("no methods found. native-obfuscator: should be automatic.\n"
-              "j2cc: pass --registrar 0x<regc_fnAddr> or --binary-json binary.json "
-              "(j2c-dumper inspect-binary).")
+        print("no methods found. Pass a registrar address or binary.json when "
+              "registration is not reachable through exports or JNI_OnLoad.")
         return
+    payload = {
+        "schemaVersion": 1,
+        "source": src,
+        "abi": em.fmt.abi.name,
+        "methods": [
+            {
+                **method,
+                "fnAddr": hex(method["fnAddr"]),
+            }
+            for method in em.methods
+        ],
+    }
+    if a.json_output:
+        with open(a.json_output, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
     print(f"# {len(em.methods)} native method(s) via {src} [{em.fmt.abi.name}]")
-    for nm, sig, fp in em.methods:
-        print(f"  {fp:#011x}  {nm or '?':<24} {sig or ''}")
+    for method in em.methods:
+        print(
+            f"  {method['fnAddr']:#011x}  "
+            f"{method.get('name') or '?':<24} {method.get('desc') or ''}"
+        )
 
 
 def c_strings(a):
@@ -669,13 +708,16 @@ def _parse_statics(items):
 
 
 def main():
-    p = argparse.ArgumentParser(description="emulation-based j2cc/native-obfuscator recovery")
+    p = argparse.ArgumentParser(
+        description="emulation-based JNI method discovery and binary introspection"
+    )
     p.add_argument("--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("recover", help="list native methods (auto-discovers entry points)")
     r.add_argument("dll")
-    r.add_argument("--registrar", nargs="+", help="explicit regc fnAddr(s) for j2cc")
-    r.add_argument("--binary-json", help="j2c-dumper binary.json (reads nativeRegistry.fnAddrs)")
+    r.add_argument("--registrar", nargs="+", help="explicit registrar function address(es)")
+    r.add_argument("--binary-json", help="binary.json (reads nativeRegistry.fnAddrs)")
+    r.add_argument("--json-output", help="write captured method records as JSON")
     r.set_defaults(f=c_recover)
     s = sub.add_parser("strings", help="dump decrypted string constants of a function")
     s.add_argument("dll"); s.add_argument("--fn", required=True)

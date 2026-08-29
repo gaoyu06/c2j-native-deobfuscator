@@ -16,6 +16,50 @@
     "loaderClass": { "type": ["string", "null"] },
     "nativeDir":   { "type": ["string", "null"] },
     "stringPool":  { "type": "array", "items": { "type": "string" } },
+    "analysis": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "methodDiscovery": { "type": "string" }
+      }
+    },
+    "bindingGaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "oneOf": [
+          {
+            "required": ["kind", "nMethods", "candidateClasses", "message"],
+            "properties": {
+              "kind": { "const": "ambiguous-count-only-table" },
+              "nMethods": { "type": "integer", "minimum": 1 },
+              "candidateClasses": {
+                "type": "array",
+                "minItems": 2,
+                "items": { "type": "string" }
+              },
+              "message": { "type": "string" },
+              "source": { "type": "string" },
+              "registerNativesCallSite": { "type": "string" },
+              "callSite": { "type": "string" },
+              "tableAddress": { "type": "string" }
+            }
+          },
+          {
+            "required": ["kind", "nMethods", "message"],
+            "properties": {
+              "kind": { "const": "unreadable-table" },
+              "nMethods": { "type": "integer", "minimum": 0 },
+              "message": { "type": "string" },
+              "reason": { "type": "string" },
+              "source": { "type": "string" },
+              "registerNativesCallSite": { "type": "string" },
+              "tableAddress": { "type": "string" }
+            }
+          }
+        ]
+      }
+    },
     "classes": {
       "type": "array",
       "items": {

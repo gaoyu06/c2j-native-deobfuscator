@@ -19,6 +19,7 @@ AMD64_SYSV = Abi(
     cs_arch=CS_ARCH_X86,
     cs_mode=CS_MODE_64,
     n_methods_arg_regs=(x86_const.X86_REG_RCX, x86_const.X86_REG_ECX),
+    methods_arg_regs=(x86_const.X86_REG_RDX,),
     pc_register=x86_const.X86_REG_RIP,
     binary_matches=[("ELF", 0x3E), ("MachO", 0x01000007)],
 )

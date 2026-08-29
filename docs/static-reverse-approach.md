@@ -1,16 +1,19 @@
-# 静态反编译方案（Ghidra Headless + tree-sitter-c AST 匹配）
+# 可选的方法体反编译方案（Ghidra Headless + tree-sitter-c AST 匹配）
 
-> **未开工**。本文档为 Phase 3b 的设计参考。
+> 本文档只描述可选的 pseudo-C 方法体 lifter。通用方法发现、manifest 与
+> stub 路径不依赖 Ghidra；请先阅读
+> [`generic-recovery.md`](generic-recovery.md)。下列“锁定”决策仅限本插件，
+> 不是整个项目的默认路径。
 
 ## 0. 锁定决策
 
 | 决策点 | 选择 |
 |---|---|
-| 总体路线 | **方案 B**：Ghidra Headless 反编译 → 伪 C → AST 匹配。无 fallback，单技术栈 |
+| 总体路线 | 本可选插件采用 **方案 B**：Ghidra Headless 反编译 → 伪 C → AST 匹配 |
 | 反编译器调用 | **GhidraScript**（不用 Ghidrathon），输出 JSON 给下游 |
 | AST 解析 | **tree-sitter-c**（出问题再考虑 pycparser） |
 | 阶段优先级 | **Phase 3a（JVMTI 动态）先做**；Phase 3b（本文档静态）后做，并用动态结果交叉验证 |
-| 备选方案 A/C | **不实现**。下面 §3 仅作为方案 B 的对照说明保留 |
+| 备选方案 A/C | 不在本方法体插件中实现；通用表发现由 `binary_introspect` 负责 |
 | `cppsnippets.properties` 模板生成 | **不进主流程**。作为独立可选 feature 提供（见 §10） |
 
 ---
@@ -103,7 +106,7 @@ Ghidra 反编译输出**会非常接近这个**（即便 -O2 把中间过程优�
 - AST 匹配规则的实现复杂度高于方案 A 的指令流匹配
 - 调试不便（Ghidra 内部不易插桩）
 
-**采用作为唯一路径**。
+**仅作为可选的 pseudo-C 方法体路径采用**。
 
 ---
 

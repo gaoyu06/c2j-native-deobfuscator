@@ -37,6 +37,7 @@ class BinaryReport:
     native_registry: list[dict[str, Any]] = field(default_factory=list)
     per_class_lookups: list[dict[str, Any]] = field(default_factory=list)
     cache_table: dict[str, Any] = field(default_factory=dict)
+    analysis: dict[str, Any] = field(default_factory=dict)
 
     def to_json_obj(self) -> dict[str, Any]:
         return {
@@ -58,6 +59,7 @@ class BinaryReport:
             "perClassLookups": self.per_class_lookups,
             "hiddenClasses": self.hidden_classes,
             "cacheTable": self.cache_table,
+            "analysis": self.analysis,
         }
 
 
@@ -319,19 +321,39 @@ def extract_hidden_classes(b: lief.Binary) -> list[dict[str, Any]]:
     return result
 
 
+def _canonical_jni_symbol(name: str, fmt: str) -> str:
+    """Return the JNI lookup name for an exported symbol.
+
+    Mach-O emits C symbols with a leading underscore in the symbol table
+    (``_Java_...``) but the JVM resolves the unprefixed spec name via
+    ``dlsym``. ELF and PE keep the spec name verbatim.
+    """
+    if fmt == "MachO" and name.startswith("_"):
+        return name[1:]
+    return name
+
+
 def extract_exported_functions(b: lief.Binary) -> list[dict[str, Any]]:
+    # Deduplicate by (name, addr), preserving first-seen order. LIEF exposes
+    # each ELF dynamic symbol under more than one accessor on some versions, so
+    # ``exported_symbols`` can list the same export twice; without this a single
+    # Java_* export would be recorded as two identical native-registry entries.
     result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(name: str, addr: str) -> None:
+        key = (name, addr)
+        if key not in seen:
+            seen.add(key)
+            result.append({"name": name, "addr": addr})
+
     if b.format == lief.Binary.FORMATS.PE and b.has_exports:
         for e in b.get_export().entries:
-            result.append({"name": e.name, "addr": hex(b.imagebase + e.address)})
-    elif b.format == lief.Binary.FORMATS.ELF:
+            _add(e.name, hex(b.imagebase + e.address))
+    elif b.format in (lief.Binary.FORMATS.ELF, lief.Binary.FORMATS.MACHO):
         for s in b.exported_symbols:
             if s.name:
-                result.append({"name": s.name, "addr": hex(s.value)})
-    elif b.format == lief.Binary.FORMATS.MACHO:
-        for s in b.exported_symbols:
-            if s.name:
-                result.append({"name": s.name, "addr": hex(s.value)})
+                _add(s.name, hex(s.value))
     return result
 
 
@@ -375,25 +397,73 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
     # per-call fn-count to jar-parser's per-class ACC_NATIVE method count.
     jni_tables = find_jni_method_tables(b, profile=profile)
     jni_tables = attribute_tables_to_classes(jni_tables, strings)
-    # Flatten: one record per RegisterNatives call site, plus one per fnPtr
-    # so downstream consumers can iterate either way.
+    # Preserve each structurally discovered table as a first-class registry
+    # record. Static tables may include exact names/descriptors; stack-built
+    # tables still provide an ordered function-address list.
     flat_methods: list[dict[str, Any]] = []
+    unreadable_tables: list[dict[str, Any]] = []
     for t in jni_tables:
-        flat_methods.append({
+        if t.get("source") == "register-natives-unreadable":
+            # A RegisterNatives call site whose in-image JNINativeMethod[] was
+            # visible (right stride and count) but whose name/descriptor bytes
+            # did not decode. Recorded as an honest gap — no methods, no
+            # fnAddrs are invented from the garbage.
+            gap = {
+                "source": "register-natives-unreadable",
+                "registerNativesCallSite": t["callSite"],
+                "nMethods": t.get("nMethods"),
+                "reason": t.get("reason", "invalid-method-descriptors"),
+                "profile": t.get("profile"),
+                "abi": t.get("abi"),
+            }
+            if t.get("tableAddress"):
+                gap["tableAddress"] = t["tableAddress"]
+            unreadable_tables.append(gap)
+            continue
+        entry = {
+            "source": t.get("source", "register-natives"),
             "registerNativesCallSite": t["callSite"],
             "nMethods": t.get("nMethods"),
             "fnAddrs": t["fnAddrs"],
-        })
+            "profile": t.get("profile"),
+            "abi": t.get("abi"),
+        }
+        if t.get("tableAddress"):
+            entry["tableAddress"] = t["tableAddress"]
+        if t.get("methods"):
+            entry["methods"] = t["methods"]
+        if t.get("classCandidates"):
+            entry["classCandidates"] = t["classCandidates"]
+        flat_methods.append(entry)
+
+    # JNI name-based exports are a second specification-defined registration
+    # mechanism. Keep the encoded symbol intact; manifest-merge resolves it
+    # exactly against classes.json, avoiding ambiguous best-effort demangling.
+    # Mach-O (and other platforms) prefix C symbols with a leading underscore
+    # in the symbol table; dlsym and the JVM look the method up by its
+    # unprefixed spec name, so normalize before recording so the exact
+    # manifest match still succeeds.
+    jni_exports = []
+    for export in exports:
+        symbol = _canonical_jni_symbol(export.get("name", ""), fmt)
+        if symbol.startswith("Java_"):
+            jni_exports.append(
+                {
+                    "source": "jni-export",
+                    "fnSymbol": symbol,
+                    "fnAddr": export["addr"],
+                }
+            )
     native_registry: list[dict[str, Any]] = [
         {"classNameCandidate": name} for name in classes_in_pool
-    ] + flat_methods
+    ] + jni_exports + flat_methods + unreadable_tables
     # JNI ID cache-table: bind every cclasses/cfields/cmethods slot
     # address back to its (owner_slot_addr, name, desc) by scanning the
     # binary for GetField/MethodID call sites. The lifter consumes this
     # to resolve raw DAT_xxxxxxx references in Ghidra pseudo-C back to
     # fully-qualified field/method names.
     cache_table: dict[str, Any] = {}
-    if pool_base is not None:
+    if pool_base is not None and profile.extract_cache_table:
         try:
             from .cache_table import extract_cache_table
             cache_table = extract_cache_table(
@@ -402,6 +472,18 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
             )
         except Exception as exc:  # noqa: BLE001
             cache_table = {"error": f"{type(exc).__name__}: {exc}"}
+
+    analysis: dict[str, Any] = {
+        "profile": profile.name,
+        "methodDiscovery": "jni-spec",
+    }
+    # Only surface the gap fact when there is one, so images with no
+    # unreadable table keep a minimal, stable ``analysis`` block. The detailed
+    # per-site records live in ``nativeRegistry`` under
+    # ``source="register-natives-unreadable"``; this is the honest count the
+    # CLI reports and manifest-merge turns into a binding gap.
+    if unreadable_tables:
+        analysis["unreadableTables"] = len(unreadable_tables)
 
     return BinaryReport(
         schema_version=1,
@@ -418,7 +500,64 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
         native_registry=native_registry,
         per_class_lookups=[],
         cache_table=cache_table,
+        analysis=analysis,
     )
+
+
+def add_emulated_registry(
+    report: BinaryReport, discovery: dict[str, Any]
+) -> None:
+    """Merge method tables captured by the optional emulator into a report."""
+    grouped: dict[str | None, list[dict[str, Any]]] = {}
+    for method in discovery.get("methods") or []:
+        fn_addr = method.get("fnAddr")
+        if not fn_addr:
+            continue
+        item = {
+            key: method[key]
+            for key in ("name", "desc", "fnAddr", "fnSymbol")
+            if method.get(key) is not None
+        }
+        grouped.setdefault(method.get("className"), []).append(item)
+
+    existing = {
+        addr
+        for entry in report.native_registry
+        for addr in (
+            entry.get("fnAddrs")
+            or ([entry["fnAddr"]] if entry.get("fnAddr") else [])
+        )
+    }
+    for class_name, methods in grouped.items():
+        addresses = [m["fnAddr"] for m in methods]
+        matching_table = next(
+            (
+                entry
+                for entry in report.native_registry
+                if entry.get("fnAddrs") == addresses
+            ),
+            None,
+        )
+        if matching_table is not None:
+            matching_table["methods"] = methods
+            matching_table["emulationCaptured"] = True
+            if class_name:
+                matching_table["className"] = class_name
+            continue
+        methods = [m for m in methods if m["fnAddr"] not in existing]
+        if not methods:
+            continue
+        entry: dict[str, Any] = {
+            "source": "register-natives-emulation",
+            "abi": discovery.get("abi"),
+            "fnAddrs": [m["fnAddr"] for m in methods],
+            "nMethods": len(methods),
+            "methods": methods,
+        }
+        if class_name:
+            entry["className"] = class_name
+        report.native_registry.append(entry)
+        existing.update(entry["fnAddrs"])
 
 
 def write_report(report: BinaryReport, out_path: Path) -> None:

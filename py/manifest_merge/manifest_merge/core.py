@@ -7,6 +7,38 @@ from pathlib import Path
 from typing import Any
 
 
+def _jni_mangle(text: str) -> str:
+    """Encode a class, method, or argument descriptor per the JNI spec."""
+    out: list[str] = []
+    encoded = text.encode("utf-16-be")
+    for offset in range(0, len(encoded), 2):
+        unit = int.from_bytes(encoded[offset:offset + 2], "big")
+        char = chr(unit)
+        if (
+            ord("a") <= unit <= ord("z")
+            or ord("A") <= unit <= ord("Z")
+            or ord("0") <= unit <= ord("9")
+        ):
+            out.append(char)
+        elif char == "/":
+            out.append("_")
+        elif char == "_":
+            out.append("_1")
+        elif char == ";":
+            out.append("_2")
+        elif char == "[":
+            out.append("_3")
+        else:
+            out.append(f"_0{unit:04x}")
+    return "".join(out)
+
+
+def _jni_export_names(owner: str, name: str, desc: str) -> tuple[str, str]:
+    short = f"Java_{_jni_mangle(owner)}_{_jni_mangle(name)}"
+    args = desc[1:desc.find(")")] if desc.startswith("(") and ")" in desc else ""
+    return short, f"{short}__{_jni_mangle(args)}"
+
+
 def load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -33,6 +65,8 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
         "classes": [],
         "hiddenClasses": (binary or {}).get("hiddenClasses") or [],
         "cacheTable": (binary or {}).get("cacheTable") or {},
+        "analysis": (binary or {}).get("analysis") or {},
+        "bindingGaps": [],
     }
 
     # Build the candidate-class set from the binary report (Phase 1 hint: which
@@ -54,6 +88,31 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
         for m in entry.get("methods", []):
             fn_index[(cls, m["name"], m["desc"])] = m
 
+    # Bind specification-defined Java_* exports exactly. The binary report
+    # intentionally preserves encoded symbols because demangling alone cannot
+    # reliably distinguish package/class separators from the method separator.
+    exported = {
+        entry.get("fnSymbol"): entry
+        for entry in (binary or {}).get("nativeRegistry") or []
+        if entry.get("source") == "jni-export" and entry.get("fnSymbol")
+    }
+    for cls in classes.get("classes", []):
+        owner = cls.get("name")
+        if not owner:
+            continue
+        for method in cls.get("methods", []):
+            if not method.get("isObfuscatedNative"):
+                continue
+            short, long = _jni_export_names(
+                owner, method["name"], method["desc"]
+            )
+            export = exported.get(long) or exported.get(short)
+            if export:
+                fn_index[(owner, method["name"], method["desc"])] = {
+                    "fnAddr": export.get("fnAddr"),
+                    "fnSymbol": export.get("fnSymbol"),
+                }
+
     # ALSO bind by position: when binary-introspect found a RegisterNatives
     # call site with N fnAddrs, and a jar-parser class has N obfuscated
     # native methods, assume the binary's fn list matches the class's
@@ -70,25 +129,122 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
         nats = [m for m in cls.get("methods", []) if m.get("isObfuscatedNative")]
         if nats:
             class_natives.append((cls["name"], nats))
-    # Match each call site to the first class with a matching native count.
-    # Each class can only be bound once.
+    # Match tables carrying names/descriptors first. This is stronger than
+    # count-only positional matching and is available for static tables and
+    # RegisterNatives calls captured through emulation.
     used_classes: set[str] = set()
+    ambiguous_named_sites: set[int] = set()
     for site in register_sites:
+        methods = site.get("methods") or []
+        if not methods:
+            continue
+        signature = [(m.get("name"), m.get("desc")) for m in methods]
+        candidates = [
+            (cname, nats)
+            for cname, nats in class_natives
+            if [(m.get("name"), m.get("desc")) for m in nats] == signature
+        ]
+        if len(candidates) != 1:
+            if len(candidates) > 1:
+                ambiguous_named_sites.add(id(site))
+            continue
+        cname, nats = candidates[0]
+        used_classes.add(cname)
+        for nat, method in zip(nats, methods):
+            fn_index[(cname, nat["name"], nat["desc"])] = {
+                "fnAddr": method.get("fnAddr"),
+                "fnSymbol": method.get("fnSymbol"),
+            }
+        site["boundTo"] = cname
+
+    # Fall back to positional count matching for stack-built tables whose
+    # string pointers are materialised only at runtime. A count is not enough
+    # evidence to choose between multiple classes: retain an explicit gap
+    # instead of assigning the table according to class iteration order.
+    for site in register_sites:
+        if site.get("boundTo") or id(site) in ambiguous_named_sites:
+            continue
         addrs = site.get("fnAddrs") or []
         n = len(addrs)
         if n == 0:
             continue
-        for cname, nats in class_natives:
-            if cname in used_classes or len(nats) != n:
-                continue
-            used_classes.add(cname)
-            for nat, addr in zip(nats, addrs):
-                fn_index[(cname, nat["name"], nat["desc"])] = {
-                    "fnAddr": addr,
-                    "fnSymbol": f"__j2c_native_{cname.replace('/', '_')}_{nat['name']}",
-                }
+        candidates = [
+            (cname, nats)
+            for cname, nats in class_natives
+            if cname not in used_classes and len(nats) == n
+        ]
+        if len(candidates) > 1:
+            candidate_names = [cname for cname, _nats in candidates]
+            location = (
+                site.get("registerNativesCallSite")
+                or site.get("callSite")
+                or site.get("tableAddress")
+            )
+            gap: dict[str, Any] = {
+                "kind": "ambiguous-count-only-table",
+                "nMethods": n,
+                "candidateClasses": candidate_names,
+                "message": (
+                    f"Native table{f' at {location}' if location else ''} has "
+                    f"{n} method address{'es' if n != 1 else ''} and matches "
+                    f"multiple classes by count ({', '.join(candidate_names)}); "
+                    "left unbound"
+                ),
+            }
+            for key in (
+                "source",
+                "registerNativesCallSite",
+                "callSite",
+                "tableAddress",
+            ):
+                if site.get(key) is not None:
+                    gap[key] = site[key]
+            out["bindingGaps"].append(gap)
+            continue
+        if not candidates:
+            continue
+        cname, nats = candidates[0]
+        used_classes.add(cname)
+        if all((cname, nat["name"], nat["desc"]) in fn_index for nat in nats):
             site["boundTo"] = cname
-            break
+            continue
+        for nat, addr in zip(nats, addrs):
+            fn_index[(cname, nat["name"], nat["desc"])] = {
+                "fnAddr": addr,
+                "fnSymbol": f"__j2c_native_{cname.replace('/', '_')}_{nat['name']}",
+            }
+        site["boundTo"] = cname
+
+    # A RegisterNatives site whose in-image JNINativeMethod[] was visible but
+    # unreadable (encrypted / XOR'd name & descriptor bytes) is carried over
+    # from binary.json as a first-class gap. It has no fnAddrs and no decoded
+    # methods, so the binding loops above never touch it and never bind garbage;
+    # record it as an explicit binding gap rather than letting the unreadable
+    # table disappear from the manifest.
+    for entry in (binary or {}).get("nativeRegistry") or []:
+        if entry.get("source") != "register-natives-unreadable":
+            continue
+        n = entry.get("nMethods")
+        location = (
+            entry.get("registerNativesCallSite") or entry.get("tableAddress")
+        )
+        reason = entry.get("reason", "invalid-method-descriptors")
+        gap = {
+            "kind": "unreadable-table",
+            "nMethods": n,
+            "reason": reason,
+            "message": (
+                f"RegisterNatives table{f' at {location}' if location else ''} "
+                "was seen but its method name/descriptor bytes did not decode "
+                f"({reason}); "
+                f"{n if n is not None else 'unknown'} method"
+                f"{'s' if n != 1 else ''} left unbound"
+            ),
+        }
+        for key in ("source", "registerNativesCallSite", "tableAddress"):
+            if entry.get(key) is not None:
+                gap[key] = entry[key]
+        out["bindingGaps"].append(gap)
 
     lookups_by_class: dict[str, dict[str, Any]] = {}
     for entry in (binary or {}).get("perClassLookups") or []:

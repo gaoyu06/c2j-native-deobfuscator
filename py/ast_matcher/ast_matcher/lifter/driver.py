@@ -25,7 +25,7 @@ from typing import Any
 import tree_sitter
 import tree_sitter_c
 
-from binary_introspect.profile import Profile, detect_profile, get_profile
+from binary_introspect.profile import Profile, get_profile
 
 from .options import LifterOptions
 from .syms import Sym, SymClass, SymFieldId, SymMethodId, SymObject, SymStringLit
@@ -745,7 +745,11 @@ def _emit_if(
     #   * `cVar != 0` body=return0 → skip entirely (exception path)
     #   * `cVar == 0` body=<work>  → fall through into cons straight-
     #     line (no exception so do the work; ignore the implicit alt)
-    if ctx.options.skip_native_exception_guards and ctx.exception_check_vars:
+    if (
+        ctx.options.skip_native_exception_guards
+        and ctx.profile.enable_exception_guard_heuristics
+        and ctx.exception_check_vars
+    ):
         m = re.fullmatch(
             r"(\w+)\s*([!=]=)\s*(?:'\\0'|0|0L|\(char\)\s*0)",
             cond_text,
@@ -772,7 +776,11 @@ def _emit_if(
     # of it is part of the user's JVM code, so skip the whole if outright
     # — we lose the symbol-table side effects (no way to bind cfields[N]
     # to a name in this pass), but the rest of the body stays clean.
-    if ctx.options.skip_native_exception_guards and _looks_like_cache_init(cond_text, cons_text):
+    if (
+        ctx.options.skip_native_exception_guards
+        and ctx.profile.enable_exception_guard_heuristics
+        and _looks_like_cache_init(cond_text, cons_text)
+    ):
         return
 
     # cond+goto-target → IF*
@@ -940,7 +948,10 @@ def lift_ghidra_function(
     from .. import jni_vtable
     options = options or LifterOptions()
     profile = profile or get_profile("generic")
-    code_rewritten = jni_vtable.rewrite_vtable_calls(code)
+    if options.rewrite_ghidra_vtable_calls and profile.rewrite_ghidra_vtable_calls:
+        code_rewritten = jni_vtable.rewrite_vtable_calls(code)
+    else:
+        code_rewritten = code
 
     ctx = _Ctx(
         options=options,
@@ -1020,7 +1031,9 @@ def lift_ghidra_dump(
     profile_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Lift every entry in a ghidra-dump.json into recovered/*.json
-    records. Returns the list of records (caller writes them).
+    records. An explicit profile wins; otherwise use ``analysis.profile``
+    from the supplied manifest/binary report before falling back to
+    conservative ``generic``. Returns the list of records (caller writes them).
     """
     options = options or LifterOptions()
     data = json.loads(ghidra_json_path.read_text(encoding="utf-8"))
@@ -1028,7 +1041,8 @@ def lift_ghidra_dump(
     if manifest_path is not None and manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    profile = get_profile(profile_name) if profile_name else get_profile("generic")
+    artifact_profile = ((manifest or {}).get("analysis") or {}).get("profile")
+    profile = get_profile(profile_name or artifact_profile or "generic")
     pool_entries = (manifest or {}).get("stringPoolEntries") or []
     cache_table = (manifest or {}).get("cacheTable") or {}
 

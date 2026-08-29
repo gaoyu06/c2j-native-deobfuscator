@@ -602,8 +602,9 @@ def lift_ghidra_dump(
 ) -> list[dict[str, Any]]:
     """Lift a ghidra-dump.json into recovered/*.json entries via the
     :mod:`ast_matcher.lifter` package. ``options`` controls per-feature
-    on/off flags; ``profile_name`` selects an obfuscator profile (auto
-    when omitted).
+    on/off flags; ``profile_name`` selects an obfuscator profile. When it is
+    omitted, ``analysis.profile`` from the supplied manifest/binary report is
+    used, with conservative ``generic`` as the final fallback.
 
     Entries without explicit ``(owner, methodName, methodDesc)`` are
     routed through the cstack/clocal AST matcher in :func:`lift_function`

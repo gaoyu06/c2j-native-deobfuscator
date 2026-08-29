@@ -59,6 +59,7 @@ individual stage commands and docs/getting-started.md.
 
 app = typer.Typer(
     add_completion=False,
+    no_args_is_help=True,
     help=HELP,
 )
 console = Console(stderr=True)
@@ -145,13 +146,80 @@ def _run_parse_jar(jar: Path, output: Path) -> None:
     run([jvm_bin("jar-parser"), str(jar), "-o", str(output)])
 
 
-def _run_inspect_binary(lib: Path, output: Path) -> None:
-    from binary_introspect.cli import main as bi_main
-    sys.argv = ["binary-introspect", str(lib), "-o", str(output)]
+def _emulation_script() -> Path:
+    return project_root() / "py" / "native_emulate" / "j2c_emu.py"
+
+
+def _run_native_emulate(args: list[str | Path]) -> None:
+    run([sys.executable, _emulation_script(), *args])
+
+
+def _run_inspect_binary(
+    lib: Path,
+    output: Path,
+    *,
+    profile: str | None = None,
+    emulate_registration: bool = False,
+    registrars: list[str] | None = None,
+) -> None:
+    from binary_introspect.core import (
+        add_emulated_registry,
+        introspect,
+        write_report,
+    )
+
+    report = introspect(lib, profile_name=profile)
+    if emulate_registration:
+        with tempfile.TemporaryDirectory(prefix="j2c-emu-") as tmp:
+            captured = Path(tmp) / "methods.json"
+            args: list[str | Path] = [
+                "recover", lib, "--json-output", captured,
+            ]
+            if registrars:
+                args += ["--registrar", *registrars]
+            _run_native_emulate(args)
+            if captured.exists():
+                add_emulated_registry(
+                    report,
+                    json.loads(captured.read_text(encoding="utf-8")),
+                )
+    write_report(report, output)
+    # Surface the selected profile and registry size so the user can see which
+    # obfuscator variant was detected. bindingGaps are intentionally NOT printed
+    # here: they live on the manifest, not binary.json, and only exist after the
+    # merge stage binds tables to jar classes.
+    selected_profile = (report.analysis or {}).get("profile", "?")
+    # An unreadable table is a visible RegisterNatives site whose method
+    # name/descriptor bytes did not decode; surface the honest count so the
+    # gap is never silently dropped from the human output.
+    unreadable_tables = (report.analysis or {}).get("unreadableTables", 0)
+    console.print(
+        f"inspect-binary: {output} "
+        f"format={report.fmt} arch={report.arch} "
+        f"profile={selected_profile} "
+        f"registry-records={len(report.native_registry)} "
+        f"unreadableTables={unreadable_tables}"
+    )
+
+
+def _print_binding_gaps(manifest: Path) -> None:
+    """Print the manifest's bindingGaps count and kinds to the console.
+
+    bindingGaps are a manifest-level fact (a native table that could not be
+    unambiguously bound to a jar class); they never appear on binary.json.
+    """
     try:
-        bi_main(standalone_mode=False)
-    except SystemExit:
-        pass
+        doc = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    gaps = doc.get("bindingGaps") or []
+    if not gaps:
+        console.print("merge-manifest: bindingGaps=0")
+        return
+    kinds = sorted({str(gap.get("kind", "unknown")) for gap in gaps})
+    console.print(
+        f"merge-manifest: bindingGaps={len(gaps)} kinds={','.join(kinds)}"
+    )
 
 
 def _run_merge_manifest(classes: Path, binary: Optional[Path], output: Path) -> None:
@@ -165,6 +233,7 @@ def _run_merge_manifest(classes: Path, binary: Optional[Path], output: Path) -> 
         mm_main(standalone_mode=False)
     except SystemExit:
         pass
+    _print_binding_gaps(output)
 
 
 def _run_dynamic_trace(run_cmd: str, output: Path) -> None:
@@ -247,9 +316,28 @@ def cli_parse_jar(
 def cli_inspect_binary(
     lib: Path = typer.Argument(..., exists=True, dir_okay=False),
     output: Path = typer.Option(..., "-o", "--output"),
+    profile: Optional[str] = typer.Option(
+        None, "--profile", help="Discovery profile; defaults to auto-detection."
+    ),
+    emulate_registration: bool = typer.Option(
+        False,
+        "--emulate-registration",
+        help="Optionally capture RegisterNatives while emulating exports/JNI_OnLoad.",
+    ),
+    registrar: Optional[list[str]] = typer.Option(
+        None,
+        "--registrar",
+        help="Registrar address for optional emulation (repeatable).",
+    ),
 ):
-    """Parse a .dll/.so/.dylib into binary.json (strings + hidden classes)."""
-    _run_inspect_binary(lib, output)
+    """Create binary.json with a JNI method list; no Ghidra required."""
+    _run_inspect_binary(
+        lib,
+        output,
+        profile=profile,
+        emulate_registration=emulate_registration,
+        registrars=registrar,
+    )
 
 
 @app.command("merge-manifest")
@@ -288,7 +376,7 @@ def cli_static_reverse(
     output: Path = typer.Option(..., "-o", "--output"),
     manifest: Optional[Path] = typer.Option(None, "--manifest"),
 ):
-    """Lift Ghidra pseudo-C dump into recovered/*.json (static path)."""
+    """Optional: lift a Ghidra pseudo-C dump into recovered/*.json."""
     _run_static_reverse(ghidra_dump, output, manifest)
 
 
@@ -301,6 +389,112 @@ def cli_rebuild(
 ):
     """Replace native stubs with recovered bytecode and strip the loader."""
     _run_rebuild(input, recovered, output, manifest)
+
+
+@app.command("synth-stubs")
+def cli_synth_stubs(
+    manifest: Path = typer.Option(
+        ..., "--manifest", exists=True, dir_okay=False
+    ),
+    output: Path = typer.Option(..., "-o", "--output"),
+):
+    """Create bytecode-restoration stubs from a method manifest."""
+    from binary_introspect.stub_recovery import synthesize_stubs
+
+    count = synthesize_stubs(manifest, output)
+    console.print(f"created {count} stub(s) in {output}")
+
+
+@app.command("static-lite")
+def cli_static_lite(
+    jar: Path = typer.Argument(..., exists=True, dir_okay=False),
+    lib: Path = typer.Option(..., "--lib", exists=True, dir_okay=False),
+    output: Path = typer.Option(..., "-o", "--output"),
+    profile: str = typer.Option(
+        "generic", "--profile", help="Method-discovery profile."
+    ),
+    emulate_registration: bool = typer.Option(
+        False,
+        "--emulate-registration",
+        help="Also capture registration through binary emulation.",
+    ),
+    registrar: Optional[list[str]] = typer.Option(
+        None,
+        "--registrar",
+        help="Registrar address for optional emulation (repeatable).",
+    ),
+):
+    """Build binary.json, manifest.json, and stubs without Ghidra."""
+    from binary_introspect.stub_recovery import synthesize_stubs
+
+    output.mkdir(parents=True, exist_ok=True)
+    classes_json = output / "classes.json"
+    binary_json = output / "binary.json"
+    manifest_json = output / "manifest.json"
+    recovered_dir = output / "recovered"
+
+    _run_parse_jar(jar, classes_json)
+    _run_inspect_binary(
+        lib,
+        binary_json,
+        profile=profile,
+        emulate_registration=emulate_registration,
+        registrars=registrar,
+    )
+    _run_merge_manifest(classes_json, binary_json, manifest_json)
+    count = synthesize_stubs(manifest_json, recovered_dir)
+    console.print(
+        f"static-lite wrote binary.json, manifest.json, and "
+        f"{count} stub(s) under {output}"
+    )
+
+
+@app.command("emulate")
+def cli_emulate(
+    lib: Path = typer.Argument(..., exists=True, dir_okay=False),
+    operation: str = typer.Option(
+        "recover", "--operation", help="recover, strings, or call"
+    ),
+    fn: Optional[str] = typer.Option(
+        None, "--fn", help="Function address for strings/call."
+    ),
+    binary_json: Optional[Path] = typer.Option(
+        None, "--binary-json", exists=True, dir_okay=False
+    ),
+    json_output: Optional[Path] = typer.Option(None, "--json-output"),
+    registrar: Optional[list[str]] = typer.Option(
+        None, "--registrar", help="Registrar address (repeatable)."
+    ),
+    arg_bytes: Optional[str] = typer.Option(None, "--arg-bytes"),
+    arg_str: Optional[str] = typer.Option(None, "--arg-str"),
+    static: Optional[list[str]] = typer.Option(
+        None, "--static", help="field=value or field=@file (repeatable)."
+    ),
+):
+    """Optional binary emulation for method, string, and oracle output."""
+    if operation not in {"recover", "strings", "call"}:
+        raise typer.BadParameter("operation must be recover, strings, or call")
+    if operation in {"strings", "call"} and fn is None:
+        raise typer.BadParameter("--fn is required for strings and call")
+
+    args: list[str | Path] = [operation, lib]
+    if fn is not None:
+        args += ["--fn", fn]
+    if operation == "recover":
+        if binary_json is not None:
+            args += ["--binary-json", binary_json]
+        if json_output is not None:
+            args += ["--json-output", json_output]
+        if registrar:
+            args += ["--registrar", *registrar]
+    if operation == "call":
+        if arg_bytes is not None:
+            args += ["--arg-bytes", arg_bytes]
+        if arg_str is not None:
+            args += ["--arg-str", arg_str]
+    if operation in {"strings", "call"} and static:
+        args += ["--static", *static]
+    _run_native_emulate(args)
 
 
 @app.command()

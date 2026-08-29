@@ -29,10 +29,23 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["classId", "className", "methods"],
         "properties": {
+          "source":           { "type": "string" },
+          "reason":           { "type": "string" },
           "classId":          { "type": "integer" },
           "className":        { "type": "string" },
+          "classNameCandidate": { "type": "string" },
+          "profile":          { "type": ["string", "null"] },
+          "abi":              { "type": ["string", "null"] },
+          "registerNativesCallSite": { "type": "string" },
+          "tableAddress":     { "type": "string" },
+          "nMethods":         { "type": ["integer", "null"] },
+          "fnAddr":           { "type": "string" },
+          "fnAddrs": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "fnSymbol":         { "type": ["string", "null"] },
           "registerFunction": {
             "type": ["object", "null"],
             "properties": {
@@ -54,6 +67,14 @@
             }
           }
         }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "methodDiscovery": { "type": "string" },
+        "unreadableTables": { "type": "integer", "minimum": 0 }
       }
     },
     "perClassLookups": {

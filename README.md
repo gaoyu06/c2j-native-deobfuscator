@@ -13,26 +13,24 @@ Three complementary recovery paths:
 | Path | Input | Approach |
 |---|---|---|
 | **Dynamic** | obfuscated jar + a runnable command | Attach a JVMTI agent, observe the JNI call stream, lift it back to JVM bytecode |
-| **Static** | offline manifest + optional Ghidra | Start with generic JNI discovery; when static bodies are needed, decompile each function and lift pseudo-C to JVM bytecode |
+| **Static-lite** | transpiled jar + native blob | Discover JNI method tables, build a manifest, and emit restoration stubs without Ghidra |
+| **Static body** | offline manifest + optional Ghidra | After discovery, optionally decompile each function and lift pseudo-C to JVM bytecode |
 | **Emulation** | obfuscated blob (no run, no Ghidra) | Run the native code under a CPU emulator + mock JNI; recover the method table, dump decrypted constants, and call methods as pure-function oracles |
 
 Offline discovery is a common, **Ghidra-free** first step:
 `parse-jar` reads the JAR declarations, `inspect-binary` inspects JNI entry
 points (direct `Java_*` exports and `RegisterNatives` registrations), and
-`merge-manifest` combines the evidence. The discovery boundary lives in
-[`py/binary_introspect`](py/binary_introspect); broader generic-first coverage
-is being completed on [PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
-Ghidra is only a later option when the JAR cannot run and you want pseudo-C
-from which to recover static method bodies.
+`merge-manifest` combines the evidence. The discovery implementation lives in
+[`py/binary_introspect`](py/binary_introspect); see
+[`docs/generic-recovery.md`](docs/generic-recovery.md). Ghidra is only a later
+option when the JAR cannot run and you want pseudo-C method bodies.
 
-The dynamic/static paths emit an `out.jar` whose native-method stubs are
-replaced with *best-effort recovered bodies* and whose loader / native-blob
-entries are stripped. Coverage is per method: the dynamic path recovers the
-paths a run actually executes, the static path what the decompile lifts
-cleanly — so unobserved or unlifted methods may keep a stub or a partial body.
-Inspect the output and expect manual completion on hard targets. The emulation
-path recovers the C-only secrets the other two can't see (inlined comparisons,
-the `<clinit>` string tables) and gives you an executable oracle.
+The dynamic path and optional method-body plugins can emit an `out.jar` whose
+native-method stubs are replaced with *best-effort recovered bodies*. Coverage
+is per method: unobserved or unlifted methods may keep a stub. Static-lite
+first produces an auditable method manifest and verifier-safe stubs. Emulation
+can add runtime registration data, decrypted constants, and a pure-function
+oracle.
 
 License: **GPLv3**.
 
@@ -101,21 +99,24 @@ fine on its own.
 
 ### Offline discovery (no Ghidra)
 
-- **JAR and JNI discovery** (`jar-parser`, `py/binary_introspect/`,
-  `manifest-merge`). `parse-jar`, `inspect-binary`, and `merge-manifest`
-  build `manifest.json` from the JAR declarations and the JNI mechanisms
-  defined by the specification: direct `Java_*` exports and dynamic
-  `RegisterNatives` registrations. This stage does not require a live JVM or
-  Ghidra. The generic discovery implementation lives in
-  [`py/binary_introspect`](py/binary_introspect); broader generic-first
-  coverage is being completed on
-  [PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+- **JNI-spec table discovery** (`jar-parser`, `py/binary_introspect/`,
+  `manifest-merge`, `capstone`). `parse-jar`, `inspect-binary`, and
+  `merge-manifest` build `manifest.json` from JAR declarations and the JNI
+  mechanisms defined by the specification: direct `Java_*` exports and
+  `RegisterNatives` (vtable index 215, ABI-specific table and length
+  arguments). PE/Microsoft x64, ELF/Mach-O System V, AArch64, ARM, and
+  i386 ELF are supported. Static `JNINativeMethod[]`, stack-built tables,
+  shared call sites, and `Java_*` exports are complementary sources. This
+  stage does not require a live JVM or Ghidra.
+- **Static-lite orchestration** creates `binary.json`, `manifest.json`,
+  and verifier-safe stubs without a decompiler. Registration emulation can
+  optionally supply runtime names and descriptors.
 
 ### Static body recovery (optional Ghidra step)
 
-- **Ghidra decompiler** (`ghidra/scripts/DumpFromManifest.java`,
-  Ghidra Headless). Use this later when the JAR cannot run and you want static
-  method bodies. It reads the `(class, method, fnAddr)` triples from
+- **Optional Ghidra plugin** (`ghidra/scripts/DumpFromManifest.java`,
+  Ghidra Headless). Use this later when the JAR cannot run and you want
+  static method bodies. It reads the `(class, method, fnAddr)` triples from
   `manifest.json` and runs Ghidra's p-code decompiler on each address,
   yielding a single `ghidra-dump.json` with one pseudo-C body per
   method.
@@ -124,15 +125,16 @@ fine on its own.
   recognises `env->FnName(args)` calls (rewritten from
   Ghidra's `(**(code **)(*reg + 0xN))(...)` form), JNI helper patterns,
   and exception-check guards.
-- **Throw-reason inference**. Native-obfuscator family obfuscators emit
+- **Optional throw-reason inference**. Some variants emit
   `"Cannot invoke X.Y.Z(args)"` strings before every would-be Java call
   for use in runtime exception messages. The lifter extracts them as
   invoke hints and uses them as fallback (owner, name, args-desc) when
   symbol tracking can't resolve a jmethodID through obfuscator helpers.
-- **Profile auto-detection**. The active obfuscator's harvest strategy
+- **Profile auto-detection**. A matching variant's harvest strategy
   (per-class vs shared-dispatch), throw-reason regex, and if-guard
   skip rules all come from a :class:`Profile` selected by scanning the
-  binary against built-in detectors.
+  binary against built-in detectors. These heuristics are disabled under
+  `generic`.
 
 ### Emulation path
 
@@ -176,11 +178,11 @@ All three target the same input but trade off coverage versus accuracy:
 
 | | Dynamic | Static | Emulation |
 |---|---|---|---|
-| **Best fit** | Binary is packed / VM-protected / has anti-debug — the JVMTI agent sits at the Java side of the wall so the native protection layer doesn't matter. | Binary is unprotected (e.g. straight native-obfuscator + zig c++ output). Ghidra can decompile each `fnAddr` directly. | Logic is rewritten to pure C (comparisons / crypto / string tables), or the jar won't run **and** Ghidra can't structure the code, or you need the decrypted constants. |
-| **Requires** | A runnable command line (`java -jar ...`) that exercises the obfuscated classes. | Ghidra 11.x installed. | Just the blob + the `unicorn` package. No JVM, no Ghidra. |
-| **Coverage** | Only branches you actually run. | Every method registered through `RegisterNatives`. | Method list + decrypted constants always; per-method behaviour via the oracle. |
-| **Accuracy** | High — every opcode maps to an observed JNI call. | Best-effort — pattern matching on decompiled C, stubs on stack imbalance. | Exact (it executes the real code), but you reverse the algorithm from oracle I/O — it does **not** auto-emit bytecode. |
-| **Speed** | Target run time + agent overhead. | Ghidra auto-analysis (minutes for ~1 MB blobs). | Fast — no Ghidra, no live JVM. |
+| **Best fit** | The JAR runs and can exercise relevant classes. | Standard JNI exports or `RegisterNatives` are visible in a supported binary. | Logic is rewritten to pure C, registration is runtime-built, or decrypted constants are needed. |
+| **Requires** | A runnable command line that exercises the transpiled classes. | JAR + native blob; no Ghidra for method lists/manifests/stubs. Optional Ghidra only for static method bodies. | Native blob + optional `unicorn`; no JVM or Ghidra. |
+| **Coverage** | Only branches actually executed. | Methods whose exports/tables satisfy the structural checks; body recovery is separate. | Methods and constants reached by emulation; per-method behaviour through an oracle. |
+| **Accuracy** | High for observed JNI calls. | Exact metadata for named tables/exports; ordered-address fallback for stack-built tables. | Executes the real native code, but does not automatically emit bytecode. |
+| **Speed** | Target run time + agent overhead. | Fast disassembly and table decoding. | Fast when the relevant entry point is reachable. |
 
 ---
 
@@ -363,28 +365,28 @@ completion on hard targets (see the human-pass note above).
 > (`py\.venv\Scripts\python` on Windows). If setup fell back to `pip`, use the
 > interpreter it installed into instead.
 
-### Offline discovery (no live run, no Ghidra)
+### Offline discovery and static-lite (no live run, no Ghidra)
 
 Start here when the JAR cannot run. These generic discovery stages inspect
-standard JNI exports and `RegisterNatives` registration evidence and produce a
-merged manifest; they do **not** require Ghidra:
+standard JNI exports and `RegisterNatives` registration evidence; they do
+**not** require Ghidra:
 
 ```bash
 scripts/j2c parse-jar      in.jar      -o classes.json
 scripts/j2c inspect-binary natives.bin -o binary.json
 scripts/j2c merge-manifest classes.json binary.json -o manifest.json
+
+# or one command: binary.json + manifest.json + recovered/*.json stubs
+scripts/j2c static-lite in.jar --lib natives.bin --profile generic -o static-lite/
 ```
 
-The generic discovery implementation lives in
-[`py/binary_introspect`](py/binary_introspect); broader generic-first coverage
-is being completed on
-[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+See [`docs/generic-recovery.md`](docs/generic-recovery.md). `inspect-binary`
+prints `profile=`; `merge-manifest` prints `bindingGaps=`.
 
-### Fallback: emulation (no live run, no Ghidra)
+For optional pseudo-C method-body lifting, run Ghidra after static-lite.
+`manifest.json` preserves `analysis.profile` from `binary.json`.
 
-**Use this when the jar won't run in your environment** — e.g. you only have the
-blob, or you need the decrypted C-only constants. It runs the native code under
-a CPU emulator with a mock JNI; no JVM and no Ghidra required:
+### Emulation recovery (no JVM, no Ghidra)
 
 ```bash
 # add unicorn to the workspace interpreter (`scripts/j2c doctor` prints the
@@ -392,13 +394,13 @@ a CPU emulator with a mock JNI; no JVM and no Ghidra required:
 (cd py && uv pip install unicorn)
 
 # list native methods (entry points auto-discovered)
-py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+scripts/j2c emulate natives.bin --operation recover --binary-json binary.json
 
 # dump a function's decrypted string constants (alphabet, secret, messages)
-py/.venv/bin/python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+scripts/j2c emulate natives.bin --operation strings --fn 0x<addr>
 
 # call a native method as a pure function (oracle)
-py/.venv/bin/python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+scripts/j2c emulate natives.bin --operation call --fn 0x<addr> \
     --arg-bytes "input" --static "v=@alphabet.txt"
 ```
 
@@ -441,19 +443,57 @@ scripts/j2c rebuild --input in.jar --recovered recovered/ \
 
 ## Generality
 
-The project ships with two obfuscator **profiles** that auto-detect:
+`generic` is the default fallback and depends on JNI specification facts:
 
-- `native_obfuscator` — radioegor146/native-obfuscator + compatible derivatives
-- `j2cc`              — me.x150.j2cc (single shared `initClass` dispatch)
-- `generic`           — fallback when no profile matches; uses pure JNI-spec knowledge only
+- `RegisterNatives` vtable index 215;
+- ABI-specific argument passing for Microsoft x64, System V x86-64,
+  AArch64 AAPCS64 (`x2` for the method table, `w3`/`x3` for `nMethods`),
+  32-bit ARM AAPCS32 (`r2` for the method table, `r3` for `nMethods`), and
+  32-bit x86/i386 System V cdecl (arguments on the stack: `push $nMethods` /
+  `push methods`);
+- valid `JNINativeMethod` names/descriptors and executable function pointers;
+- specification-defined `Java_*` exports;
+- optional registration capture through binary emulation.
 
-Custom variants can plug in a new profile without touching the main flow.
-See [`docs/adding-obfuscator-profile.md`](docs/adding-obfuscator-profile.md).
+It does not enable throw-message regexes, decompiler-output rewrites,
+cache-table naming assumptions, or exception/cache guard skip patterns.
+Matching variant profiles can opt into those features. Ghidra scripts are
+optional plugins for method-body lifting and are not part of generic method
+discovery.
 
-The static path's lifter exposes every inference / matching step as a
-feature flag (throw-reason hint parsing, ExceptionCheck-guard skipping,
-symbol-table tracking, lookup-table resolution, etc.). Disable a flag
-when it misbehaves on a specific binary:
+Generic discovery is proven by committed fixtures across all three x86-64
+object formats (ELF, PE, Mach-O) and **two distinct registration families** —
+the per-class one-table registrar (a `RegisterNatives` static table or `Java_*`
+export names) and a shared `initClass()`-style dispatcher where one call site
+registers two classes with different `nMethods` (both stack tables recovered,
+not collapsed into one bind). The shared dispatcher is proven from two
+directions: the generic `auto` harvest picking it up on an **ELF** with no named
+detector (`libjni_dispatch_shared.so`, `analysis.profile` stays `generic`), and
+the **named `j2cc` profile detector** firing on a genuine **PE x86-64** image
+(`jni_dispatch_j2cc.dll`) whose `shared_dispatch` strategy recovers both
+Microsoft x64 tables. Coverage also includes a symbol-stripped ELF, an **AArch64**
+ELF (`adrp`/`add` table addressing, JNI dispatch reached through the `x16`
+veneer register), a **Mach-O arm64** dylib (`format=MachO`/`arch=aarch64` with a
+`_Java_*` export, and the static table decoded through the compact single-`adr`
+table addressing when the host Capstone can decode AArch64), a **32-bit ARM**
+ELF (`format=ELF`/`arch=arm` with a `Java_*` export, and the static table
+decoded through the literal-pool + `add r2, pc, r2` table addressing and the
+`ip` veneer register when the host Capstone can decode ARM), a **32-bit
+x86/i386** ELF (`format=ELF`/`arch=x86` cdecl with stack arguments and a
+GOT-base `lea` table address, a genuine `EM_386` image rather than a renamed
+64-bit `.so`), and **section-header-removed ELF** images recovered through a
+`PT_LOAD` program-header fallback. See the proven/unproven matrix in
+[`docs/generic-recovery.md`](docs/generic-recovery.md). This remains a
+development path: it is not promoted to the default `recover` flow, and it does
+not claim to restore method bytecode.
+
+Generic recovery is intentionally bounded: unsupported ABIs, nonstandard or
+encrypted registration that emulation cannot reach, and custom method-body
+layouts still need a profile/backend extension. See
+[`docs/generic-recovery.md`](docs/generic-recovery.md) and
+[`docs/adding-obfuscator-profile.md`](docs/adding-obfuscator-profile.md).
+
+Optional lifter heuristics remain individually switchable:
 
 The flags are not exposed by `scripts/j2c static-reverse`, so drive the lifter
 directly with the workspace interpreter:
@@ -506,6 +546,8 @@ py/.venv/bin/python -m ast_matcher.cli --list-flags
   artifact schemas, extension points
 - [emulation-recovery.md](docs/emulation-recovery.md) — emulation path how-to
   (+ command reference in [`py/native_emulate/README.md`](py/native_emulate/README.md))
+- [generic-recovery.md](docs/generic-recovery.md) — Ghidra-free method discovery,
+  manifests, stubs, and optional emulation
 - [manual-restoration.md](docs/manual-restoration.md) — hand-cleaning recovered output
 - [ROADMAP.md](docs/ROADMAP.md) — known limitations and planned work
 - [adding-obfuscator-profile.md](docs/adding-obfuscator-profile.md) — how

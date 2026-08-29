@@ -16,6 +16,8 @@ def main(classes: Path, binary: Path | None, output: Path) -> None:
     binary_doc = load(binary) if binary else None
     merged = merge(classes_doc, binary_doc)
     write(merged, output)
+    for gap in merged.get("bindingGaps", []):
+        click.echo(f"warning: {gap['message']}", err=True)
     s = stats(merged)
     click.echo(
         f"Wrote {output}\n"

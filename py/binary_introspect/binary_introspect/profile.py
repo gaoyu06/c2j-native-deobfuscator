@@ -11,16 +11,14 @@ path needs to disassemble + lift a native-obfuscator-style binary:
     INVOKE owner/name/desc when symbol-tracking fails)
   - if-guard skip patterns (e.g. `if (env->ExceptionCheck()) return 0;`)
 
-Two built-in profiles ship today:
+The built-in ``generic`` profile owns specification-based discovery. Variant
+profiles only opt into additional harvest/lifter heuristics:
 
-  * ``native_obfuscator`` — radioegor146/native-obfuscator and any
-    derivative that emits the original error-string layout AND uses
-    one RegisterNatives call site per registered class.
+  * ``native_obfuscator`` — a variant that emits one supported error-string
+    layout and uses one RegisterNatives call site per registered class.
 
-  * ``j2cc`` — me.x150.j2cc; inherits the error-string layout from
-    native-obfuscator but uses a single shared ``initClass()`` that
-    dispatches by class name and reuses ONE RegisterNatives call site
-    for every registered class.
+  * ``j2cc`` — a shared ``initClass()`` dispatcher that reuses one
+    RegisterNatives call site for multiple registered classes.
 
 New variants can register themselves by extending :class:`Profile`
 (or copying one of the built-ins) and calling :func:`register_profile`.
@@ -77,23 +75,19 @@ class Profile:
     #: Strategy for extracting method tables from RegisterNatives call
     #: sites. One of:
     #:
+    #:   * ``"auto"`` — generic structural harvest (static or stack table,
+    #:     including multiple branches that share a call site)
     #:   * ``"per_class"``  — one call site = one class's table
     #:   * ``"shared_dispatch"`` — one call site reused by multiple
     #:     classes, with each branch setting its own ``nMethods``
-    harvest_strategy: str = "per_class"
+    harvest_strategy: str = "auto"
 
     # ---------- throw-reason parsing ----------
     #: Regex matching the error-string format emitted before each
     #: would-be Java call. Must define named groups ``owner`` /
     #: ``name`` / ``args``. ``owner`` is dot-separated; ``args`` is a
     #: comma-separated Java-source arg list (e.g. ``"int, java.util.List"``).
-    invoke_error_re: re.Pattern[str] = field(
-        default_factory=lambda: re.compile(
-            r"^Cannot\s+invoke\s+"
-            r"(?P<owner>[\w.$]+)\.(?P<name>[\w$<>]+)"
-            r"\((?P<args>[^)]*)\)$"
-        )
-    )
+    invoke_error_re: re.Pattern[str] | None = None
 
     #: Regex matching the error-string format emitted before each
     #: would-be Java field access. Must define named groups ``op``
@@ -102,11 +96,7 @@ class Profile:
     #: inferred from the enclosing method's declaring class — j2cc and
     #: native-obfuscator both emit the throw at the call site, so the
     #: containing class is almost always the field's owner.
-    field_error_re: re.Pattern[str] = field(
-        default_factory=lambda: re.compile(
-            r'^Cannot\s+(?P<op>read|assign)\s+field\s+"(?P<name>[^"]+)"'
-        )
-    )
+    field_error_re: re.Pattern[str] | None = None
 
     # ---------- if-guard skip patterns ----------
     #: A list of (condition-regex, body-regex) tuples. When the
@@ -116,6 +106,19 @@ class Profile:
     skip_if_patterns: list[tuple[re.Pattern[str], re.Pattern[str]]] = field(
         default_factory=list
     )
+
+    #: Enable additional cross-statement exception/cache guard cleanup.
+    #: This is conservative-off for ``generic`` because those shapes are
+    #: emitted by particular transpilers, not guaranteed by JNI.
+    enable_exception_guard_heuristics: bool = False
+
+    #: Enable rewriting of one decompiler's untyped JNI-vtable pseudo-C.
+    #: Binary discovery never depends on this compatibility helper.
+    rewrite_ghidra_vtable_calls: bool = False
+
+    #: Extract transpiler-specific JNI ID cache tables used by the optional
+    #: pseudo-C lifter. Generic method discovery does not need them.
+    extract_cache_table: bool = False
 
     # ---------- detection ----------
     #: Optional detector. Receives the parsed ``lief.Binary`` and
@@ -284,17 +287,26 @@ _EXCEPTION_CHECK_COND = re.compile(r".*ExceptionCheck\s*\(\)")
 _RETURN_ZERO_BODY = re.compile(
     r"\s*\{?\s*return\s+(?:\([^)]*\)\s*)?(?:0|0L|NULL|nullptr|\(jobject\)\s*0x0)\s*;\s*\}?\s*"
 )
+_INVOKE_ERROR_RE = re.compile(
+    r"^Cannot\s+invoke\s+"
+    r"(?P<owner>[\w.$]+)\.(?P<name>[\w$<>]+)"
+    r"\((?P<args>[^)]*)\)$"
+)
+_FIELD_ERROR_RE = re.compile(
+    r'^Cannot\s+(?P<op>read|assign)\s+field\s+"(?P<name>[^"]+)"'
+)
 
 
 # Register the built-ins ------------------------------------------------------
 
 register_profile(Profile(
     name="generic",
-    description="Minimal fallback. Standard JNI vtable, no obfuscator-specific tricks.",
+    description="JNI-spec fallback: ABI-aware registration, static/stack tables, and exports.",
     arch_filter=(),
     os_filter=(),
-    harvest_strategy="per_class",
+    harvest_strategy="auto",
     skip_if_patterns=[],   # do not skip anything by default
+    detector=lambda _binary: 0.01,
 ))
 
 register_profile(Profile(
@@ -303,7 +315,12 @@ register_profile(Profile(
     arch_filter=("x86_64",),
     os_filter=(),               # Windows + Linux both work
     harvest_strategy="per_class",
+    invoke_error_re=_INVOKE_ERROR_RE,
+    field_error_re=_FIELD_ERROR_RE,
     skip_if_patterns=[(_EXCEPTION_CHECK_COND, _RETURN_ZERO_BODY)],
+    enable_exception_guard_heuristics=True,
+    rewrite_ghidra_vtable_calls=True,
+    extract_cache_table=True,
     detector=_detect_native_obfuscator,
 ))
 
@@ -313,6 +330,11 @@ register_profile(Profile(
     arch_filter=("x86_64",),
     os_filter=("windows",),
     harvest_strategy="shared_dispatch",
+    invoke_error_re=_INVOKE_ERROR_RE,
+    field_error_re=_FIELD_ERROR_RE,
     skip_if_patterns=[(_EXCEPTION_CHECK_COND, _RETURN_ZERO_BODY)],
+    enable_exception_guard_heuristics=True,
+    rewrite_ghidra_vtable_calls=True,
+    extract_cache_table=True,
     detector=_detect_j2cc,
 ))
