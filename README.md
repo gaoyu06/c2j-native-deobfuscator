@@ -354,9 +354,11 @@ Every stage has its own subcommand under `j2c-dumper`; see
 `generic` is the default fallback and depends on JNI specification facts:
 
 - `RegisterNatives` vtable index 215;
-- ABI-specific argument registers for Microsoft x64, System V x86-64,
-  AArch64 AAPCS64 (`x2` for the method table, `w3`/`x3` for `nMethods`), and
-  32-bit ARM AAPCS32 (`r2` for the method table, `r3` for `nMethods`);
+- ABI-specific argument passing for Microsoft x64, System V x86-64,
+  AArch64 AAPCS64 (`x2` for the method table, `w3`/`x3` for `nMethods`),
+  32-bit ARM AAPCS32 (`r2` for the method table, `r3` for `nMethods`), and
+  32-bit x86/i386 System V cdecl (arguments on the stack: `push $nMethods` /
+  `push methods`);
 - valid `JNINativeMethod` names/descriptors and executable function pointers;
 - specification-defined `Java_*` exports;
 - optional registration capture through binary emulation.
@@ -368,18 +370,22 @@ optional plugins for method-body lifting and are not part of generic method
 discovery.
 
 Generic discovery is proven by committed fixtures across all three x86-64
-object formats (ELF, PE, Mach-O) and both registration families (a
-`RegisterNatives` static table and `Java_*` export names), including a
-symbol-stripped ELF, an **AArch64** ELF (`adrp`/`add` table addressing, JNI
-dispatch reached through the `x16` veneer register), a **Mach-O arm64** dylib
-(`format=MachO`/`arch=aarch64` with a `_Java_*` export, and the static table
-decoded through the compact single-`adr` table addressing when the host
-Capstone can decode AArch64), a **32-bit ARM** ELF (`format=ELF`/`arch=arm`
-with a `Java_*` export, and the static table decoded through the
-literal-pool + `add r2, pc, r2` table addressing and the `ip` veneer register
-when the host Capstone can decode ARM), and **section-header-removed ELF**
-images recovered through a `PT_LOAD` program-header fallback. See the
-proven/unproven matrix in
+object formats (ELF, PE, Mach-O) and **two distinct registration families** —
+the per-class one-table registrar (a `RegisterNatives` static table or `Java_*`
+export names) and a shared `initClass()`-style dispatcher where one call site
+registers two classes with different `nMethods` (both stack tables recovered,
+not collapsed into one bind) — including a symbol-stripped ELF, an **AArch64**
+ELF (`adrp`/`add` table addressing, JNI dispatch reached through the `x16`
+veneer register), a **Mach-O arm64** dylib (`format=MachO`/`arch=aarch64` with a
+`_Java_*` export, and the static table decoded through the compact single-`adr`
+table addressing when the host Capstone can decode AArch64), a **32-bit ARM**
+ELF (`format=ELF`/`arch=arm` with a `Java_*` export, and the static table
+decoded through the literal-pool + `add r2, pc, r2` table addressing and the
+`ip` veneer register when the host Capstone can decode ARM), a **32-bit
+x86/i386** ELF (`format=ELF`/`arch=x86` cdecl with stack arguments and a
+GOT-base `lea` table address, a genuine `EM_386` image rather than a renamed
+64-bit `.so`), and **section-header-removed ELF** images recovered through a
+`PT_LOAD` program-header fallback. See the proven/unproven matrix in
 [`docs/generic-recovery.md`](docs/generic-recovery.md). This remains a
 development path: it is not promoted to the default `recover` flow, and it does
 not claim to restore method bytecode.

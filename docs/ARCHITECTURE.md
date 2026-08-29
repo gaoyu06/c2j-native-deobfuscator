@@ -101,11 +101,14 @@ package. Each module registers an :class:`Abi` with:
 
 - pointer size
 - capstone arch + mode
-- register set holding `nMethods` for the calling convention
-- methods to recognise indirect-vtable calls + PC-relative LEAs +
-  stack stores
+- register set holding `nMethods` for the calling convention (empty for a
+  stack-argument ABI such as i386 cdecl, which reads the pushed `nMethods`
+  immediate instead)
+- methods to recognise indirect-vtable calls + PC-relative / GOT-relative
+  "address of constant" forms + stack stores
 
-Built-ins: `amd64-windows`, `amd64-sysv`.
+Built-ins: `amd64-windows`, `amd64-sysv`, `i386-sysv` (32-bit x86 cdecl),
+`aarch64-aapcs64` (64-bit ARM, ELF + Mach-O), and `arm-aapcs32` (32-bit ARM).
 
 ### Lifter feature flags
 

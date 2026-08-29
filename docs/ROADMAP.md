@@ -48,14 +48,16 @@ the resulting `String[]` field via reflection). A dedicated
 
 ### Architectures
 
-Four ABIs ship today: `amd64-windows`, `amd64-sysv`, `aarch64-aapcs64`
-(64-bit ARM, ELF + Mach-O), and `arm-aapcs32` (32-bit ARM ELF). Each is
-backed by a committed real-binary fixture and an assertion in
-`test_generic_discovery.py`; see [generic-recovery.md](generic-recovery.md)
-for the proven matrix.
+Five ABIs ship today: `amd64-windows`, `amd64-sysv`, `aarch64-aapcs64`
+(64-bit ARM, ELF + Mach-O), `arm-aapcs32` (32-bit ARM ELF), and `i386-sysv`
+(32-bit x86 ELF, cdecl — arguments passed on the stack rather than in
+registers). Each is backed by a committed real-binary fixture and an assertion
+in `test_generic_discovery.py`; see [generic-recovery.md](generic-recovery.md)
+for the proven matrix. Two registration families are proven there as well: the
+per-class one-table registrar and a shared `initClass()`-style dispatcher.
 
-Adding a further architecture (for example MIPS, RISC-V, or 32-bit x86)
-follows the same recipe:
+Adding a further architecture (for example MIPS or RISC-V) follows the same
+recipe:
 
 - a new `binary_introspect/arch/<arch>*.py` with that architecture's
   capstone setup, PC-relative "address of constant" decoding, and the
@@ -63,7 +65,11 @@ follows the same recipe:
   `nMethods`);
 - adapting `is_indirect_vtable_call` / `vtable_slot_load` /
   `decode_pc_relative_lea` / `is_stack_store` for the architecture's
-  idioms, then registering the `Abi` so `detect_abi` selects it.
+  idioms, then registering the `Abi` so `detect_abi` selects it. A
+  stack-argument ABI (such as i386 cdecl) instead leaves the argument
+  registers empty and overrides `is_n_methods_load` to read the pushed
+  `nMethods` immediate, with `decode_pc_relative_lea` folding any
+  GOT-base/PC-thunk address form back to an absolute VA.
 
 Until an ABI is registered, `detect_abi` returns `None` for that machine
 type and discovery yields an empty registry with no fabricated methods.

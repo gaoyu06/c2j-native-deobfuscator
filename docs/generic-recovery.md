@@ -16,6 +16,7 @@ The current binary introspection and emulation backends support:
 | ELF or Mach-O x86-64 | System V | `rdx` | `ecx` / `rcx` |
 | ELF or Mach-O aarch64 | AAPCS64 | `x2` | `w3` / `x3` |
 | ELF 32-bit ARM | AAPCS32 | `r2` | `r3` |
+| ELF 32-bit x86 (i386) | System V (cdecl) | stack (`push`) | stack (`push $imm`) |
 
 `RegisterNatives` is identified as JNI vtable index 215. The scanner reads
 
@@ -23,9 +24,11 @@ The current binary introspection and emulation backends support:
 
 Generic discovery started as an ELF-only, single-table proof. It is now
 exercised by committed fixtures across all three x86-64 object formats,
-non-x86-64 images (64-bit AArch64 and 32-bit ARM), section-header-removed
-images, and both registration families, so the path is no longer tied to one
-workflow. Each row
+non-x86-64 images (64-bit AArch64, 32-bit ARM, and 32-bit x86/i386),
+section-header-removed images, and **two distinct registration families** — the
+per-class one-table registrar and a shared `initClass()`-style dispatcher (one
+call site, several tables) — so the path is no longer tied to one workflow or a
+single obfuscator shape. Each row
 below is backed by a real binary in `py/binary_introspect/tests/fixtures/`
 (source `.c` + built binary, or a derivation of a committed base) and an
 assertion in `test_generic_discovery.py`:
@@ -35,6 +38,8 @@ assertion in `test_generic_discovery.py`:
 | ELF x86-64 | System V | `RegisterNatives` static table decoded to names/descriptors/addresses via relocations | `libjni_registrar.so` |
 | ELF x86-64 (symbols stripped) | System V | Same table still recovered after `strip --strip-all` (no `.symtab`); no silent empty result | `libjni_registrar.stripped.so` |
 | ELF x86-64 (exports only) | System V | Second registration family: methods registered purely by `Java_*` export names, **no** table | `libjni_exports_only.so` |
+| **ELF x86-64 (shared dispatch)** | System V | Second registration **family** beyond a single obfuscator: one shared `RegisterNatives` call site reached by two branches registers two classes with different `nMethods` (2 and 3). The generic `auto` harvest recovers **both** stack-built tables from the one site — two independently sized `nMethods` groups whose fnAddrs cross-check the export addresses — instead of collapsing them into one silent bind. No names are decoded and no methods are fabricated for the stack tables | `libjni_dispatch_shared.so` (asm) |
+| **ELF 32-bit x86 (i386)** | System V (cdecl) | A genuine `(ELF, EM_386)` image: `format=ELF`/`arch=x86` reported, `detect_abi` selects `i386-sysv`, and a `Java_*` export is recorded. cdecl passes `RegisterNatives` arguments on the stack (`push $nMethods` / `push methods`); PIC forms the table address through the GOT-base register (`call`/`pop`/`add` PC thunk, then `lea disp(%ebx), %edx`), which the backend folds back so the static table decodes to names/descriptors whose fnPtrs (from `R_386_32` relocations) cross-check the export addresses. Not a renamed 64-bit `.so` | `libjni_registrar_i386.so` |
 | PE x86-64 | Microsoft x64 | Static table (r8/r9d) decoded to names/addresses **and** a `Java_*` export recorded | `jni_registrar.dll` |
 | Mach-O x86-64 | System V | Static table decoded to names/addresses **and** a `_Java_*` export normalized to the spec name | `libjni_registrar.dylib` |
 | **ELF aarch64** | AAPCS64 | Static table decoded via `adrp`/`add` table addressing and `R_AARCH64_ABS64` fnPtr relocations; the split JNI dispatch is followed through the `x16` veneer register (`ldr`/`mov x16`/`br x16`); a `Java_*` export is recorded | `libjni_registrar_aarch64.so` |
@@ -49,8 +54,13 @@ present (`x86_64-w64-mingw32-gcc` for PE, `clang` + `ld64.lld` for both Mach-O
 fixtures — `-target x86_64-apple-macos` and `-target arm64-apple-macos`, or
 `zig cc -target aarch64-macos` for the arm64 one — `aarch64-linux-gnu-gcc` or
 `zig cc -target aarch64-linux-gnu` for the AArch64 ELF, `arm-linux-gnueabi-gcc`
-or `zig cc -target arm-linux-gnueabi` for the 32-bit ARM ELF, the host `cc` +
-`strip` for x86-64 ELF). The section-header-removed images
+or `zig cc -target arm-linux-gnueabi` for the 32-bit ARM ELF, the host `cc`
+assembler for the shared-dispatch `.s`, an i386 toolchain
+(`i686-linux-gnu-gcc`, `zig cc -target x86-linux-gnu`,
+`clang --target=i386-linux-gnu`, or `gcc -m32`) for the i386 ELF, and the host
+`cc` + `strip` for x86-64 ELF). If no i386 toolchain is present the committed
+`libjni_registrar_i386.so` is kept and **no** 64-bit `.so` is renamed to stand
+in for it. The section-header-removed images
 are derived from the committed base binaries by `strip_section_headers.py` (a
 dependency-free `sstrip` equivalent). The built binaries are committed so the
 suite runs without any toolchain; the base ELF is a committed input and is not
@@ -90,6 +100,48 @@ relocations while the name/descriptor pointers are read from their inline
 the `Java_*` export is still parsed from the symbol table via LIEF and **no**
 methods are fabricated.
 
+### i386 (cdecl, stack arguments) disassembly notes
+
+The i386 System V C calling convention passes **every** argument on the stack,
+so `RegisterNatives` is four `push` instructions (right-to-left:
+`push $nMethods` first) followed by an indirect call through the vtable slot
+(`call *0x35c(%ecx)`, i.e. `215 * 4`). The `i386-sysv` backend therefore reads
+the count from a pushed immediate (bounded to a plausible table size so a pushed
+pointer is never mistaken for a count) rather than from a register move.
+Position-independent i386 has no RIP-relative addressing; it materialises the
+Global Offset Table base into a register with a PC thunk — clang's inline
+`call .Lnext` / `pop %ebx` / `add $off, %ebx`, or gcc's out-of-line
+`call __x86.get_pc_thunk.reg` / `add $off, %reg` — and then reaches the table
+with `lea disp(%ebx), %edx`. The backend tracks the GOT-base register across
+either thunk form and folds the GOT-relative `lea` back to the absolute table
+VA, after which the architecture-agnostic decoder reads the table exactly as on
+x86-64. The zeroed `fnPtr` slots are filled from `R_386_32` relocations while
+the name/descriptor pointers are read from their inline `R_386_RELATIVE` values.
+Every capstone build carries the base x86 decoder, so 32-bit x86 is effectively
+always disassemblable; the test still guards on it and, on the hypothetical
+build that cannot decode it, claims no table and fabricates no methods while the
+`Java_*` export (from LIEF's symbol table) still stands.
+
+### Shared-dispatch registration (one call site, several tables)
+
+The second registration family beyond the per-class registrar is a shared
+`initClass()`-style dispatcher: one `RegisterNatives` call site is reached by
+several branches, each building its own `JNINativeMethod[]` (on the stack) with
+its own `nMethods`. The generic `auto` harvest splits such a site on each
+`nMethods` boundary and emits one `register-natives-stack` table per branch —
+recovering two independently sized `nMethods` groups from a single call rather
+than collapsing them into one silent bind. The committed
+`libjni_dispatch_shared.so` fixture is hand-written x86-64 assembly on purpose:
+a stack-built shared dispatcher's instruction shape is not stable across C
+compilers or optimisation levels (PIC routes function pointers through the GOT,
+stores get vectorised, and one if/else branch is laid out *after* the merged
+call, outside the back-scan window), so a fixed assembly sequence keeps the
+fixture a faithful, reproducible model with both branches before the shared
+call. Stack-built tables expose an ordered `fnAddrs` list and a per-branch
+`nMethods` but no decoded names; `manifest-merge` binds them by count and
+**records a `bindingGaps` entry** whenever a branch's count matches more than
+one class, never guessing a bind.
+
 ### Section-header-removed ELF (`PT_LOAD` fallback)
 
 When an ELF has had its section header table removed (`e_shoff`/`e_shnum`
@@ -109,19 +161,27 @@ These are acknowledged gaps, not silent successes — the code either records an
 honest gap, raises, or returns nothing observable rather than a fabricated
 binding:
 
-- Architectures without a registered ABI backend (for example MIPS, RISC-V, or
-  32-bit x86). `detect_abi` returns `None`, so discovery yields an empty
-  registry with no fabricated methods. (32-bit ARM ELF is now proven — see the
-  table above — as are x86-64 PE/Mach-O/ELF and 64-bit ARM in both ELF and
+- Architectures without a registered ABI backend (for example MIPS or RISC-V).
+  `detect_abi` returns `None`, so discovery yields an empty registry with no
+  fabricated methods. (32-bit x86/i386 ELF is now proven — see the table above —
+  as are 32-bit ARM ELF, x86-64 PE/Mach-O/ELF, and 64-bit ARM in both ELF and
   Mach-O.)
 - A section-header-removed ELF that a particular LIEF build cannot map through
   its program headers. Introspection raises an honest error in that case (the
   tests encode both outcomes); it never silently succeeds.
+- 32-bit x86 on Windows (PE `IMAGE_FILE_MACHINE_I386`), whose `JNICALL` is
+  `__stdcall` rather than the ELF cdecl proven above. `detect_abi` matches only
+  ELF `EM_386`, so a PE i386 image yields an empty registry with no fabricated
+  methods until a dedicated backend is added.
 - Encrypted or runtime-decrypted method tables that emulation cannot reach.
-- Custom dispatch that does not preserve `JNINativeMethod[]` order.
+- Custom dispatch that does not preserve `JNINativeMethod[]` order. (A shared
+  `initClass()` dispatcher that *does* preserve per-branch table order is now
+  proven — see the shared-dispatch fixture above.)
 
 Whenever a `RegisterNatives` table is count-only or matches multiple classes by
-count, `manifest-merge` records it in `bindingGaps` instead of guessing a bind.
+count — including each branch of a shared-dispatch call site — `manifest-merge`
+records it in `bindingGaps` instead of guessing a bind. The default `recover`
+pipeline is unchanged by this work.
 
 
 Capstone operands, not rendered instruction text. It then requires supporting

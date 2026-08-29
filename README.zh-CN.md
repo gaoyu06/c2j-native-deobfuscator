@@ -303,8 +303,9 @@ python -m j2c_dumper_cli.main emulate natives.bin --operation call --fn 0x<addr>
 
 - `RegisterNatives` 的 vtable 索引 215；
 - Microsoft x64、System V x86-64、AArch64 AAPCS64（方法表用 `x2`，
-  `nMethods` 用 `w3`/`x3`）与 32 位 ARM AAPCS32（方法表用 `r2`，
-  `nMethods` 用 `r3`）的参数寄存器；
+  `nMethods` 用 `w3`/`x3`）、32 位 ARM AAPCS32（方法表用 `r2`，
+  `nMethods` 用 `r3`）与 32 位 x86/i386 System V cdecl（参数走栈：
+  `push $nMethods` / `push methods`）的参数传递方式；
 - 合法的 `JNINativeMethod` 名称/descriptor 与可执行函数指针；
 - 规范定义的 `Java_*` 导出；
 - 可选的二进制模拟注册捕获。
@@ -314,13 +315,17 @@ guard 跳过。匹配的变体 Profile 可以按需开启这些能力。Ghidra �
 方法体插件，不参与通用方法发现。
 
 通用发现已由提交入库的 fixture 证明：覆盖三种 x86-64 目标格式（ELF、PE、
-Mach-O）、两种注册族（`RegisterNatives` 静态表与 `Java_*` 导出名），并包含
+Mach-O）、**两种不同的注册族**——按类的单表注册器（`RegisterNatives` 静态表
+或 `Java_*` 导出名）与共享 `initClass()` 式分发器（一个调用点为两个类注册、
+`nMethods` 各不相同，两张栈表都被恢复而非折叠成一次绑定），并包含
 符号剥离 ELF、**AArch64** ELF（`adrp`/`add` 取表地址，JNI 分发经 `x16`
 中转寄存器）、**Mach-O arm64** dylib（报告 `format=MachO`/`arch=aarch64` 与
 `_Java_*` 导出；当宿主 Capstone 能反汇编 AArch64 时，静态表还会经紧凑的单条
 `adr` 取表地址方式解出）、**32 位 ARM** ELF（报告 `format=ELF`/`arch=arm` 与
 `Java_*` 导出；当宿主 Capstone 能反汇编 ARM 时，静态表还会经字面量池 +
-`add r2, pc, r2` 取表地址与 `ip` 中转寄存器解出），以及**删除节头表**
+`add r2, pc, r2` 取表地址与 `ip` 中转寄存器解出）、**32 位 x86/i386** ELF
+（报告 `format=ELF`/`arch=x86`，cdecl 走栈传参、经 GOT 基址 `lea` 取表地址，
+是真正的 `EM_386` 镜像而非改名的 64 位 `.so`），以及**删除节头表**
 （section header table）后仅靠 `PT_LOAD` 程序头兜底恢复的 ELF。完整
 “已证明/未证明”对照见
 [`docs/generic-recovery.md`](docs/generic-recovery.md)。该路径仍是开发中能力：
