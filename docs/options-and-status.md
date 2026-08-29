@@ -29,7 +29,7 @@ review can be skipped.
 |---:|---|---|---|
 | **#2** | Design-theory assessment and PR sequence; documentation only and mergeable as documentation. | **Yes, as docs.** | Owner documentation sign-off only. |
 | **#3** | Genericity audit; documentation only. | **Yes, as docs.** | Owner factual spot-check only. |
-| **#4** | Generic-first discovery at `30775d85a0bfb0c8a553c1d3aa5019d4ec38b0a1`. In addition to the earlier format and architecture fixtures, committed fixtures now prove a shared-dispatch second registration family that recovers two tables from one `RegisterNatives` site, plus a genuine i386 ELF through the System V cdecl backend. | **Yes: ship-as-draft-dev; not as the default release.** | Yes before default promotion. Architectures without a registered ABI backend and encrypted or shuffled tables remain unproven. |
+| **#4** | Generic-first discovery at `7643877759f2354b864908ae4c47a9a76764cfc8`. In addition to the earlier format and architecture fixtures, a committed genuine PE x86-64 DLL now makes the named `j2cc` detector fire on a real image, and a Microsoft x64 shared-dispatch harvest recovers two tables from one `RegisterNatives` site. The separate generic ELF shared-dispatch proof is unchanged. | **Yes: ship-as-draft-dev; not as the default release.** | Yes before default promotion. Encrypted, runtime-decrypted, or shuffled tables and unregistered ABIs (MIPS, RISC-V, PE i386 stdcall) remain unproven. |
 | **#5** | Platform plan selecting Swing + FlatLaf and recording reserved decisions; documentation only. | **Yes, as docs.** | Owner documentation sign-off only. |
 | **#6** | `doctor`, setup scripts, launchers, and getting-started material at `52ddeb3ed97a66316fce8be50d9242a71ce71ca0`. Offline discovery is documented as `parse-jar` + `inspect-binary` + `merge-manifest`, with Ghidra optional; `recover` still defaults to dynamic recovery. JDK 17 is retained. | **Yes: ship-as-draft.** | Normal merge review remains; neither a JDK migration nor an offline `recover` default is implied. |
 | **#7** | Native-x86 process inspection, library instrumentation, and plugin ABI at `1817e2d664b0a72269f188cbc4a9ddc342b62f0a`. Linux smoke passes sections 1–15. Windows supports read-only module/export observation, with no live breakpoints. No kernel component is shipped. | **Yes: ship-as-preview-draft only.** | Yes for later promotion, broader platform support, ABI trust, and transport decisions. |
@@ -45,7 +45,7 @@ review can be skipped.
 ### Generic-first discovery (#4)
 
 - The reviewed revision is
-  `30775d85a0bfb0c8a553c1d3aa5019d4ec38b0a1`.
+  `7643877759f2354b864908ae4c47a9a76764cfc8`.
 - Committed x86-64 fixtures exercise real PE, Mach-O, stripped ELF without
   `.symtab`, and exports-only ELF images.
 - Committed fixtures also exercise a real AArch64 ELF and a
@@ -55,22 +55,47 @@ review can be skipped.
 - A real Mach-O arm64 dylib now proves that format and architecture.
 - A committed real ELF32 ARM fixture and its tests now prove 32-bit ARM ELF
   discovery through the AAPCS32 backend.
-- A shared `initClass()`-style dispatcher proves a second registration family:
-  two independently sized tables are recovered from branches reaching one
-  `RegisterNatives` site instead of being collapsed into one silent binding.
 - A genuine i386 ELF fixture proves 32-bit x86 discovery through the System V
   cdecl backend, including stack arguments and GOT-relative table addressing.
+- `py/binary_introspect/tests/fixtures/jni_dispatch_j2cc.dll`, assembled from
+  the committed `jni_dispatch_j2cc.s`, is a genuine PE x86-64 image: it starts
+  with `MZ`, LIEF parses it as PE, its machine value is `0x8664`, and its
+  sha256 is
+  `6676142d1127ba8f9e4314a76f1d8a34db4695bfdf9fd317374c867d3312f563`.
+- The named `j2cc` detector now fires on that real DLL, reporting
+  `analysis.profile == "j2cc"`. Previously the named detector was proved only
+  against a mocked LIEF object.
+- On that fixture the `shared_dispatch` harvest on the Microsoft x64 backend
+  recovers two stack-built tables, with `nMethods` 2 and 3, from a single
+  `RegisterNatives` site at `0x1800010ef`; the reported abi is
+  `amd64-windows`, and the only `Java_*` exports are
+  `Java_com_example_Boot_initClass` and `Java_com_example_Boot_bootstrap`.
+- The existing `jni_registrar.dll` fixture still selects `generic`, so the
+  named detector is not being applied indiscriminately to PE images.
+- The ELF `libjni_dispatch_shared.so` fixture still proves the generic `auto`
+  shared-dispatch harvest with `profile=generic`. That proof and the new PE
+  `j2cc` proof are separate; neither replaces the other.
 - Ambiguous count-only matching is represented with `bindingGaps`; it is not
   silently treated as a complete binding, including for each shared-dispatch
   branch.
+- On the command line, `inspect-binary` prints `profile=` on stderr and
+  `merge-manifest` prints `bindingGaps=<n> kinds=…`. `bindingGaps` is a
+  reported count only; it is not written into `binary.json`.
+- Independently re-run `pytest` reports 31 passed for `binary_introspect`,
+  5 for `manifest_merge`, and 3 for `j2c_dumper_cli`.
 - The branch can **ship-as-draft-dev**.
-- The `recover` default is unchanged.
+- The `recover` default is unchanged; the branch shows no diff against `main`
+  for `recover` behavior.
 - It is not the default release path.
-- Architectures without a registered ABI backend, including 32-bit Windows
-  x86, and encrypted or shuffled tables remain unproven.
+- Encrypted or runtime-decrypted tables, shuffled tables, and architectures
+  without a registered ABI backend — including MIPS, RISC-V, and PE i386
+  stdcall — remain unproven.
 
 The consequence is deliberate: developers can continue validating the generic
 path without presenting incomplete platform coverage as a released default.
+Two reviewer nits are non-blocking: a split paragraph in
+`docs/generic-recovery.md`, and wording that describes `recover` as using the
+generic path when it in fact auto-detects with a generic fallback.
 
 ### Setup and launchers (#6)
 
@@ -200,7 +225,13 @@ the recommendation, and the consequence of adopting it.
 
 - The generic path is **not** the default release path.
 - Generic discovery does **not** cover architectures without a registered ABI
-  backend or encrypted or shuffled tables.
+  backend — including MIPS, RISC-V, and PE i386 stdcall — and does **not**
+  cover encrypted, runtime-decrypted, or shuffled tables.
+- A named `j2cc` profile on one real PE fixture does **not** make named-profile
+  detection general; the existing PE registrar fixture still resolves to
+  `generic`.
+- `bindingGaps` is **not** persisted in `binary.json`; it is reported by
+  `merge-manifest` on stderr.
 - Documenting the offline discovery sequence does **not** change `recover`;
   dynamic recovery remains its default.
 - Live attach is **not** equivalent to startup instrumentation and is often
@@ -233,10 +264,14 @@ the recommendation, and the consequence of adopting it.
 
 - #4 now has committed x86-64 PE, Mach-O, stripped-ELF-without-`.symtab`, and
   exports-only ELF fixtures, plus real AArch64 ELF, real ELF32 ARM, genuine
-  i386 ELF, section-header-removed ELF, and real Mach-O arm64 fixtures. Its
-  shared-dispatch fixture recovers two tables from one `RegisterNatives` site.
-  Default promotion remains blocked on evidence for architectures without a
-  registered ABI backend and encrypted or shuffled tables.
+  i386 ELF, section-header-removed ELF, and real Mach-O arm64 fixtures. A
+  genuine PE x86-64 DLL makes the named `j2cc` detector fire on a real image,
+  and its Microsoft x64 shared-dispatch harvest recovers two tables from one
+  `RegisterNatives` site; the ELF fixture separately proves the generic
+  shared-dispatch harvest. Default promotion remains blocked on evidence for
+  encrypted, runtime-decrypted, or shuffled tables and for architectures
+  without a registered ABI backend, including MIPS, RISC-V, and PE i386
+  stdcall.
 - #7 needs explicit plugin trust and transport decisions, additional platform
   evidence beyond Linux smoke sections 1–15 and Windows read-only module/export
   observation, and a separate promotion review before it can move beyond
