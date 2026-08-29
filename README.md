@@ -374,7 +374,12 @@ object formats (ELF, PE, Mach-O) and **two distinct registration families** —
 the per-class one-table registrar (a `RegisterNatives` static table or `Java_*`
 export names) and a shared `initClass()`-style dispatcher where one call site
 registers two classes with different `nMethods` (both stack tables recovered,
-not collapsed into one bind) — including a symbol-stripped ELF, an **AArch64**
+not collapsed into one bind). The shared dispatcher is proven from two
+directions: the generic `auto` harvest picking it up on an **ELF** with no named
+detector (`libjni_dispatch_shared.so`, `analysis.profile` stays `generic`), and
+the **named `j2cc` profile detector** firing on a genuine **PE x86-64** image
+(`jni_dispatch_j2cc.dll`) whose `shared_dispatch` strategy recovers both
+Microsoft x64 tables. Coverage also includes a symbol-stripped ELF, an **AArch64**
 ELF (`adrp`/`add` table addressing, JNI dispatch reached through the `x16`
 veneer register), a **Mach-O arm64** dylib (`format=MachO`/`arch=aarch64` with a
 `_Java_*` export, and the static table decoded through the compact single-`adr`

@@ -38,7 +38,8 @@ assertion in `test_generic_discovery.py`:
 | ELF x86-64 | System V | `RegisterNatives` static table decoded to names/descriptors/addresses via relocations | `libjni_registrar.so` |
 | ELF x86-64 (symbols stripped) | System V | Same table still recovered after `strip --strip-all` (no `.symtab`); no silent empty result | `libjni_registrar.stripped.so` |
 | ELF x86-64 (exports only) | System V | Second registration family: methods registered purely by `Java_*` export names, **no** table | `libjni_exports_only.so` |
-| **ELF x86-64 (shared dispatch)** | System V | Second registration **family** beyond a single obfuscator: one shared `RegisterNatives` call site reached by two branches registers two classes with different `nMethods` (2 and 3). The generic `auto` harvest recovers **both** stack-built tables from the one site — two independently sized `nMethods` groups whose fnAddrs cross-check the export addresses — instead of collapsing them into one silent bind. No names are decoded and no methods are fabricated for the stack tables | `libjni_dispatch_shared.so` (asm) |
+| **ELF x86-64 (shared dispatch, generic `auto`)** | System V | Second registration **family** beyond a single obfuscator: one shared `RegisterNatives` call site reached by two branches registers two classes with different `nMethods` (2 and 3). The **generic `auto` harvest** (no named detector fires — `analysis.profile` stays `generic`) recovers **both** stack-built tables from the one site — two independently sized `nMethods` groups whose fnAddrs cross-check the export addresses — instead of collapsing them into one silent bind. No names are decoded and no methods are fabricated for the stack tables | `libjni_dispatch_shared.so` (asm) |
+| **PE x86-64 (named `j2cc`, `shared_dispatch`)** | Microsoft x64 | The **named `j2cc` profile detector** (`_detect_j2cc`) firing on a real Windows image — not a mocked LIEF object. Two Java_* exports (`initClass` + `bootstrap`, ≤4) plus a `Cannot invoke ` literal make `_detect_j2cc` win over the generic fallback, so `analysis.profile` is `j2cc`. That profile's `harvest_strategy="shared_dispatch"` then **always** calls `_harvest_dispatch` (not the `auto` fallback) and recovers **both** stack tables (`nMethods` 2 and 3) from the one Microsoft x64 `RegisterNatives` call site (env in `rcx`, `methods*` in `r8`, `nMethods` in `r9d`, `call *0x6b8(%rax)`). Recovered fnAddrs cross-check the `fixture_*` export addresses; no names are fabricated on the stack tables. A genuine PE (MZ/PE magic, machine `0x8664`) — never a renamed ELF | `jni_dispatch_j2cc.dll` (asm) |
 | **ELF 32-bit x86 (i386)** | System V (cdecl) | A genuine `(ELF, EM_386)` image: `format=ELF`/`arch=x86` reported, `detect_abi` selects `i386-sysv`, and a `Java_*` export is recorded. cdecl passes `RegisterNatives` arguments on the stack (`push $nMethods` / `push methods`); PIC forms the table address through the GOT-base register (`call`/`pop`/`add` PC thunk, then `lea disp(%ebx), %edx`), which the backend folds back so the static table decodes to names/descriptors whose fnPtrs (from `R_386_32` relocations) cross-check the export addresses. Not a renamed 64-bit `.so` | `libjni_registrar_i386.so` |
 | PE x86-64 | Microsoft x64 | Static table (r8/r9d) decoded to names/addresses **and** a `Java_*` export recorded | `jni_registrar.dll` |
 | Mach-O x86-64 | System V | Static table decoded to names/addresses **and** a `_Java_*` export normalized to the spec name | `libjni_registrar.dylib` |
@@ -57,7 +58,8 @@ fixtures — `-target x86_64-apple-macos` and `-target arm64-apple-macos`, or
 or `zig cc -target arm-linux-gnueabi` for the 32-bit ARM ELF, the host `cc`
 assembler for the shared-dispatch `.s`, an i386 toolchain
 (`i686-linux-gnu-gcc`, `zig cc -target x86-linux-gnu`,
-`clang --target=i386-linux-gnu`, or `gcc -m32`) for the i386 ELF, and the host
+`clang --target=i386-linux-gnu`, or `gcc -m32`) for the i386 ELF,
+`x86_64-w64-mingw32-gcc` for the PE `j2cc` shared-dispatch `.s`, and the host
 `cc` + `strip` for x86-64 ELF). If no i386 toolchain is present the committed
 `libjni_registrar_i386.so` is kept and **no** 64-bit `.so` is renamed to stand
 in for it. The section-header-removed images
@@ -127,20 +129,41 @@ build that cannot decode it, claims no table and fabricates no methods while the
 The second registration family beyond the per-class registrar is a shared
 `initClass()`-style dispatcher: one `RegisterNatives` call site is reached by
 several branches, each building its own `JNINativeMethod[]` (on the stack) with
-its own `nMethods`. The generic `auto` harvest splits such a site on each
-`nMethods` boundary and emits one `register-natives-stack` table per branch —
-recovering two independently sized `nMethods` groups from a single call rather
-than collapsing them into one silent bind. The committed
-`libjni_dispatch_shared.so` fixture is hand-written x86-64 assembly on purpose:
-a stack-built shared dispatcher's instruction shape is not stable across C
-compilers or optimisation levels (PIC routes function pointers through the GOT,
-stores get vectorised, and one if/else branch is laid out *after* the merged
-call, outside the back-scan window), so a fixed assembly sequence keeps the
-fixture a faithful, reproducible model with both branches before the shared
-call. Stack-built tables expose an ordered `fnAddrs` list and a per-branch
-`nMethods` but no decoded names; `manifest-merge` binds them by count and
-**records a `bindingGaps` entry** whenever a branch's count matches more than
-one class, never guessing a bind.
+its own `nMethods`. The scanner splits such a site on each `nMethods` boundary
+and emits one `register-natives-stack` table per branch — recovering two
+independently sized `nMethods` groups from a single call rather than collapsing
+them into one silent bind. This family is proven by **two committed fixtures
+that exercise two different entry points into the same `_harvest_dispatch`
+logic**:
+
+- **ELF `libjni_dispatch_shared.so` — generic `auto` harvest.** No
+  variant-specific detector fires, so `analysis.profile` stays `generic`; the
+  `auto` strategy falls back to `_harvest_dispatch` only after the ordinary
+  per-class harvest finds no single table, and only accepts the split when more
+  than one independently sized table is recovered. This proves the
+  specification-based path picks up a shared dispatcher on a real binary without
+  any named profile.
+- **PE `jni_dispatch_j2cc.dll` — named `j2cc` detector + `shared_dispatch`
+  strategy.** The named `j2cc` profile detector fires on a genuine Windows image
+  (two Java_* exports plus a `Cannot invoke ` literal), so `analysis.profile` is
+  `j2cc`; that profile pins `harvest_strategy="shared_dispatch"`, the path that
+  **always** calls `_harvest_dispatch` directly (never the `auto` fallback).
+  This proves the named detector and its dedicated harvest on Microsoft x64
+  (env in `rcx`, `methods*` in `r8`, `nMethods` in `r9d`), closing the gap where
+  `_detect_j2cc` was previously exercised only by a mocked LIEF object.
+
+Both fixtures are hand-written assembly on purpose: a stack-built shared
+dispatcher's instruction shape is not stable across C compilers or optimisation
+levels (PIC routes function pointers through the GOT, stores get vectorised, and
+one if/else branch is laid out *after* the merged call, outside the back-scan
+window), so a fixed sequence keeps each fixture a faithful, reproducible model
+with both branches before the shared call. Stack-built tables expose an ordered
+`fnAddrs` list and a per-branch `nMethods` but no decoded names; `manifest-merge`
+binds them by count and **records a `bindingGaps` entry** whenever a branch's
+count matches more than one class, never guessing a bind.
+
+This is a draft development capability, not a default-release path: `recover`'s
+defaults are unchanged and continue to use the conservative `generic` profile.
 
 ### Section-header-removed ELF (`PT_LOAD` fallback)
 
@@ -252,6 +275,13 @@ python -m j2c_dumper_cli.main synth-stubs \
 
 Add `--emulate-registration` and optional `--registrar` values to
 `inspect-binary` to use registration emulation as another method-table source.
+
+`inspect-binary` prints the detected `profile=<name>` (from
+`binary.json`'s `analysis.profile`) alongside the format, arch, and
+registry-record count. `merge-manifest` prints `bindingGaps=<n>` and the gap
+kinds after writing `manifest.json`. Binding gaps are a manifest-level fact — a
+native table that could not be unambiguously bound to a JAR class — so they are
+reported after the merge stage and are **not** written onto `binary.json`.
 
 The same top-level CLI exposes optional string and oracle output:
 

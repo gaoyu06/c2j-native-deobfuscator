@@ -54,7 +54,12 @@ Five ABIs ship today: `amd64-windows`, `amd64-sysv`, `aarch64-aapcs64`
 registers). Each is backed by a committed real-binary fixture and an assertion
 in `test_generic_discovery.py`; see [generic-recovery.md](generic-recovery.md)
 for the proven matrix. Two registration families are proven there as well: the
-per-class one-table registrar and a shared `initClass()`-style dispatcher.
+per-class one-table registrar and a shared `initClass()`-style dispatcher. The
+shared dispatcher is proven from two directions — the generic `auto` harvest on
+an ELF with no named detector (`libjni_dispatch_shared.so`), and the named
+`j2cc` profile detector firing on a genuine PE x86-64 image
+(`jni_dispatch_j2cc.dll`) whose `shared_dispatch` strategy recovers both
+Microsoft x64 tables.
 
 Adding a further architecture (for example MIPS or RISC-V) follows the same
 recipe:
