@@ -29,23 +29,23 @@ review can be skipped.
 |---:|---|---|---|
 | **#2** | Design-theory assessment and PR sequence; documentation only and mergeable as documentation. | **Yes, as docs.** | Owner documentation sign-off only. |
 | **#3** | Genericity audit; documentation only. | **Yes, as docs.** | Owner factual spot-check only. |
-| **#4** | Generic-first discovery at `5d43cd4508118c8f385bbf5606a9d15cd0a2e41d`. In addition to the x86-64 formats, committed fixtures prove real AArch64 ELF, section-header-removed ELF mapped from `PT_LOAD`, and a real Mach-O arm64 dylib. | **Yes: ship-as-draft-dev; not as the default release.** | Yes before default promotion. 32-bit ARM and encrypted or shuffled tables remain unproven. |
+| **#4** | Generic-first discovery at `ce53942811d2fb9de76b30a535f14601257814ea`. In addition to the x86-64 formats, committed fixtures prove real AArch64 ELF, real ELF32 ARM, section-header-removed ELF mapped from `PT_LOAD`, and a real Mach-O arm64 dylib. | **Yes: ship-as-draft-dev; not as the default release.** | Yes before default promotion. ABIs without a registered backend and encrypted or shuffled tables remain unproven. |
 | **#5** | Platform plan selecting Swing + FlatLaf and recording reserved decisions; documentation only. | **Yes, as docs.** | Owner documentation sign-off only. |
-| **#6** | `doctor`, setup scripts, launchers, and getting-started material. JDK 17 is retained. | **Yes, as a draft.** | Normal merge review remains; no JDK migration is implied. |
+| **#6** | `doctor`, setup scripts, launchers, and getting-started material at `52ddeb3ed97a66316fce8be50d9242a71ce71ca0`. Offline discovery is documented as `parse-jar` + `inspect-binary` + `merge-manifest`, with Ghidra optional; `recover` still defaults to dynamic recovery. JDK 17 is retained. | **Yes: ship-as-draft.** | Normal merge review remains; neither a JDK migration nor an offline `recover` default is implied. |
 | **#7** | Native-x86 process inspection, library instrumentation, and plugin ABI at `1817e2d664b0a72269f188cbc4a9ddc342b62f0a`. Linux smoke passes sections 1–15. Windows supports read-only module/export observation, with no live breakpoints. No kernel component is shipped. | **Yes: ship-as-preview-draft only.** | Yes for later promotion, broader platform support, ABI trust, and transport decisions. |
 | **#8** | Optional Swing + FlatLaf artifact viewer. The visual pass is complete. The desktop module uses JDK 21 while the repository baseline remains JDK 17. | **Yes, as an optional desktop draft.** | Yes, principally for the JDK 21 module boundary and normal merge review. |
 | **#9** | Opt-in JVMTI attach at `f7664e46f89b83bc6ffb6c3680193412c8cbff36`. Common attach refusals are classified, there is no stealth or bypass behavior, and default recovery remains startup `-agentpath`. | **Yes: ship-as-preview-draft.** | `allowAttachSelf=false` warns rather than hard-refusing the external CLI; `cross-user` and `not-a-jvm` failures print `attach failed (reason=…)`; pytest reports 55 passed. Review remains required before capability or default-policy expansion. |
 | **#10** | This options and status report; documentation only. | **Yes, as docs.** | Owner accuracy and decision sign-off. |
 | **#11** | Optional privileged observer at `dc30188118a6579c024978fa9ff52ca154012170`, with a versioned plugin ABI and Linux maps backend. It is default-off userspace code with no kernel files. | **Yes: ship-as-preview-userspace.** | Yes for later promotion and merge-order integration with #7. It is not a kernel feature, and the default remains **no**. |
 | **#12** | Desktop live-attach/listen GUI at `e07275c1dc0500db3afe79b78792835f510c4a35`, based on PR #8. The must-fixes cover clipping, honest Run disabling when the attach CLI is absent, `outcomeFor` tests, the `allowAttachSelf` warning, and manifest-derived `bindingGaps`; visual shots 07–12 are preview-ok. | **Yes: ship-as-preview after #8.** | Yes for integration review after #8. An enabled attach Run also needs the #9 CLI; the GUI does not replace the CLI. |
-| **#13** | Desktop attach wiring at `542046b8b64668d25657fcf61941a1bfc73eb5c8`, based on #12 rather than `main`. It merges #9’s attach CLI and `Agent_OnAttach` into the desktop stack so GUI Run works. Desktop-ui reports 52 passing tests, attach reports 55, and shot `13-attach-ready` is preview evidence. | **Yes: ship-as-preview after #8 and #12.** | Yes for stacked integration and overlap handling. Because #13 contains #9’s attach files, landing both on `main` requires conflict care. |
+| **#13** | Desktop attach wiring at `c73528414b933737f5a6a29c4d05a0a60119be33`, based on #12 rather than `main`. It merges #9’s attach CLI and `Agent_OnAttach` into the desktop stack so GUI Run works. Relative `-o` values and viewer tailing now use the same absolute path. Desktop-ui reports 56 passing tests and attach reports 55. | **Yes: ship-as-preview, after #8 and #12.** | Yes for stacked integration and overlap handling. Because #13 contains #9’s attach files, landing both on `main` requires conflict care. |
 
 ## Current evidence and boundaries
 
 ### Generic-first discovery (#4)
 
 - The reviewed revision is
-  `5d43cd4508118c8f385bbf5606a9d15cd0a2e41d`.
+  `ce53942811d2fb9de76b30a535f14601257814ea`.
 - Committed x86-64 fixtures exercise real PE, Mach-O, stripped ELF without
   `.symtab`, and exports-only ELF images.
 - Committed fixtures also exercise a real AArch64 ELF and a
@@ -53,14 +53,15 @@ review can be skipped.
 - Independent review confirmed that the former is a real AArch64 ELF and the
   latter has zero section headers.
 - A real Mach-O arm64 dylib now proves that format and architecture.
-- Pytest covers at least 23 introspection-and-merge cases; the implementer
-  reports 31 passing in the full suite.
+- A committed real ELF32 ARM fixture and its tests now prove 32-bit ARM ELF
+  discovery through the AAPCS32 backend.
 - Ambiguous count-only matching is represented with `bindingGaps`; it is not
   silently treated as a complete binding.
 - The branch can ship as a draft/development path.
 - The `recover` default is unchanged.
 - It is not the default release path.
-- 32-bit ARM and encrypted or shuffled tables remain unproven.
+- ABIs without a registered backend and encrypted or shuffled tables remain
+  unproven.
 
 The consequence is deliberate: developers can continue validating the generic
 path without presenting incomplete platform coverage as a released default.
@@ -70,9 +71,16 @@ path without presenting incomplete platform coverage as a released default.
 - The branch can ship as a draft.
 - The repository baseline remains JDK 17.
 - Desktop-specific JDK 21 requirements do not move this setup path to JDK 21.
+- The documented offline discovery path is `parse-jar` + `inspect-binary` +
+  `merge-manifest`; those steps produce a method-discovery manifest rather than
+  recovered method bodies.
+- Ghidra is an optional later static-recovery step, not a prerequisite for
+  offline discovery.
+- `recover` continues to default to the dynamic path.
 
 This keeps the baseline stable while allowing the optional desktop module to
-carry an explicit module-local toolchain requirement.
+carry an explicit module-local toolchain requirement. It also makes offline
+discovery visible without changing the established recovery default.
 
 ### Native-x86 preview (#7)
 
@@ -112,10 +120,13 @@ feature claim.
 - PR #12’s visual shots 07–12 are preview-ok.
 - The attach CLI itself is #9; the GUI does not replace the CLI.
 - PR #13 is reviewed at
-  `542046b8b64668d25657fcf61941a1bfc73eb5c8` and remains stacked on PR #12,
+  `c73528414b933737f5a6a29c4d05a0a60119be33` and remains stacked on PR #12,
   not `main`.
 - PR #13 merges #9’s attach CLI and `Agent_OnAttach` files into that stack so
-  GUI Run works; desktop-ui reports 52 passing tests and attach reports 55.
+  GUI Run works.
+- A relative `-o` is resolved before launch so the attach process and the
+  viewer tail use the same absolute path.
+- Desktop-ui reports 56 passing tests and attach reports 55.
 - Shot `13-attach-ready` is the visual preview evidence.
 
 The consequence is that #12 can ship as a preview after #8 and #13 can follow
@@ -123,7 +134,9 @@ The consequence is that #12 can ship as a preview after #8 and #13 can follow
 than silently changing the repository baseline. Because #13 already contains
 #9’s attach files, either merge #9 to `main` for the CLI-only path and rebase #13,
 or merge #13 after #12 and treat #9 as included for the desktop stack. Merging
-both branches without that reconciliation should be expected to overlap.
+both branches without that reconciliation should be expected to overlap. The
+absolute-path fix removes the relative-output launch/tail mismatch; it does not
+change the preview verdict.
 
 ### JVMTI attach (#9)
 
@@ -176,6 +189,10 @@ the recommendation, and the consequence of adopting it.
 ## What is still not true
 
 - The generic path is **not** the default release path.
+- Generic discovery does **not** cover ABIs without a registered backend or
+  encrypted or shuffled tables.
+- Documenting the offline discovery sequence does **not** change `recover`;
+  dynamic recovery remains its default.
 - Live attach is **not** equivalent to startup instrumentation and is often
   bind-only on OpenJDK 21.
 - Live attach does **not** provide stealth or bypass behavior.
@@ -205,10 +222,10 @@ the recommendation, and the consequence of adopting it.
 ## Promotion gates
 
 - #4 now has committed x86-64 PE, Mach-O, stripped-ELF-without-`.symtab`, and
-  exports-only ELF fixtures, plus real AArch64 ELF and
-  section-header-removed-ELF fixtures and a real Mach-O arm64 dylib. Default
-  promotion remains blocked on 32-bit ARM and encrypted or shuffled table
-  evidence.
+  exports-only ELF fixtures, plus real AArch64 ELF, real ELF32 ARM,
+  section-header-removed-ELF, and real Mach-O arm64 fixtures. Default promotion
+  remains blocked on evidence for ABIs without a registered backend and
+  encrypted or shuffled tables.
 - #7 needs explicit plugin trust and transport decisions, additional platform
   evidence beyond Linux smoke sections 1–15 and Windows read-only module/export
   observation, and a separate promotion review before it can move beyond
@@ -218,9 +235,10 @@ the recommendation, and the consequence of adopting it.
 - #12 is preview-ok at the reviewed revision after its must-fixes, but it still
   depends on #8. An enabled attach Run needs the #9 CLI; without that CLI, Run
   must remain disabled.
-- #13 is preview-ok after #8 and #12, with desktop-ui 52 and attach 55 passing
-  and shot `13-attach-ready`. It carries #9’s attach files, so landing #9 and
-  #13 independently requires a rebase or explicit conflict resolution.
+- #13 is preview-ok after #8 and #12, with relative `-o` launch and tailing
+  sharing one absolute path, desktop-ui 56 and attach 55 passing, and shot
+  `13-attach-ready`. It carries #9’s attach files, so landing #9 and #13
+  independently requires a rebase or explicit conflict resolution.
 - #9/#12 must report actual attach capabilities and retain startup `-agentpath`
   as the default recovery path. #9 now warns for `allowAttachSelf=false` rather
   than hard-refusing the external CLI, and prints reason codes for `cross-user`
