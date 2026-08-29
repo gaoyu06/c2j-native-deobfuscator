@@ -48,14 +48,25 @@ the resulting `String[]` field via reflection). A dedicated
 
 ### Architectures
 
-Only `amd64-windows` and `amd64-sysv` ABIs ship today. AArch64 +
-non-x86 obfuscator outputs require:
+Four ABIs ship today: `amd64-windows`, `amd64-sysv`, `aarch64-aapcs64`
+(64-bit ARM, ELF + Mach-O), and `arm-aapcs32` (32-bit ARM ELF). Each is
+backed by a committed real-binary fixture and an assertion in
+`test_generic_discovery.py`; see [generic-recovery.md](generic-recovery.md)
+for the proven matrix.
 
-- a new `binary_introspect/arch/aarch64*.py` with the AArch64 capstone
-  setup, `ADRP`+`ADD` PC-relative decoding, and the AAPCS64 register
-  bank;
-- adapting `is_indirect_vtable_call` / `decode_pc_relative_lea` /
-  `is_stack_store` for the architecture's idioms.
+Adding a further architecture (for example MIPS, RISC-V, or 32-bit x86)
+follows the same recipe:
+
+- a new `binary_introspect/arch/<arch>*.py` with that architecture's
+  capstone setup, PC-relative "address of constant" decoding, and the
+  ABI register bank (which register carries `JNINativeMethod *` and
+  `nMethods`);
+- adapting `is_indirect_vtable_call` / `vtable_slot_load` /
+  `decode_pc_relative_lea` / `is_stack_store` for the architecture's
+  idioms, then registering the `Abi` so `detect_abi` selects it.
+
+Until an ABI is registered, `detect_abi` returns `None` for that machine
+type and discovery yields an empty registry with no fabricated methods.
 
 ### Other JNI-native obfuscators
 

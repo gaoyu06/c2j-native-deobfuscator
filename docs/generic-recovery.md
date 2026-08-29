@@ -15,15 +15,17 @@ The current binary introspection and emulation backends support:
 | PE x86-64 | Microsoft x64 | `r8` | `r9d` / `r9` |
 | ELF or Mach-O x86-64 | System V | `rdx` | `ecx` / `rcx` |
 | ELF or Mach-O aarch64 | AAPCS64 | `x2` | `w3` / `x3` |
+| ELF 32-bit ARM | AAPCS32 | `r2` | `r3` |
 
 `RegisterNatives` is identified as JNI vtable index 215. The scanner reads
 
 ## Proven object formats and registration families
 
 Generic discovery started as an ELF-only, single-table proof. It is now
-exercised by committed fixtures across all three x86-64 object formats, a
-non-x86-64 (AArch64) image, section-header-removed images, and both
-registration families, so the path is no longer tied to one workflow. Each row
+exercised by committed fixtures across all three x86-64 object formats,
+non-x86-64 images (64-bit AArch64 and 32-bit ARM), section-header-removed
+images, and both registration families, so the path is no longer tied to one
+workflow. Each row
 below is backed by a real binary in `py/binary_introspect/tests/fixtures/`
 (source `.c` + built binary, or a derivation of a committed base) and an
 assertion in `test_generic_discovery.py`:
@@ -37,6 +39,7 @@ assertion in `test_generic_discovery.py`:
 | Mach-O x86-64 | System V | Static table decoded to names/addresses **and** a `_Java_*` export normalized to the spec name | `libjni_registrar.dylib` |
 | **ELF aarch64** | AAPCS64 | Static table decoded via `adrp`/`add` table addressing and `R_AARCH64_ABS64` fnPtr relocations; the split JNI dispatch is followed through the `x16` veneer register (`ldr`/`mov x16`/`br x16`); a `Java_*` export is recorded | `libjni_registrar_aarch64.so` |
 | **Mach-O arm64** | AAPCS64 | A genuine `(MachO, aarch64)` image: `format=MachO`/`arch=aarch64` reported, and a `_Java_*` export normalized to the spec name. When the host Capstone can decode AArch64 the static table is additionally decoded — clang forms the nearby table address with a single `adr` (not the ELF `adrp`/`add` pair), and the fnPtrs cross-check the export addresses; otherwise the export stands alone and no methods are fabricated | `libjni_registrar_arm64.dylib` |
+| **ELF 32-bit ARM** | AAPCS32 | A genuine `(ELF, EM_ARM)` image: `format=ELF`/`arch=arm` reported, and a `Java_*` export recorded. When the host Capstone can decode 32-bit ARM the static table is additionally decoded — the split JNI dispatch is followed through the `ip` (r12) veneer register (`ldr lr, [ip, #860]` / `mov ip, lr` / `bx ip`), the position-independent table address is folded back from the `ldr`-literal + `add r2, pc, r2` pair, and the fnPtrs (zeroed slots filled from `R_ARM_ABS32` relocations) cross-check the export addresses; otherwise the export stands alone and no methods are fabricated | `libjni_registrar_arm.so` |
 | **ELF x86-64 (section header table removed)** | System V | `sstrip`-style image with only `PT_LOAD` segments: the static table is still decoded through the program-header (`PT_LOAD` + dynamic relocation) fallback, with no sections | `libjni_registrar.noshdr.so` |
 | **ELF x86-64 (section header table removed, exports only)** | System V | `Java_*` dynamic exports recovered from `PT_DYNAMIC` with the section table gone | `libjni_exports_only.noshdr.so` |
 
@@ -45,8 +48,9 @@ py/binary_introspect/tests/fixtures/build.sh` when the cross toolchains are
 present (`x86_64-w64-mingw32-gcc` for PE, `clang` + `ld64.lld` for both Mach-O
 fixtures — `-target x86_64-apple-macos` and `-target arm64-apple-macos`, or
 `zig cc -target aarch64-macos` for the arm64 one — `aarch64-linux-gnu-gcc` or
-`zig cc -target aarch64-linux-gnu` for the AArch64 ELF, the host `cc` + `strip`
-for x86-64 ELF). The section-header-removed images
+`zig cc -target aarch64-linux-gnu` for the AArch64 ELF, `arm-linux-gnueabi-gcc`
+or `zig cc -target arm-linux-gnueabi` for the 32-bit ARM ELF, the host `cc` +
+`strip` for x86-64 ELF). The section-header-removed images
 are derived from the committed base binaries by `strip_section_headers.py` (a
 dependency-free `sstrip` equivalent). The built binaries are committed so the
 suite runs without any toolchain; the base ELF is a committed input and is not
@@ -68,6 +72,24 @@ host's Capstone build cannot decode AArch64, the `Java_*` export is still parsed
 from the symbol table via LIEF and **no** methods are fabricated. This holds for
 both the ELF aarch64 and the Mach-O arm64 fixtures.
 
+### 32-bit ARM disassembly notes
+
+Like AArch64, 32-bit ARM has no "call through a memory operand" instruction, so
+the JNI vtable dispatch is the split form: the slot is materialised with
+`ldr lr, [ip, #215*4]` (i.e. `#860`) and reached via `bx`/`blx`, frequently
+through the `ip` (r12) intra-procedure-call veneer (`mov ip, lr` / `bx ip`). The
+split-call scanner follows that register-to-register move so the veneer does not
+hide the site. The address of an in-image `JNINativeMethod[]` is not a single
+`lea` (x86) or `adrp`/`add` pair (AArch64): position-independent ARM loads a
+link-time-constant offset from the function's literal pool and adds the program
+counter (`ldr r2, [pc, #k]` / `add r2, pc, r2`). The AAPCS32 ABI reads the
+pooled word through a per-scan literal reader and folds the pair back into the
+absolute table VA. The zeroed `fnPtr` slots are filled from `R_ARM_ABS32`
+relocations while the name/descriptor pointers are read from their inline
+`R_ARM_RELATIVE` values. If a host's Capstone build cannot decode 32-bit ARM,
+the `Java_*` export is still parsed from the symbol table via LIEF and **no**
+methods are fabricated.
+
 ### Section-header-removed ELF (`PT_LOAD` fallback)
 
 When an ELF has had its section header table removed (`e_shoff`/`e_shnum`
@@ -87,9 +109,11 @@ These are acknowledged gaps, not silent successes — the code either records an
 honest gap, raises, or returns nothing observable rather than a fabricated
 binding:
 
-- 32-bit ARM (`arm`) ELF and other architectures without a registered ABI
-  backend. `detect_abi` returns `None`, so discovery yields an empty registry
-  with no fabricated methods.
+- Architectures without a registered ABI backend (for example MIPS, RISC-V, or
+  32-bit x86). `detect_abi` returns `None`, so discovery yields an empty
+  registry with no fabricated methods. (32-bit ARM ELF is now proven — see the
+  table above — as are x86-64 PE/Mach-O/ELF and 64-bit ARM in both ELF and
+  Mach-O.)
 - A section-header-removed ELF that a particular LIEF build cannot map through
   its program headers. Introspection raises an honest error in that case (the
   tests encode both outcomes); it never silently succeeds.

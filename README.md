@@ -354,8 +354,9 @@ Every stage has its own subcommand under `j2c-dumper`; see
 `generic` is the default fallback and depends on JNI specification facts:
 
 - `RegisterNatives` vtable index 215;
-- ABI-specific argument registers for Microsoft x64, System V x86-64, and
-  AArch64 AAPCS64 (`x2` for the method table, `w3`/`x3` for `nMethods`);
+- ABI-specific argument registers for Microsoft x64, System V x86-64,
+  AArch64 AAPCS64 (`x2` for the method table, `w3`/`x3` for `nMethods`), and
+  32-bit ARM AAPCS32 (`r2` for the method table, `r3` for `nMethods`);
 - valid `JNINativeMethod` names/descriptors and executable function pointers;
 - specification-defined `Java_*` exports;
 - optional registration capture through binary emulation.
@@ -373,8 +374,11 @@ symbol-stripped ELF, an **AArch64** ELF (`adrp`/`add` table addressing, JNI
 dispatch reached through the `x16` veneer register), a **Mach-O arm64** dylib
 (`format=MachO`/`arch=aarch64` with a `_Java_*` export, and the static table
 decoded through the compact single-`adr` table addressing when the host
-Capstone can decode AArch64), and **section-header-removed ELF** images
-recovered through a `PT_LOAD` program-header fallback. See the
+Capstone can decode AArch64), a **32-bit ARM** ELF (`format=ELF`/`arch=arm`
+with a `Java_*` export, and the static table decoded through the
+literal-pool + `add r2, pc, r2` table addressing and the `ip` veneer register
+when the host Capstone can decode ARM), and **section-header-removed ELF**
+images recovered through a `PT_LOAD` program-header fallback. See the
 proven/unproven matrix in
 [`docs/generic-recovery.md`](docs/generic-recovery.md). This remains a
 development path: it is not promoted to the default `recover` flow, and it does

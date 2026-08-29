@@ -302,8 +302,9 @@ python -m j2c_dumper_cli.main emulate natives.bin --operation call --fn 0x<addr>
 `generic` 是默认兜底，只依赖 JNI 规范中的结构事实：
 
 - `RegisterNatives` 的 vtable 索引 215；
-- Microsoft x64、System V x86-64 与 AArch64 AAPCS64 的参数寄存器
-  （方法表用 `x2`，`nMethods` 用 `w3`/`x3`）；
+- Microsoft x64、System V x86-64、AArch64 AAPCS64（方法表用 `x2`，
+  `nMethods` 用 `w3`/`x3`）与 32 位 ARM AAPCS32（方法表用 `r2`，
+  `nMethods` 用 `r3`）的参数寄存器；
 - 合法的 `JNINativeMethod` 名称/descriptor 与可执行函数指针；
 - 规范定义的 `Java_*` 导出；
 - 可选的二进制模拟注册捕获。
@@ -317,8 +318,11 @@ Mach-O）、两种注册族（`RegisterNatives` 静态表与 `Java_*` 导出名�
 符号剥离 ELF、**AArch64** ELF（`adrp`/`add` 取表地址，JNI 分发经 `x16`
 中转寄存器）、**Mach-O arm64** dylib（报告 `format=MachO`/`arch=aarch64` 与
 `_Java_*` 导出；当宿主 Capstone 能反汇编 AArch64 时，静态表还会经紧凑的单条
-`adr` 取表地址方式解出），以及**删除节头表**（section header table）后仅靠
-`PT_LOAD` 程序头兜底恢复的 ELF。完整“已证明/未证明”对照见
+`adr` 取表地址方式解出）、**32 位 ARM** ELF（报告 `format=ELF`/`arch=arm` 与
+`Java_*` 导出；当宿主 Capstone 能反汇编 ARM 时，静态表还会经字面量池 +
+`add r2, pc, r2` 取表地址与 `ip` 中转寄存器解出），以及**删除节头表**
+（section header table）后仅靠 `PT_LOAD` 程序头兜底恢复的 ELF。完整
+“已证明/未证明”对照见
 [`docs/generic-recovery.md`](docs/generic-recovery.md)。该路径仍是开发中能力：
 未提升为默认 `recover` 流程，也不声称还原方法字节码。
 
