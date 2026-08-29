@@ -7,11 +7,11 @@
 及其衍生工具（如 j2cc）—— 凡是把 JVM 字节码翻成 C++、再通过 JNI 从打包进
 JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 
-提供三条互补的恢复路径：
+提供四条互补的恢复路径（只有**动态**是默认的 `recover` 流程）：
 
 | 路径 | 输入 | 思路 |
 |---|---|---|
-| **动态** | 混淆后的 JAR + 一条可运行的命令 | 加载 JVMTI agent，观察 JNI 调用流，把它重新拼回 JVM 字节码 |
+| **动态** | 混淆后的 JAR + 一条可运行的命令 | 启动时加载 JVMTI agent，观察 JNI 调用流，把它重新拼回 JVM 字节码 |
 | **轻量静态** | 转译后的 JAR + native blob | 无需 Ghidra，发现 JNI 方法表、生成 manifest 和字节码还原 stub |
 | **静态方法体** | 离线 manifest + 可选 Ghidra | 发现之后，可选地反编译各函数并把 pseudo-C 抬升回 JVM 字节码 |
 | **模拟** | 混淆后的 blob（不需运行、不需 Ghidra） | 用 CPU 模拟器 + mock JNI 直接跑 native 代码：恢复方法表、dump 解密后的常量、把方法当纯函数来调用 |
@@ -32,6 +32,39 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 [可选观察器契约](docs/privileged-observer.md)默认关闭，本项目不为其签名。
 JAR 还原不需要它；仓库不发布内核镜像或内核源码。
 
+当前架构、全部表面、默认 vs 预览状态见
+**[docs/overview.zh-CN.md](docs/overview.zh-CN.md)**
+（[English](docs/overview.md)）。
+
+---
+
+## 架构速览
+
+```
+  CLI（scripts/j2c）  ·  可选桌面查看器（scripts/gui.sh）
+                         │  版本化 JSON（schemas/）
+          发现 ──────────┼───── 恢复引擎 ───── 重建
+   parse-jar / inspect-  │   动态 JVMTI（默认）    class-rebuilder
+   binary / merge-       │   attach（预览）         → out.jar
+   manifest              │   轻量静态（draft-dev）
+                         │   模拟 / Ghidra 方法体（可选）
+
+  相邻、不在 JAR 路径上：
+    native-x86/                 用户态 metadata 观察
+    privileged-observer/        用户态 maps；默认关闭
+```
+
+| 表面 | 作用 | 是否默认？ |
+|---|---|---|
+| `scripts/j2c recover` | 启动期 `-agentpath` 动态恢复 | **是** |
+| `parse-jar` / `inspect-binary` / `merge-manifest` / `static-lite` | 无 Ghidra 的方法发现 + stub | 否（draft-dev） |
+| `emulate` | Unicorn + mock JNI（表 / 字符串 / oracle） | 否 |
+| Ghidra + `static-reverse` | 可选 pseudo-C 方法体 | 否 |
+| `scripts/j2c attach` | 活动、同一用户的 JVMTI 附加 | 否（预览） |
+| `scripts/gui.sh` | Swing + FlatLaf 产物 / 附加查看器 | 否（可选） |
+| `native-x86/` | 进程镜像 metadata，插件 ABI 0.2 | 否（预览；不在 JAR 路径上） |
+| `privileged-observer/` | 用户态 `/proc` maps | 否（默认**关**） |
+
 ---
 
 ## 自己动手运行
@@ -49,9 +82,10 @@ scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 > `uv` 把 Python 工作区装进 `py/.venv`，所以直接用*系统* `python3 -m j2c_dumper_cli`
 > 找不到这些包。该启动器会挑选真正装了这些包的解释器。
 
-详见下方的 [Quick start](#quick-start) 以及
+详见下方的 [Quick start](#quick-start)、
 [10 分钟上手指南](docs/getting-started.zh-CN.md)
-（[English](docs/getting-started.md)）。
+（[English](docs/getting-started.md)），以及
+[架构与功能一览](docs/overview.zh-CN.md)。
 
 **什么时候需要人工过一遍。** 本项目提供的是对整个"把 Java 转译成 C/C++
 再通过 JNI 回调"混淆器家族的**通用思路**，所以难度较大的目标仍可能需要针对
@@ -119,9 +153,12 @@ scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 
 ### 动态路径
 
-- **JVMTI agent**（`native/`，C++）。通过 `-agentpath:` 加载，订阅
+- **JVMTI agent**（`native/`，C++）。默认通过 `-agentpath:` 在启动时加载；
+  也可作为预览，用 `Agent_OnAttach` 附加到已经在跑、且属于同一用户的 JVM
+  （见 [`docs/jvm-attach.md`](docs/jvm-attach.md)）。启动时订阅
   `NativeMethodBind`、`MethodEntry`、`MethodExit`、`Exception`、
-  `ExceptionCatch` 等 JVMTI 事件。
+  `ExceptionCatch`；活动附加只订阅 JDK 仍授予的事件（在 OpenJDK 21 上常常
+  只有 `NativeMethodBind`）。
 - **JNI 函数表替换**。在 `VMInit` 和每个 `ThreadStart` 时，把
   `JNIEnv->functions` 指针整体换成一份代理表。代理表里约 80 个槽位都被
   重定向到记录调用日志的 wrapper，wrapper 在转发到原函数前把这次调用
@@ -189,6 +226,14 @@ scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
   `RegisterNatives`=215，`ExceptionCheck`=228…），所以同一套引擎对整个家族
   通用。后端：x86-64 PE/Win64 与 ELF/System-V。详见
   [`docs/emulation-recovery.md`](docs/emulation-recovery.md)。
+
+### 可选桌面查看器
+
+- **Swing + FlatLaf**（`jvm/desktop-ui/`，**仅此模块**需要 JDK 21）。
+  `scripts/gui.sh [会话目录]` 打开会话文件夹，展示方法、恢复后的方法体、
+  管线状态、绑定缺口，以及实时 `trace.jsonl`。**Attach / Listen** 是
+  `scripts/j2c attach` 的前端，不会另起一套协议。恢复步骤仍走 CLI。
+  详见 [docs/desktop-gui.md](docs/desktop-gui.md)。
 
 ### 共用部分
 
@@ -325,6 +370,19 @@ JDK 在附加*之后*还允许申请哪些 JVMTI 能力。在不少 JDK 上（**
 进程附加必须显式提供 `--pid` 和 `--i-own-this-process` 确认标志，并且拒绝跨用户
 目标。详见 [`docs/jvm-attach.md`](docs/jvm-attach.md)。
 
+### 可选桌面查看器
+
+恢复**不需要**这个 Swing 查看器。在 `recover --workdir`（或任何含 JSON
+产物的会话目录）之后：
+
+```bash
+scripts/gui.sh ./work          # Windows：scripts\gui.ps1 .\work
+```
+
+它展示方法、恢复后的方法体、管线状态，并能运行或只监听 `attach`。
+该模块需要 **JDK 21**；仓库其余部分仍是 JDK 17。详见
+[`docs/desktop-gui.md`](docs/desktop-gui.md)。
+
 ### 离线发现与轻量静态（无需运行、无需 Ghidra）
 
 当 JAR 无法运行时先从这里开始。下面的通用发现步骤会检查标准 JNI 导出符号和
@@ -340,7 +398,10 @@ scripts/j2c static-lite in.jar --lib natives.bin --profile generic -o static-lit
 ```
 
 详见 [`docs/generic-recovery.md`](docs/generic-recovery.md)。`inspect-binary`
-会打印 `profile=`，`merge-manifest` 会打印 `bindingGaps=`。
+会在 stderr 打印 `format/arch/profile=` 与 `unreadableTables=`；
+`merge-manifest` 会打印 `bindingGaps=<n> kinds=…`。`bindingGaps` 不会写入
+`binary.json`。可见但不可读的 `JNINativeMethod[]` 会记成 `unreadable-table`
+缺口，而不是编造绑定。
 如需可选的 pseudo-C 方法体抬升，可在轻量静态步骤后运行 Ghidra。
 
 ### 模拟恢复（无需 JVM、无需 Ghidra）
@@ -448,33 +509,50 @@ py/.venv/bin/python -m ast_matcher.cli --list-flags
 
 ---
 
-## 实验性模块：`native-x86/`
+## 预览：`native-x86/`（不在 JAR 路径上）
 
-[`native-x86/`](native-x86/) 是一个与上面所有内容都相互独立的**实验性骨架**：
-一套用户态插件 ABI，用于描述通用的 x86 进程信息（模块、符号、调用点），
-内部不包含任何 JVM / JNI 概念。它**不是 JAR 恢复的必需组件** ——
-动态、静态、模拟三条路径都不依赖它，整个目录删掉也不影响它们。
+[`native-x86/`](native-x86/) 是**实验性 / 预览**的用户态 host + 插件，
+用于进程镜像 metadata。公开 ABI（v0.2）**不含 Java 类型**。动态、静态、
+模拟路径都不依赖它；整个目录删掉也不影响它们。
 
-目前它只包含一个带版本号的 C ABI、一个加载示例插件的 host stub 以及文档，
-没有实现任何插桩逻辑。详见
-[`docs/native-x86-module.md`](docs/native-x86-module.md)。
+目前能做的：
+
+- Linux：同一用户 + `--i-own-this-process`；只读模块/导出，或**单线程**
+  活动观察（ptrace / INT3），只记录具名导出的进入/返回 metadata。
+- Windows：只读模块/导出快照（没有活动断点）。
+- 示例插件按名字观察 OpenSSL `SSL_*` / `RSA_*` / `AES_*` / `EVP_*`、
+  JNI 约定的 `Java_*`、以及 Windows CNG `BCrypt*` 导出。
+
+明确不做的事：TLS 拦截、缓冲区/密钥/内容采集、stealth、任何内核组件。
+详见 [`docs/native-x86-module.md`](docs/native-x86-module.md) 与
+[`docs/plugin-abi.md`](docs/plugin-abi.md)。
+
+## 预览：特权观察器（用户态，默认关闭）
+
+[`privileged-observer/`](privileged-observer/) 是另一套用户态插件 host。
+随仓库提供的 Linux 后端读取 `/proc/<pid>/maps`，输出模块路径与地址。
+必须同时给出 `--i-enable-privileged-observer` 与 `--i-own-this-process`。
+本仓库**不发布内核镜像或内核源码**。详见
+[`docs/privileged-observer.md`](docs/privileged-observer.md)。
 
 ---
 
 ## 仓库结构
 
 ```
-├── jvm/                        Kotlin/ASM 模块（Gradle 多项目）
+├── scripts/                    j2c / j2c.ps1、setup、gui.sh / gui.ps1
+├── jvm/                        Kotlin/ASM 模块（Gradle；除 desktop-ui 外为 JDK 17）
 │   ├── jar-parser/             input.jar  → classes.json
 │   ├── trace-to-bytecode/      manifest + trace.jsonl → recovered/*.json
 │   ├── class-rebuilder/        input.jar + recovered/ → output.jar
-│   └── common/                 公共 schema 类型
-├── native/                     C++ JVMTI agent（zig c++ 构建）
-├── native-x86/                 实验性的用户态 x86 插件 ABI 骨架
+│   ├── common/                 公共 schema 类型
+│   └── desktop-ui/             Swing + FlatLaf 查看器（JDK 21）
+├── native/                     C++ JVMTI agent（OnLoad + OnAttach；zig c++）
+├── native-x86/                 预览级用户态观察 host + 插件
 │                               （任何恢复路径都不依赖它）
+├── privileged-observer/        用户态 maps host；默认关闭；无内核镜像
 ├── ghidra/scripts/             Ghidra Headless 脚本（Java）
 ├── py/                         Python 模块（uv workspace）
-│   ├── jar_parser/             —
 │   ├── binary_introspect/      .dll / .so / natives.bin  → binary.json
 │   │   ├── arch/               按架构 / ABI 的实现
 │   │   ├── jni_tables.py       RegisterNatives 表发现
@@ -487,7 +565,7 @@ py/.venv/bin/python -m ast_matcher.cli --list-flags
 │   ├── native_emulate/         模拟路径：j2c_emu.py（Unicorn + mock JNI）
 │   └── snippet_importer/       （可选）native-obfuscator cppsnippets 导入器
 ├── .claude/skills/             j2c-deobfuscate skill（智能体使用手册）
-├── docs/                       ARCHITECTURE.md、ROADMAP.md、profile 指南 …
+├── docs/                       overview、ARCHITECTURE、ROADMAP …
 ├── schemas/                    每种 artifact 的 JSON Schema
 └── tests/                      端到端 fixture 与管线测试
 ```
@@ -496,19 +574,27 @@ py/.venv/bin/python -m ast_matcher.cli --list-flags
 
 ## 文档
 
+- [overview.zh-CN.md](docs/overview.zh-CN.md) — **架构与全部功能从这里开始**
+  （[English](docs/overview.md)）
 - [getting-started.zh-CN.md](docs/getting-started.zh-CN.md) — 10 分钟默认路径
   上手、常见故障、JSON 产物在哪
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — 模块边界、管线、artifact schema、扩展点
+- [desktop-gui.md](docs/desktop-gui.md) — 可选 Swing 查看器
+  （[模块 README](jvm/desktop-ui/README.md)）
+- [jvm-attach.md](docs/jvm-attach.md) — 可选活动 JVMTI 附加（预览）
 - [emulation-recovery.md](docs/emulation-recovery.md) — 模拟路径使用指南
   （命令参考见 [`py/native_emulate/README.md`](py/native_emulate/README.md)）
 - [generic-recovery.md](docs/generic-recovery.md) — 无 Ghidra 的方法发现、
-  manifest、stub 与可选模拟
+  manifest、stub、诚实缺口与可选模拟
 - [manual-restoration.md](docs/manual-restoration.md) — 手工清理恢复产物
+- [options-and-status.md](docs/options-and-status.md) — 决策、合并状态、晋升门槛
 - [ROADMAP.md](docs/ROADMAP.md) — 已知限制和计划工作
 - [adding-obfuscator-profile.md](docs/adding-obfuscator-profile.md) — 如何注册新混淆器变体
 - [static-reverse-approach.md](docs/static-reverse-approach.md) — 基于 Ghidra 的静态路径设计笔记
-- [native-x86-module.md](docs/native-x86-module.md) — 实验性用户态 x86 模块的边界与非目标
-  （[插件 ABI](docs/plugin-abi.md)、[特权观察器](docs/privileged-observer.md)）
+- [native-x86-module.md](docs/native-x86-module.md) — 预览级用户态观察
+  （[插件 ABI](docs/plugin-abi.md)、
+  [密码学插件](docs/plugins/crypto-libraries.md)、
+  [特权观察器](docs/privileged-observer.md)）
 - [`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md) —
   智能体使用手册（加载到你的编码智能体里）
 

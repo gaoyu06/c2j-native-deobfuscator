@@ -9,6 +9,10 @@ The dynamic path works when you can *launch* the obfuscated jar in your
 environment. If you can't run it, jump to
 [When you can't run the jar](#when-you-cant-run-the-jar).
 
+For the full architecture and every optional surface (desktop viewer,
+live attach, native-x86, privileged observer), see
+[overview.md](overview.md).
+
 ---
 
 ## 0. Prerequisites
@@ -101,6 +105,19 @@ and whose loader / native-blob entries are stripped. Dynamic tracing only covers
 the paths your `--run-cmd` actually executed; unobserved methods may keep a stub
 or a partial body, so inspect the output and expect some manual completion on
 hard targets.
+
+### Optional: look at the session in the desktop viewer
+
+If you have **JDK 21** and passed `--workdir ./work`:
+
+```bash
+scripts/gui.sh ./work
+```
+
+The viewer only displays artifacts (and can front the `attach` CLI). It
+does not run `recover`. See [desktop-gui.md](desktop-gui.md). Live
+attach, if you cannot restart the JVM, is documented in
+[jvm-attach.md](jvm-attach.md) (`scripts/j2c attach --pid … --i-own-this-process`).
 
 ---
 

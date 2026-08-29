@@ -11,6 +11,9 @@
 > Terminology in this report is deliberately neutral: JNI-native transpiled JAR
 > recovery, JVMTI, process inspection, library instrumentation, plugin ABI, and
 > privileged observer.
+>
+> Product-level architecture and the feature catalog:
+> [overview.md](overview.md) ([中文](overview.zh-CN.md)).
 
 ## Executive recommendation
 

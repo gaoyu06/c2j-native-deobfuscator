@@ -8,6 +8,9 @@
 动态路径的前提是你能在自己的环境里**跑起来**这个混淆 jar。如果跑不起来，请直接
 看[目标跑不起来时怎么办](#目标跑不起来时怎么办)。
 
+完整架构与全部可选表面（桌面查看器、活动附加、native-x86、特权观察器）见
+[overview.zh-CN.md](overview.zh-CN.md)。
+
 ---
 
 ## 0. 前置条件
@@ -89,6 +92,19 @@ scripts/j2c recover \
 行为、尽力恢复出的方法体**，loader / native blob 资源条目也被剥离。动态 trace 只
 覆盖 `--run-cmd` 实际执行到的路径；未观察到的方法可能仍是桩或只有部分方法体，因此
 请检查输出，难度较大的目标要预期需要人工补全。
+
+### 可选：用桌面查看器看这次会话
+
+如果你有 **JDK 21**，并且传了 `--workdir ./work`：
+
+```bash
+scripts/gui.sh ./work
+```
+
+查看器只展示产物（也能作为 `attach` CLI 的前端），不会自己跑 `recover`。
+详见 [desktop-gui.md](desktop-gui.md)。如果 JVM 不能重启，活动附加见
+[jvm-attach.md](jvm-attach.md)
+（`scripts/j2c attach --pid … --i-own-this-process`）。
 
 ---
 

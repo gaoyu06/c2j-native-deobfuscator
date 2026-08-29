@@ -77,8 +77,10 @@ These are boundaries, not a backlog.
 - **No signature or protection bypass.** Nothing here exists to defeat
   licensing, integrity checks or code signing.
 - **No kernel component in this tree.** See
-  [privileged-observer.md](privileged-observer.md): the privileged path
-  is documentation only, and no signed driver is provided.
+  [privileged-observer.md](privileged-observer.md): the in-repo
+  privileged observer is a **userspace** maps plugin (default off).
+  This repository ships no kernel image, kernel source, or signed
+  driver.
 - **No Java coupling.** No JNI header, no Gradle module, no
   `jni.h` include, ever, under `native-x86/`. See
   [`native-x86/bridge-notes.md`](../native-x86/bridge-notes.md).
