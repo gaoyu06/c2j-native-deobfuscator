@@ -138,6 +138,80 @@ def test_introspect_real_macho_resolves_static_table_and_jni_export() -> None:
     assert [e["fnSymbol"] for e in exports] == ["Java_com_example_Sample_ping"]
 
 
+def test_introspect_real_macho_arm64_reports_format_arch_export_and_table() -> None:
+    """Mach-O arm64 proven on a committed ``.dylib``.
+
+    This is the arm64 sibling of the Mach-O x86-64 dylib and the ELF aarch64
+    ``.so``: a genuine ``(MachO, aarch64)`` image, not a renamed ELF or
+    x86-64 dylib. LIEF confirms the Mach-O magic and the ARM64 cpu type, so
+    ``introspect`` reports ``format=MachO`` and ``arch=aarch64``.
+
+    The specification-defined ``Java_*`` export is recovered on every host via
+    the LIEF symbol table (Mach-O stores it as ``_Java_...``, normalized back
+    to the spec name). When the host capstone can decode AArch64 the static
+    ``RegisterNatives`` table is additionally recovered: clang materialises the
+    table address with a single ``adr`` (rather than the ELF's ``adrp``/``add``
+    pair), and the AAPCS64 backend folds it back so names/descriptors decode
+    and their function pointers cross-check the export addresses. When capstone
+    cannot decode AArch64, no table is claimed and no methods are fabricated.
+    """
+    path = FIXTURES / "libjni_registrar_arm64.dylib"
+
+    binary = lief.parse(str(path))
+    assert binary.format == lief.Binary.FORMATS.MACHO
+    assert int(binary.header.cpu_type) == 0x0100000C  # CPU_TYPE_ARM64
+
+    report = introspect(path)
+    assert report.fmt == "MachO"
+    assert report.arch == "aarch64"
+    assert report.analysis == {"profile": "generic", "methodDiscovery": "jni-spec"}
+
+    # The Java_* export is recovered regardless of capstone, from the symbol
+    # table rather than disassembly.
+    exports = _jni_exports(report)
+    assert [e["fnSymbol"] for e in exports] == ["Java_com_example_Sample_ping"]
+    assert exports[0]["fnAddr"] == _export_addr(
+        report, "Java_com_example_Sample_ping"
+    )
+
+    tables = _static_tables(report)
+    if not _capstone_disassembles_aarch64():
+        # Honest fallback: no AArch64 disassembler means no table is claimed,
+        # and crucially no fabricated methods. The export above still holds.
+        assert tables == []
+        return
+
+    assert len(tables) == 1, "Mach-O arm64 table must not silently yield nothing"
+    table = tables[0]
+    assert table["abi"] == "aarch64-aapcs64"
+    assert table["nMethods"] == 2
+    assert [(m["name"], m["desc"]) for m in table["methods"]] == [
+        ("alpha", "()V"),
+        ("beta", "(I)I"),
+    ]
+    assert table["methods"][0]["fnAddr"] == _export_addr(report, "fixture_alpha")
+    assert table["methods"][1]["fnAddr"] == _export_addr(report, "fixture_beta")
+
+
+def test_aarch64_adr_single_instruction_table_address_is_folded() -> None:
+    """clang reaches a nearby ``JNINativeMethod[]`` with a single
+    ``adr x2, #label`` instead of the ``adrp``/``add`` pair. The AArch64
+    backend must fold that compact form back to the absolute table VA — a
+    regression here silently loses every ``adr``-addressed table (the shape a
+    small Mach-O arm64 image emits)."""
+    from binary_introspect.arch.aarch64 import AARCH64_AAPCS64
+
+    cs = AARCH64_AAPCS64.disassembler()
+    if cs is None or not _capstone_disassembles_aarch64():
+        pytest.skip("host capstone cannot decode AArch64")
+
+    # adr x2, #0x4000  encoded for a PC of 0x398 (the form clang emits for the
+    # committed libjni_registrar_arm64.dylib).
+    (insn,) = cs.disasm(bytes.fromhex("42e30110"), 0x398)
+    assert insn.mnemonic == "adr"
+    assert AARCH64_AAPCS64.decode_pc_relative_lea(insn) == 0x4000
+
+
 def _capstone_disassembles_aarch64() -> bool:
     """True when the host capstone can actually decode AArch64. The ABI can
     still parse exports via LIEF without this, so table assertions are guarded
