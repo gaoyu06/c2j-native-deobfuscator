@@ -12,6 +12,8 @@
 #   ELF x86-64  : the host cc/gcc + strip          (always available)
 #   ELF aarch64 : aarch64-linux-gnu-gcc            (apt: gcc-aarch64-linux-gnu)
 #                 or `zig cc -target aarch64-linux-gnu`
+#   ELF arm     : arm-linux-gnueabi-gcc            (apt: gcc-arm-linux-gnueabi)
+#                 or `zig cc -target arm-linux-gnueabi`
 #   PE          : x86_64-w64-mingw32-gcc           (apt: gcc-mingw-w64-x86-64)
 #   Mach-O      : clang + ld64.lld                 (apt: clang lld)
 #
@@ -67,6 +69,26 @@ elif command -v zig >/dev/null 2>&1; then
     log "built libjni_registrar_aarch64.so (zig cc)"
 else
     skip "no aarch64 cross cc ($AARCH64_CC) or zig — keeping committed libjni_registrar_aarch64.so"
+fi
+
+echo "[ELF/arm] libjni_registrar_arm.so (AAPCS32 static table + Java_* export)"
+# The 32-bit sibling of the aarch64 fixture: a genuine (ELF, EM_ARM) image,
+# not a renamed aarch64/x86 binary. Prefer a dedicated cross gcc; fall back to
+# zig. -marm keeps the fixture in ARM (not Thumb) state so the committed byte
+# encodings match the unit-test assertions. The test cross-checks function
+# pointers against the export addresses rather than hard-coding absolute VAs,
+# so a rebuild that shifts addresses does not break the assertions.
+ARM_CC="${ARM_CC:-arm-linux-gnueabi-gcc}"
+if command -v "$ARM_CC" >/dev/null 2>&1; then
+    "$ARM_CC" -O2 -shared -fPIC -nostdlib -marm \
+        -o libjni_registrar_arm.so jni_registrar_arm.c
+    log "built libjni_registrar_arm.so ($ARM_CC)"
+elif command -v zig >/dev/null 2>&1; then
+    zig cc -target arm-linux-gnueabi -O2 -shared -fPIC -nostdlib -marm \
+        -o libjni_registrar_arm.so jni_registrar_arm.c
+    log "built libjni_registrar_arm.so (zig cc)"
+else
+    skip "no arm cross cc ($ARM_CC) or zig — keeping committed libjni_registrar_arm.so"
 fi
 
 echo "[ELF] libjni_exports_only.so (Java_* exports, no table)"
