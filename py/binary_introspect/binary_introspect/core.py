@@ -401,7 +401,25 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
     # record. Static tables may include exact names/descriptors; stack-built
     # tables still provide an ordered function-address list.
     flat_methods: list[dict[str, Any]] = []
+    unreadable_tables: list[dict[str, Any]] = []
     for t in jni_tables:
+        if t.get("source") == "register-natives-unreadable":
+            # A RegisterNatives call site whose in-image JNINativeMethod[] was
+            # visible (right stride and count) but whose name/descriptor bytes
+            # did not decode. Recorded as an honest gap — no methods, no
+            # fnAddrs are invented from the garbage.
+            gap = {
+                "source": "register-natives-unreadable",
+                "registerNativesCallSite": t["callSite"],
+                "nMethods": t.get("nMethods"),
+                "reason": t.get("reason", "invalid-method-descriptors"),
+                "profile": t.get("profile"),
+                "abi": t.get("abi"),
+            }
+            if t.get("tableAddress"):
+                gap["tableAddress"] = t["tableAddress"]
+            unreadable_tables.append(gap)
+            continue
         entry = {
             "source": t.get("source", "register-natives"),
             "registerNativesCallSite": t["callSite"],
@@ -438,7 +456,7 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
             )
     native_registry: list[dict[str, Any]] = [
         {"classNameCandidate": name} for name in classes_in_pool
-    ] + jni_exports + flat_methods
+    ] + jni_exports + flat_methods + unreadable_tables
     # JNI ID cache-table: bind every cclasses/cfields/cmethods slot
     # address back to its (owner_slot_addr, name, desc) by scanning the
     # binary for GetField/MethodID call sites. The lifter consumes this
@@ -455,6 +473,18 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
         except Exception as exc:  # noqa: BLE001
             cache_table = {"error": f"{type(exc).__name__}: {exc}"}
 
+    analysis: dict[str, Any] = {
+        "profile": profile.name,
+        "methodDiscovery": "jni-spec",
+    }
+    # Only surface the gap fact when there is one, so images with no
+    # unreadable table keep a minimal, stable ``analysis`` block. The detailed
+    # per-site records live in ``nativeRegistry`` under
+    # ``source="register-natives-unreadable"``; this is the honest count the
+    # CLI reports and manifest-merge turns into a binding gap.
+    if unreadable_tables:
+        analysis["unreadableTables"] = len(unreadable_tables)
+
     return BinaryReport(
         schema_version=1,
         input_path=str(path),
@@ -470,10 +500,7 @@ def introspect(path: Path, profile_name: str | None = None) -> BinaryReport:
         native_registry=native_registry,
         per_class_lookups=[],
         cache_table=cache_table,
-        analysis={
-            "profile": profile.name,
-            "methodDiscovery": "jni-spec",
-        },
+        analysis=analysis,
     )
 
 

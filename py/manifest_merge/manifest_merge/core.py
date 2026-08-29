@@ -215,6 +215,37 @@ def merge(classes: dict[str, Any], binary: dict[str, Any] | None) -> dict[str, A
             }
         site["boundTo"] = cname
 
+    # A RegisterNatives site whose in-image JNINativeMethod[] was visible but
+    # unreadable (encrypted / XOR'd name & descriptor bytes) is carried over
+    # from binary.json as a first-class gap. It has no fnAddrs and no decoded
+    # methods, so the binding loops above never touch it and never bind garbage;
+    # record it as an explicit binding gap rather than letting the unreadable
+    # table disappear from the manifest.
+    for entry in (binary or {}).get("nativeRegistry") or []:
+        if entry.get("source") != "register-natives-unreadable":
+            continue
+        n = entry.get("nMethods")
+        location = (
+            entry.get("registerNativesCallSite") or entry.get("tableAddress")
+        )
+        reason = entry.get("reason", "invalid-method-descriptors")
+        gap = {
+            "kind": "unreadable-table",
+            "nMethods": n,
+            "reason": reason,
+            "message": (
+                f"RegisterNatives table{f' at {location}' if location else ''} "
+                "was seen but its method name/descriptor bytes did not decode "
+                f"({reason}); "
+                f"{n if n is not None else 'unknown'} method"
+                f"{'s' if n != 1 else ''} left unbound"
+            ),
+        }
+        for key in ("source", "registerNativesCallSite", "tableAddress"):
+            if entry.get(key) is not None:
+                gap[key] = entry[key]
+        out["bindingGaps"].append(gap)
+
     lookups_by_class: dict[str, dict[str, Any]] = {}
     for entry in (binary or {}).get("perClassLookups") or []:
         # Some implementations key per-class lookups by classId (int); we accept either

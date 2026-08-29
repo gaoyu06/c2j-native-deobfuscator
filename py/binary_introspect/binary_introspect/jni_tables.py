@@ -442,6 +442,11 @@ def _harvest_call(
         fn_addrs = fn_addrs[-n_methods:]
 
     methods: list[dict[str, Any]] = []
+    # The third-argument table pointer as loaded, captured before the decode
+    # loop can reassign ``methods_table_va``. When decode fails this remembers
+    # the visible-but-unreadable table address so discovery can record an honest
+    # gap instead of silently dropping the call site.
+    arg3_table_va = methods_table_va
     table_candidates = (
         ([methods_table_va] if methods_table_va is not None else [])
         + list(reversed(address_candidates))
@@ -470,6 +475,7 @@ def _harvest_call(
         "nMethods": n_methods,
         "methods": methods,
         "tableAddress": methods_table_va if methods else None,
+        "tableCandidate": arg3_table_va,
     }
 
 
@@ -631,6 +637,28 @@ def find_jni_method_tables(
                     })
                 continue
         if not h["fnAddrs"]:
+            # A RegisterNatives call site was found but no function pointers
+            # were recovered. Distinguish an honest gap — the third argument
+            # points at an in-image ``JNINativeMethod[]`` of a known length
+            # whose name/descriptor bytes do not decode (encrypted / XOR'd /
+            # high-bit garbage) — from a site with nothing observable at all.
+            # Record the visible-but-unreadable table as a first-class gap
+            # rather than silently dropping it; never fabricate names or
+            # fnAddrs from the garbage.
+            if (
+                not h["methods"]
+                and h.get("tableCandidate") is not None
+                and h.get("nMethods")
+            ):
+                tables.append({
+                    "callSite": hex(site),
+                    "nMethods": h["nMethods"],
+                    "profile": profile.name,
+                    "abi": abi.name,
+                    "source": "register-natives-unreadable",
+                    "tableAddress": hex(h["tableCandidate"]),
+                    "reason": "invalid-method-descriptors",
+                })
             continue
         table = {
             "callSite": hex(site),

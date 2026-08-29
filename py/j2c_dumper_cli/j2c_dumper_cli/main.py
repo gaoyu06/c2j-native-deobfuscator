@@ -122,11 +122,16 @@ def _run_inspect_binary(
     # here: they live on the manifest, not binary.json, and only exist after the
     # merge stage binds tables to jar classes.
     selected_profile = (report.analysis or {}).get("profile", "?")
+    # An unreadable table is a visible RegisterNatives site whose method
+    # name/descriptor bytes did not decode; surface the honest count so the
+    # gap is never silently dropped from the human output.
+    unreadable_tables = (report.analysis or {}).get("unreadableTables", 0)
     console.print(
         f"inspect-binary: {output} "
         f"format={report.fmt} arch={report.arch} "
         f"profile={selected_profile} "
-        f"registry-records={len(report.native_registry)}"
+        f"registry-records={len(report.native_registry)} "
+        f"unreadableTables={unreadable_tables}"
     )
 
 

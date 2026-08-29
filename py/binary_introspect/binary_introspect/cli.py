@@ -43,7 +43,8 @@ def introspect_cmd(lib: Path, output: Path, profile_name: str | None,
         f"profile={report.analysis.get('profile')}\n"
         f"  strings={len(report.string_pool)} hidden-classes={len(report.hidden_classes)} "
         f"exports={len(report.exported_functions)} "
-        f"registry-records={len(report.native_registry)}",
+        f"registry-records={len(report.native_registry)} "
+        f"unreadableTables={report.analysis.get('unreadableTables', 0)}",
         err=True,
     )
 
@@ -72,7 +73,8 @@ def main(lib: Path, output: Path, profile_name: str | None) -> None:
         f"profile={report.analysis.get('profile')}\n"
         f"  strings={len(report.string_pool)} hidden-classes={len(report.hidden_classes)} "
         f"exports={len(report.exported_functions)} "
-        f"registry-records={len(report.native_registry)}",
+        f"registry-records={len(report.native_registry)} "
+        f"unreadableTables={report.analysis.get('unreadableTables', 0)}",
         err=True,
     )
 
