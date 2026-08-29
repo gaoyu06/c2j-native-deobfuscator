@@ -34,6 +34,10 @@ oracle.
 
 License: **GPLv3**.
 
+The [optional observer contract](docs/privileged-observer.md) is off by
+default and unsigned by this project. It is not required for JAR recovery; no
+kernel image or kernel source is shipped.
+
 ---
 
 ## Run it yourself

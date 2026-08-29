@@ -1,138 +1,116 @@
-# Privileged observer (optional, documentation only)
+# Optional privileged-observer userspace module
 
-Status: **not implemented, and nothing in this repository implements
-it.** There is no kernel source, no driver project, no build target and
-no binary. This document exists so the option is described honestly
-before anyone starts, and so the boundary around it is written down.
+This advanced module is optional and **off by default**. It is a userspace
+plugin host for JNI-native transpiled JAR recovery; it is not a kernel feature
+and is not required for JVMTI, process inspection, or library instrumentation.
 
-Read [native-x86-module.md](native-x86-module.md) first; the non-goals
-listed there apply here in full and are not relaxed by privilege.
+This repository ships **no kernel image and no kernel source**. If an operator
+needs a higher-privilege backend, they must enable their operating system's
+debug or test-signing configuration themselves and build and maintain that
+backend out of tree. This repository does not include that backend or automate
+those operating-system settings.
 
----
+Read [native-x86-module.md](native-x86-module.md) first; the user-mode
+non-goals listed there apply here in full and are not relaxed by privilege.
 
-## What it would be
+## Build and run the Linux backend
 
-A separate, optional component that observes at a higher privilege level
-than the user-mode host, for authorized diagnostics on software the user
-owns or is otherwise permitted to analyze. Its only job would be to
-produce the same generic records the user-mode path produces —
-module loads, symbol resolutions, call sites — in situations where a
-user-mode observer structurally cannot see them.
+The shipped backend reads `/proc/<pid>/maps`. It only reports module path and
+mapped address metadata.
 
-It would sit **behind the same plugin ABI**
-([plugin-abi.md](plugin-abi.md)). Consumers would not know which
-observer produced a record, and would gain no new record types from it.
-If a privileged observer would need a new event kind, that is a signal
-it has drifted outside the intent described here.
+```sh
+make -C privileged-observer
+python3 privileged-observer/observer.py \
+  --pid "$$" \
+  --i-enable-privileged-observer \
+  --i-own-this-process
+```
 
-## Why it is optional, and stays optional
+Both confirmation flags are mandatory. The host refuses to load a plugin
+without `--i-enable-privileged-observer`, and it refuses a live PID without
+`--i-own-this-process`. It also verifies that `/proc/<pid>` belongs to the
+current effective user; the Linux plugin independently verifies ownership
+before reading the map. Every refusal exits non-zero.
 
-- **Nothing depends on it.** JAR recovery does not need `native-x86/`;
-  `native-x86/` does not need a privileged observer. Two independent
-  layers of "safe to ignore".
-- **It cannot be shipped usefully.** See the operator burden below: on a
-  stock, fully locked-down desktop the component simply will not load,
-  and the project has no intention of changing that.
-- **The user-mode path is the product.** If a diagnostic can be done in
-  user mode, it should be, and the privileged path should never become
-  the default answer to "the user-mode observer missed something".
+Use `--plugin PATH` to select another compatible userspace plugin. Selecting a
+plugin does not bypass either confirmation or the same-user check.
 
-## What the user would have to do
+## Versioned plugin ABI
 
-The component would be **unsigned**. No signed driver is provided, and
-distributing one is not planned. Loading unsigned privileged code
-requires the machine owner to weaken a platform security guarantee
-themselves, deliberately and visibly:
+`privileged-observer/include/privileged_observer_plugin.h` defines ABI version
+1. A shared-library plugin exports:
 
-- On Windows: enabling test signing, or booting with driver-signature
-  enforcement disabled. Both are global machine states, both are visible
-  to the user (a desktop watermark, a changed boot configuration), and
-  both may disable other protections — including features that other
-  software depends on.
-- On Linux: a locally built out-of-tree module, or a local signing key
-  enrolled by the machine owner. On a Secure Boot machine with kernel
-  lockdown, unsigned modules do not load at all.
+```c
+const struct po_plugin_v1 *po_plugin_query(uint32_t host_abi_version);
+```
 
-This project would never automate those steps, ship a helper that
-performs them, or work around them. If the operating system says no,
-the answer is no. Nothing here is a bypass of a signing or integrity
-check; the only supported route is the machine owner explicitly changing
-their own machine's configuration and understanding what they gave up.
+The host requests exactly the ABI version it understands and rejects a null,
+mismatched, or undersized descriptor. Plugins declare a capability bitmask.
+The shipped `linux-proc-maps` plugin declares only `maps-read`; the v1 callback
+can emit only a path, base address, and end address.
 
-## Intent, at a high level
+The ABI contains no process-memory read operation and no channel for keys,
+buffers, payloads, or TLS interception. A future on-disk ELF symbol provider
+can use a separately versioned metadata capability; v1 does not read or emit
+symbols.
 
-Observe-only, and structural:
+## JSON-lines module records
 
-- Report the same record kinds the user-mode observer reports.
-- Report **program structure** — which image, at which base, which
-  symbol, which call site — never program data.
-- Stay passive. No modification of the observed target's code, memory,
-  data or control flow. No blocking, filtering, injecting or rewriting
-  of anything.
+The host normalizes map entries into one UTF-8 JSON object per line:
 
-Any mechanism detail beyond that statement of intent is intentionally
-absent. This is a boundary document, not an implementation guide, and
-it should stay that way until there is a concrete, reviewed reason for
-the component to exist at all.
+```json
+{"base_address":4194304,"end_address":4329472,"image_size":135168,"kind":"module-load","module_name":"libexample.so","path":"/usr/lib/libexample.so","process_id":4242}
+```
 
-## Explicit non-goals
+All fields are required. Addresses and sizes are JSON integers.
 
-Privilege does not unlock anything that is off-limits in user mode. The
-following are excluded here, permanently, and no pull request should
-propose them under this heading:
+| Field | Meaning |
+|---|---|
+| `kind` | Always `module-load`. |
+| `process_id` | Positive operating-system process identifier. |
+| `module_name` | Final component of the mapped module path. |
+| `path` | Mapped module path reported by the operating system. |
+| `base_address` | Start of the normalized module address range. |
+| `end_address` | Exclusive end of the normalized module address range. |
+| `image_size` | `end_address - base_address`. |
 
-- **No stealth.** No hiding the observer from the target, from the OS,
-  from a debugger or from the user. No anti-debug evasion, no
-  anti-analysis countermeasures, no attempt to be hard to notice. The
-  component is meant to be obvious.
-- **No signature or integrity bypass.** Nothing to defeat code signing,
-  driver-signature enforcement, secure boot, licensing or tamper checks.
-  The user relaxes their own machine's policy or the component does not
-  run.
-- **No hidden loaders.** No injection, no self-installing service, no
-  persistence, no packing or obfuscation of the component itself, and no
-  loading of code the user did not name.
-- **No interception or modification.** No TLS interception, no traffic
-  capture or rewriting, no credential or key capture, no alteration of
-  what the target computes. Well-known cryptographic library entry points
-  (OpenSSL, CNG, AES primitives) may be *named* and *observed* at
-  entry/return as points of interest — the same metadata-only way the
-  user-mode host does (see
-  [plugins/crypto-libraries.md](plugins/crypto-libraries.md)). Capturing
-  the content those functions move, or altering their behaviour, is not
-  in scope at any privilege level.
-- **No data exfiltration.** Records stay on the machine that produced
-  them; the component has no network behaviour.
+These are module/map names and addresses only. There are no content,
+argument-value, return-value, or raw-memory fields.
 
-## Support burden (the reason to say no)
+## Relationship to native-x86
 
-If this component existed, the project would inherit:
+This module owns the optional privileged-observer contract. The
+[native-x86 module](native-x86-module.md) is user-mode observation. The two
+may represent compatible `module-load` metadata, but this module does not
+replace native-x86 or make it higher-privilege. Nothing in JAR recovery
+depends on `native-x86/`, and nothing in `native-x86/` depends on this
+module.
 
-- **Per-kernel maintenance.** Privileged interfaces are not stable
-  across kernel or OS releases the way user-mode APIs are. Every update
-  is a potential rebuild, retest and re-release.
-- **Crash blast radius.** A user-mode bug ends a process. A privileged
-  bug takes the machine down, and the resulting reports are hard to
-  reproduce and hard to triage.
-- **Unreproducible environments.** Bug reports would arrive from
-  machines in a security configuration the maintainers cannot mirror in
-  CI, and CI cannot test the component at all — no hosted runner will
-  load an unsigned privileged module.
-- **Support questions that are not about this project.** "Test signing
-  broke feature X" and "my machine will not boot" become inbox items.
-- **Review load.** Every contribution would need review against the
-  non-goals above, by someone qualified to judge privileged code.
-- **Reputational and distribution risk.** An unsigned privileged
-  component attracts both malware heuristics and use cases this project
-  refuses to serve.
+## Kernel / higher-privilege backend (not implemented)
 
-The honest summary: the cost is high, permanent, and paid by
-maintainers, while the benefit applies to a narrow set of cases. A
-concrete, repeated diagnostic need that user-mode observation provably
-cannot serve is the minimum bar for revisiting this.
+A kernel-mode or other higher-privilege backend is **not implemented**. There
+is no kernel source, no driver project, no build target, and no binary. No
+signed driver is provided, and distributing one is not planned.
 
-## Decision status
+If such a backend existed, the machine owner would have to weaken a platform
+security guarantee themselves (Windows test signing, Linux out-of-tree module
+or local signing key). This project will never automate those steps, ship a
+helper that performs them, or work around them.
 
-Open, and reserved for a human. Nothing about it is settled by the
-skeleton in `native-x86/`, and the user-mode ABI does not assume it will
-ever exist.
+A privileged backend, if ever added out of tree, would stay observe-only and
+structural: the same record kinds as user-mode, program structure only, no
+stealth, no signature bypass, no interception or content capture. Privilege
+does not unlock anything that is off-limits in user mode.
+
+The support cost of an in-tree kernel component is high and permanent. The
+recommended default remains **no**. Revisiting that decision requires a
+concrete, repeated diagnostic need that user-mode observation cannot serve.
+
+## Non-goals
+
+- Observing a process that the operator does not own.
+- Modifying a process or changing its control flow.
+- Collecting process memory, content, or transport data.
+- Changing operating-system security policy.
+- Stealth, anti-analysis countermeasures, hidden loaders, or persistence.
+- TLS interception, credential or key capture, or rewriting target behavior.
