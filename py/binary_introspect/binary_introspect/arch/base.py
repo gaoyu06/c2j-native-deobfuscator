@@ -51,6 +51,17 @@ class Abi:
     # Methods (overridable but with sensible defaults).
     # ----------------------------------------------------------------
 
+    def begin_scan(self, read_word=None) -> None:
+        """Hook called once before a disassembly scan of a binary.
+
+        ``read_word(va, size)`` returns a little-endian integer read from the
+        mapped image at ``va`` (or ``None`` when the address is not mapped).
+        Only architectures whose "address of constant" form dereferences a
+        literal pool (32-bit ARM) need it; the default just records it so a
+        subclass can consume it, and is otherwise a no-op.
+        """
+        self._scan_read_word = read_word
+
     def disassembler(self):
         """Construct a configured capstone Cs object. Lazy import so
         capstone is only required for arches that actually use it."""

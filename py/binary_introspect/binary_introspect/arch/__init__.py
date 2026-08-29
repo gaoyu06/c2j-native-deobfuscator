@@ -18,6 +18,6 @@ register its :class:`Abi` instance with :func:`register_abi`.
 from __future__ import annotations
 
 from .base import Abi, register_abi, get_abi, list_abis, detect_abi
-from . import amd64_windows, amd64_sysv, aarch64  # ensure built-ins register
+from . import amd64_windows, amd64_sysv, aarch64, arm_aapcs32  # ensure built-ins register
 
 __all__ = ["Abi", "register_abi", "get_abi", "list_abis", "detect_abi"]

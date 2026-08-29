@@ -572,6 +572,20 @@ def find_jni_method_tables(
     mapped_rngs = _mapped_ranges(b, image_base)
     relocations = _relocation_targets(b, image_base, mapped_rngs)
 
+    # Give the ABI a way to read literal-pool words during the scan. 32-bit ARM
+    # forms a constant's address by loading a PC-relative offset from the
+    # function's literal pool (in an executable section) and adding PC; folding
+    # that back requires reading the pooled word. Other arches ignore this.
+    def _read_word(va: int, size: int = 4) -> int | None:
+        raw = _read_at(mapped_rngs, va, size)
+        if raw is None:
+            raw = _read_at(exec_rngs, va, size)
+        if raw is None:
+            return None
+        return int.from_bytes(raw, "little", signed=False)
+
+    abi.begin_scan(_read_word)
+
     sites = _find_register_natives_calls(
         cs, abi, exec_rngs, profile.register_natives_index
     )
