@@ -19,6 +19,23 @@ The current binary introspection and emulation backends support:
 | ELF 32-bit x86 (i386) | System V (cdecl) | stack (`push`) | stack (`push $imm`) |
 
 `RegisterNatives` is identified as JNI vtable index 215. The scanner reads
+Capstone operands, not rendered instruction text. It then requires supporting
+facts near the call: an immediate table length in the ABI's fourth argument,
+function-address LEAs into executable ranges, or a third-argument pointer to a
+valid in-image `JNINativeMethod[]`.
+
+For a static table, every entry must contain:
+
+1. a readable method-name string;
+2. a valid JVM method descriptor;
+3. a function pointer into an executable range.
+
+Stack-built tables can still yield an ordered `fnAddrs` list when names and
+descriptors are materialized only at runtime. `manifest-merge` binds named
+tables first and uses count/order only as a fallback.
+
+Specification-defined `Java_*` exports are also recorded. Their encoded names
+are matched exactly against the JAR's native methods during manifest creation.
 
 ## Proven object formats and registration families
 
@@ -163,7 +180,10 @@ binds them by count and **records a `bindingGaps` entry** whenever a branch's
 count matches more than one class, never guessing a bind.
 
 This is a draft development capability, not a default-release path: `recover`'s
-defaults are unchanged and continue to use the conservative `generic` profile.
+defaults are unchanged. `recover` runs `inspect-binary` with no explicit
+`--profile`, so it auto-detects the profile and falls back to the conservative
+`generic` profile when no variant detector fires — it does not force
+`--profile generic`.
 
 ### Section-header-removed ELF (`PT_LOAD` fallback)
 
@@ -205,25 +225,6 @@ Whenever a `RegisterNatives` table is count-only or matches multiple classes by
 count — including each branch of a shared-dispatch call site — `manifest-merge`
 records it in `bindingGaps` instead of guessing a bind. The default `recover`
 pipeline is unchanged by this work.
-
-
-Capstone operands, not rendered instruction text. It then requires supporting
-facts near the call: an immediate table length in the ABI's fourth argument,
-function-address LEAs into executable ranges, or a third-argument pointer to a
-valid in-image `JNINativeMethod[]`.
-
-For a static table, every entry must contain:
-
-1. a readable method-name string;
-2. a valid JVM method descriptor;
-3. a function pointer into an executable range.
-
-Stack-built tables can still yield an ordered `fnAddrs` list when names and
-descriptors are materialized only at runtime. `manifest-merge` binds named
-tables first and uses count/order only as a fallback.
-
-Specification-defined `Java_*` exports are also recorded. Their encoded names
-are matched exactly against the JAR's native methods during manifest creation.
 
 ## One-command static-lite path
 
