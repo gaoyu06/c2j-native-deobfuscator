@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,12 @@ from binary_introspect.profile import detect_profile, get_profile
 
 
 FIXTURES = Path(__file__).with_name("fixtures")
+# py/binary_introspect/tests/ -> py/binary_introspect/ -> py/ -> repo root.
+SCHEMAS = Path(__file__).resolve().parents[3] / "schemas"
+
+
+def _load_schema(name: str) -> dict:
+    return json.loads((SCHEMAS / name).read_text(encoding="utf-8"))
 
 
 def _lea(insn: bytes, address: int, target: int) -> bytes:
@@ -1222,6 +1229,77 @@ def test_unreadable_table_leaves_two_method_class_unbound_with_gap() -> None:
     assert gaps[0]["nMethods"] == 2
     assert gaps[0]["source"] == "register-natives-unreadable"
     assert gaps[0]["registerNativesCallSite"].startswith("0x")
+
+
+def test_unreadable_fixture_binary_json_validates_against_schema() -> None:
+    """A real ``introspect`` of the visible-but-unreadable-table fixture must
+    produce a ``binary.json`` that validates against ``binary.schema.json`` —
+    including the new ``analysis.unreadableTables`` count and the
+    ``register-natives-unreadable`` registry record carrying a ``reason``."""
+    jsonschema = pytest.importorskip("jsonschema")
+
+    report = introspect(FIXTURES / "libjni_unreadable_table.so")
+    binary = report.to_json_obj()
+
+    # The declared fields the schema must now accept (not merely tolerated by
+    # additionalProperties): the honest unreadable-table count and reason.
+    assert binary["analysis"]["unreadableTables"] == 1
+    unreadable = [
+        entry
+        for entry in binary["nativeRegistry"]
+        if entry.get("source") == "register-natives-unreadable"
+    ]
+    assert len(unreadable) == 1
+    assert unreadable[0]["reason"] == "invalid-method-descriptors"
+
+    schema = _load_schema("binary.schema.json")
+    jsonschema.Draft7Validator.check_schema(schema)
+    jsonschema.Draft7Validator(schema).validate(binary)
+
+
+def test_unreadable_fixture_merge_manifest_validates_against_schema() -> None:
+    """The reviewer's exact failure: a real merge of the unreadable-table
+    fixture against a 2-native-method class produces a manifest whose
+    ``bindingGaps`` entry has ``kind: unreadable-table`` and no
+    ``candidateClasses``. It must validate against ``manifest.schema.json``
+    (the ``oneOf`` unreadable-table variant), not be rejected for a missing
+    ``candidateClasses``."""
+    jsonschema = pytest.importorskip("jsonschema")
+    from manifest_merge.core import merge
+
+    report = introspect(FIXTURES / "libjni_unreadable_table.so")
+    binary = report.to_json_obj()
+    classes = {
+        "input": {"jarPath": "input.jar"},
+        "classes": [
+            {
+                "name": "com/example/Enc",
+                "methods": [
+                    {
+                        "name": "a",
+                        "desc": "()V",
+                        "access": 0x0100,
+                        "isObfuscatedNative": True,
+                    },
+                    {
+                        "name": "b",
+                        "desc": "(I)I",
+                        "access": 0x0100,
+                        "isObfuscatedNative": True,
+                    },
+                ],
+            }
+        ],
+    }
+    manifest = merge(classes, binary)
+
+    gap = manifest["bindingGaps"][0]
+    assert gap["kind"] == "unreadable-table"
+    assert "candidateClasses" not in gap
+
+    schema = _load_schema("manifest.schema.json")
+    jsonschema.Draft7Validator.check_schema(schema)
+    jsonschema.Draft7Validator(schema).validate(manifest)
 
 
 def test_introspect_real_i386_elf_recovers_static_table_and_export() -> None:

@@ -1,4 +1,18 @@
+import json
+from pathlib import Path
+
+import pytest
+
 from manifest_merge.core import _jni_export_names, merge
+
+# py/manifest_merge/tests/ -> py/manifest_merge/ -> py/ -> repo root.
+SCHEMAS = Path(__file__).resolve().parents[3] / "schemas"
+
+
+def _manifest_schema() -> dict:
+    return json.loads(
+        (SCHEMAS / "manifest.schema.json").read_text(encoding="utf-8")
+    )
 
 
 def _classes(methods):
@@ -210,3 +224,100 @@ def test_unreadable_register_natives_entry_is_recorded_as_binding_gap() -> None:
             "tableAddress": "0x3ef0",
         }
     ]
+
+
+def test_ambiguous_count_only_gap_manifest_validates_against_schema() -> None:
+    """An ``ambiguous-count-only-table`` gap manifest (the shared-dispatch
+    ambiguous case) must still validate against ``manifest.schema.json`` after
+    the ``bindingGaps`` items became a ``oneOf`` — the ambiguous variant keeps
+    its ``candidateClasses`` (minItems 2) requirement."""
+    jsonschema = pytest.importorskip("jsonschema")
+
+    classes = {
+        "input": {"jarPath": "input.jar"},
+        "classes": [
+            {
+                "name": owner,
+                "methods": [
+                    {
+                        "name": method_name,
+                        "desc": "()V",
+                        "access": 0x0100,
+                        "isObfuscatedNative": True,
+                    }
+                ],
+            }
+            for owner, method_name in (
+                ("sample/First", "first"),
+                ("sample/Second", "second"),
+            )
+        ],
+    }
+    site = {
+        "source": "register-natives-stack",
+        "registerNativesCallSite": "0x5000",
+        "fnAddrs": ["0x401000"],
+    }
+    manifest = merge(classes, {"nativeRegistry": [site]})
+
+    gap = manifest["bindingGaps"][0]
+    assert gap["kind"] == "ambiguous-count-only-table"
+    assert len(gap["candidateClasses"]) >= 2
+
+    schema = _manifest_schema()
+    jsonschema.Draft7Validator.check_schema(schema)
+    jsonschema.Draft7Validator(schema).validate(manifest)
+
+
+def test_unreadable_gap_manifest_validates_against_schema() -> None:
+    """The ``unreadable-table`` gap manifest must validate against the new
+    ``oneOf`` variant — required ``kind``/``nMethods``/``message`` and NO
+    required ``candidateClasses`` (unreadable tables are not attributed by
+    count)."""
+    jsonschema = pytest.importorskip("jsonschema")
+
+    classes = _classes([("alpha", "()V"), ("beta", "(I)I")])
+    manifest = merge(
+        classes,
+        {
+            "nativeRegistry": [
+                {
+                    "source": "register-natives-unreadable",
+                    "registerNativesCallSite": "0x1016",
+                    "nMethods": 2,
+                    "tableAddress": "0x3ef0",
+                    "reason": "invalid-method-descriptors",
+                }
+            ]
+        },
+    )
+
+    gap = manifest["bindingGaps"][0]
+    assert gap["kind"] == "unreadable-table"
+    assert "candidateClasses" not in gap
+
+    schema = _manifest_schema()
+    jsonschema.Draft7Validator(schema).validate(manifest)
+
+
+def test_schema_still_requires_ambiguous_gap_candidate_classes() -> None:
+    """Lock-in: the old ``ambiguous-count-only-table`` required fields are not
+    weakened. An ambiguous gap missing ``candidateClasses`` must be REJECTED
+    (it matches neither ``oneOf`` variant), proving the ``oneOf`` did not turn
+    into an accept-anything shape."""
+    jsonschema = pytest.importorskip("jsonschema")
+
+    bad = {
+        "schemaVersion": 1,
+        "classes": [],
+        "bindingGaps": [
+            {
+                "kind": "ambiguous-count-only-table",
+                "nMethods": 2,
+                "message": "missing candidateClasses",
+            }
+        ],
+    }
+    schema = _manifest_schema()
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.Draft7Validator(schema).validate(bad)

@@ -9,6 +9,12 @@ dependencies = [
     "click>=8.1.7",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "jsonschema>=4.0",
+]
+
 [project.scripts]
 binary-introspect = "binary_introspect.cli:main"
 
