@@ -8,11 +8,12 @@ and its derivatives (e.g. j2cc) — anything that transpiles JVM bytecode
 to C++ then re-invokes Java through the JNI from a packaged
 `.dll` / `.so`.
 
-Three complementary recovery paths:
+Four complementary recovery paths (only **Dynamic** is the default
+`recover` flow):
 
 | Path | Input | Approach |
 |---|---|---|
-| **Dynamic** | obfuscated jar + a runnable command | Attach a JVMTI agent, observe the JNI call stream, lift it back to JVM bytecode |
+| **Dynamic** | obfuscated jar + a runnable command | Load a JVMTI agent at startup, observe the JNI call stream, lift it back to JVM bytecode |
 | **Static-lite** | transpiled jar + native blob | Discover JNI method tables, build a manifest, and emit restoration stubs without Ghidra |
 | **Static body** | offline manifest + optional Ghidra | After discovery, optionally decompile each function and lift pseudo-C to JVM bytecode |
 | **Emulation** | obfuscated blob (no run, no Ghidra) | Run the native code under a CPU emulator + mock JNI; recover the method table, dump decrypted constants, and call methods as pure-function oracles |
@@ -38,6 +39,39 @@ The [optional observer contract](docs/privileged-observer.md) is off by
 default and unsigned by this project. It is not required for JAR recovery; no
 kernel image or kernel source is shipped.
 
+Current architecture, every surface, and default-vs-preview status:
+**[docs/overview.md](docs/overview.md)**
+([中文](docs/overview.zh-CN.md)).
+
+---
+
+## Architecture at a glance
+
+```
+  CLI (scripts/j2c)  ·  optional desktop viewer (scripts/gui.sh)
+                         │  versioned JSON (schemas/)
+          Discovery ─────┼───── Recovery engines ───── Rebuild
+   parse-jar / inspect-  │   dynamic JVMTI (default)    class-rebuilder
+   binary / merge-       │   attach (preview)           → out.jar
+   manifest              │   static-lite (draft-dev)
+                         │   emulate / Ghidra body (optional)
+
+  Adjacent, not on the JAR path:
+    native-x86/                 user-mode metadata observation
+    privileged-observer/        userspace maps; default off
+```
+
+| Surface | Role | Default? |
+|---|---|---|
+| `scripts/j2c recover` | Startup `-agentpath` dynamic recovery | **Yes** |
+| `parse-jar` / `inspect-binary` / `merge-manifest` / `static-lite` | Ghidra-free method discovery + stubs | No (draft-dev) |
+| `emulate` | Unicorn + mock JNI (table / strings / oracle) | No |
+| Ghidra + `static-reverse` | Optional pseudo-C method bodies | No |
+| `scripts/j2c attach` | Live same-user JVMTI attach | No (preview) |
+| `scripts/gui.sh` | Swing + FlatLaf artifact / attach viewer | No (optional) |
+| `native-x86/` | Process-image metadata, plugin ABI 0.2 | No (preview; not on the JAR path) |
+| `privileged-observer/` | Userspace `/proc` maps | No (default **off**) |
+
 ---
 
 ## Run it yourself
@@ -56,9 +90,10 @@ scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 > `python3 -m j2c_dumper_cli` on the *system* interpreter would not find the
 > packages. The launcher picks the interpreter that actually has them.
 
-See [Quick start](#quick-start) below and the
+See [Quick start](#quick-start) below, the
 [10-minute getting-started guide](docs/getting-started.md)
-([中文](docs/getting-started.zh-CN.md)).
+([中文](docs/getting-started.zh-CN.md)), and the
+[architecture overview](docs/overview.md).
 
 **When the auto-output needs a human pass.** This project is a *universal*
 approach for the whole "transpile Java → C/C++ and call back via JNI"
@@ -170,6 +205,15 @@ fine on its own.
   index 171, `RegisterNatives` = 215, `ExceptionCheck` = 228, …), so the
   same engine generalizes across the family. Backends: x86-64 PE/Win64
   and ELF/System-V. See [`docs/emulation-recovery.md`](docs/emulation-recovery.md).
+
+### Optional desktop viewer
+
+- **Swing + FlatLaf** (`jvm/desktop-ui/`, **JDK 21** only for this
+  module). `scripts/gui.sh [session-dir]` opens a session folder and
+  shows methods, recovered bodies, pipeline status, binding gaps, and
+  a live `trace.jsonl` tail. **Attach / Listen** is a front end to
+  `scripts/j2c attach`; it does not invent a second protocol. Recovery
+  steps stay in the CLI. See [docs/desktop-gui.md](docs/desktop-gui.md).
 
 ### Shared
 
@@ -394,6 +438,19 @@ obtained. For full method-body recovery use the startup path. Live attach
 requires an explicit `--pid` and the `--i-own-this-process` confirmation, and
 refuses cross-user targets. Full details: [`docs/jvm-attach.md`](docs/jvm-attach.md).
 
+### Optional desktop viewer
+
+The Swing viewer is **not** required for recovery. After a `recover`
+`--workdir` run (or any session folder with the JSON artifacts):
+
+```bash
+scripts/gui.sh ./work          # Windows: scripts\gui.ps1 .\work
+```
+
+It shows methods, recovered bodies, pipeline status, and can run or
+listen to `attach`. The module needs **JDK 21**; the rest of the
+repository stays on JDK 17. See [`docs/desktop-gui.md`](docs/desktop-gui.md).
+
 ### Offline discovery and static-lite (no live run, no Ghidra)
 
 Start here when the JAR cannot run. These generic discovery stages inspect
@@ -410,7 +467,10 @@ scripts/j2c static-lite in.jar --lib natives.bin --profile generic -o static-lit
 ```
 
 See [`docs/generic-recovery.md`](docs/generic-recovery.md). `inspect-binary`
-prints `profile=`; `merge-manifest` prints `bindingGaps=`.
+prints `format/arch/profile=` and `unreadableTables=` on stderr;
+`merge-manifest` prints `bindingGaps=<n> kinds=…`. `bindingGaps` is not
+written into `binary.json`. A visible-but-unreadable `JNINativeMethod[]`
+becomes an `unreadable-table` gap, not a fabricated binding.
 
 For optional pseudo-C method-body lifting, run Ghidra after static-lite.
 `manifest.json` preserves `analysis.profile` from `binary.json`.
@@ -536,35 +596,54 @@ py/.venv/bin/python -m ast_matcher.cli --list-flags
 
 ---
 
-## Experimental: `native-x86/`
+## Preview: `native-x86/` (not on the JAR path)
 
-[`native-x86/`](native-x86/) is an **experimental skeleton**, separate
-from everything above: a small user-mode plugin ABI for generic x86
-process inspection (modules, symbols, call sites), with no JVM or JNI
-concepts in it. It is **not required for JAR recovery** — the dynamic,
-static and emulation paths ignore it entirely, and the directory can be
-deleted without affecting them.
+[`native-x86/`](native-x86/) is an **experimental / preview** user-mode
+host plus plugins for process-image metadata. It has **no Java types**
+in the public ABI (v0.2). The dynamic, static, and emulation paths do
+not depend on it; the directory can be deleted without affecting them.
 
-Today it ships a versioned C ABI, a host stub that loads a sample
-plugin, and documentation. It implements no instrumentation. See
-[`docs/native-x86-module.md`](docs/native-x86-module.md).
+What it does today:
+
+- Linux: same-user + `--i-own-this-process`; read-only modules/exports,
+  or a **single-thread** live pass (ptrace / INT3) that records
+  metadata-only entry/return of named exports.
+- Windows: read-only module/export snapshot (no live breakpoints).
+- Sample plugins name OpenSSL `SSL_*` / `RSA_*` / `AES_*` / `EVP_*`,
+  JNI-convention `Java_*`, and Windows CNG `BCrypt*` exports.
+
+What it does **not** do: TLS interception, buffer/key/content capture,
+stealth, or any kernel component. See
+[`docs/native-x86-module.md`](docs/native-x86-module.md) and
+[`docs/plugin-abi.md`](docs/plugin-abi.md).
+
+## Preview: privileged observer (userspace, default off)
+
+[`privileged-observer/`](privileged-observer/) is a separate userspace
+plugin host. The shipped Linux backend reads `/proc/<pid>/maps` and
+emits module path/address records. Both
+`--i-enable-privileged-observer` and `--i-own-this-process` are
+required. This repository ships **no kernel image and no kernel
+source**. See [`docs/privileged-observer.md`](docs/privileged-observer.md).
 
 ---
 
 ## Repository layout
 
 ```
-├── jvm/                        Kotlin/ASM modules (Gradle multi-project)
+├── scripts/                    j2c / j2c.ps1, setup, gui.sh / gui.ps1
+├── jvm/                        Kotlin/ASM modules (Gradle; JDK 17 except desktop-ui)
 │   ├── jar-parser/             input.jar  → classes.json
 │   ├── trace-to-bytecode/      manifest + trace.jsonl → recovered/*.json
 │   ├── class-rebuilder/        input.jar + recovered/ → output.jar
-│   └── common/                 shared schema types
-├── native/                     C++ JVMTI agent (zig c++ build)
-├── native-x86/                 experimental user-mode x86 plugin ABI skeleton
+│   ├── common/                 shared schema types
+│   └── desktop-ui/             Swing + FlatLaf viewer (JDK 21)
+├── native/                     C++ JVMTI agent (OnLoad + OnAttach; zig c++)
+├── native-x86/                 preview user-mode observation host + plugins
 │                               (not used by any recovery path)
+├── privileged-observer/        userspace maps host; default off; no kernel image
 ├── ghidra/scripts/             Ghidra headless scripts (Java)
 ├── py/                         Python modules (uv workspace)
-│   ├── jar_parser/             —
 │   ├── binary_introspect/      .dll / .so / natives.bin  → binary.json
 │   │   ├── arch/               per-arch / ABI implementations
 │   │   ├── jni_tables.py       RegisterNatives table discovery
@@ -577,7 +656,7 @@ plugin, and documentation. It implements no instrumentation. See
 │   ├── native_emulate/         emulation path: j2c_emu.py (Unicorn + mock JNI)
 │   └── snippet_importer/       (optional) native-obfuscator cppsnippets ingestor
 ├── .claude/skills/             j2c-deobfuscate skill (agent playbook)
-├── docs/                       ARCHITECTURE.md, ROADMAP.md, profile guide, …
+├── docs/                       overview, ARCHITECTURE, ROADMAP, …
 ├── schemas/                    JSON Schema for every artifact
 └── tests/                      e2e fixtures and pipeline tests
 ```
@@ -586,23 +665,30 @@ plugin, and documentation. It implements no instrumentation. See
 
 ## Documentation
 
+- [overview.md](docs/overview.md) — **start here for architecture and every
+  feature** ([中文](docs/overview.zh-CN.md))
 - [getting-started.md](docs/getting-started.md) — 10-minute default-path
   walkthrough, common failures, where the JSON artifacts land
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — module boundaries, pipeline,
   artifact schemas, extension points
+- [desktop-gui.md](docs/desktop-gui.md) — optional Swing viewer
+  ([module README](jvm/desktop-ui/README.md))
+- [jvm-attach.md](docs/jvm-attach.md) — opt-in live JVMTI attach (preview)
 - [emulation-recovery.md](docs/emulation-recovery.md) — emulation path how-to
   (+ command reference in [`py/native_emulate/README.md`](py/native_emulate/README.md))
 - [generic-recovery.md](docs/generic-recovery.md) — Ghidra-free method discovery,
-  manifests, stubs, and optional emulation
+  manifests, stubs, honest gaps, and optional emulation
 - [manual-restoration.md](docs/manual-restoration.md) — hand-cleaning recovered output
+- [options-and-status.md](docs/options-and-status.md) — decisions, merge status,
+  promotion gates
 - [ROADMAP.md](docs/ROADMAP.md) — known limitations and planned work
 - [adding-obfuscator-profile.md](docs/adding-obfuscator-profile.md) — how
   to register a new obfuscator variant
 - [static-reverse-approach.md](docs/static-reverse-approach.md) — design
   notes for the Ghidra-based path
-- [native-x86-module.md](docs/native-x86-module.md) — experimental
-  user-mode x86 module: boundary and non-goals
-  ([plugin ABI](docs/plugin-abi.md),
+- [native-x86-module.md](docs/native-x86-module.md) — preview user-mode
+  observation ([plugin ABI](docs/plugin-abi.md),
+  [crypto plugins](docs/plugins/crypto-libraries.md),
   [privileged observer](docs/privileged-observer.md))
 - [`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md) —
   the agent playbook (load this into your coding agent)

@@ -1,11 +1,13 @@
 # Architecture
 
 How `c2j-native-deobfuscator` is structured, and where to plug things in.
+For the product-level map (every surface, default vs preview), start at
+[overview.md](overview.md).
 
 ## Goals
 
 - Turn a JNI-native-obfuscated jar back into a jar with **real JVM
-  bytecode** in place of every native stub.
+  bytecode** in place of every native stub, when evidence allows.
 - Stay **obfuscator-agnostic** in the core pipeline; concentrate
   variant-specific knowledge in **profiles** and **architecture
   modules** that can be added without touching the main flow.
@@ -14,8 +16,14 @@ How `c2j-native-deobfuscator` is structured, and where to plug things in.
 - Each stage is a **standalone CLI** that consumes / produces a
   well-defined JSON artifact; the top-level orchestrator just chains
   them.
+- Keep optional surfaces (desktop viewer, live attach, native-x86,
+  privileged observer) **out of the default recover path**.
 
 ## Pipeline
+
+Discovery is shared. Recovery engines are alternatives. The desktop
+viewer and attach CLI sit on the artifact / agent boundary; they do
+not invent a second pipeline.
 
 ```
                  ┌────────────────────────────┐
@@ -29,35 +37,38 @@ How `c2j-native-deobfuscator` is structured, and where to plug things in.
                                                                     ▼
                                               ┌──────────────────────────┐
                                               │ manifest-merge           │
+                                              │  + bindingGaps           │
                                               └──────────────────────────┘
                                                             │
                                                             │ manifest.json
-                                ┌───────────────────────────┴───────────────────────────┐
-                                │                                                       │
-                                ▼ Dynamic path                          Static path     ▼
-              ┌────────────────────────────┐                       ┌─────────────────────────────┐
-              │ JVMTI agent (native/)      │                       │ Ghidra headless             │
-              │  hooks RegisterNatives +   │                       │   ExtractRegisterNatives    │
-              │  every key JNI fn          │                       │   DumpFromManifest          │
-              └────────────────────────────┘                       └─────────────────────────────┘
-                          │                                                            │
-                          │ trace.jsonl                                                │ ghidra-dump.json
-                          ▼                                                            ▼
-              ┌────────────────────────────┐                       ┌─────────────────────────────┐
-              │ trace-to-bytecode          │                       │ ast-matcher                 │
-              │  (Kotlin/ASM lifter)       │                       │  (Python tree-sitter + lifter)
-              └────────────────────────────┘                       └─────────────────────────────┘
-                          │                                                            │
-                          └──────────────┬──── recovered/*.json ────────────────┬──────┘
-                                         ▼                                      ▼
-                                ┌──────────────────────────────────────────────────────┐
-                                │ class-rebuilder                                      │
-                                │  replaces native stubs, strips loader + native blob  │
-                                └──────────────────────────────────────────────────────┘
-                                                       │
-                                                       ▼
-                                                    out.jar
+      ┌─────────────────────┬───────────────────┬───────────┴────────────┐
+      ▼ default             ▼ draft-dev         ▼ optional               ▼ optional
+ ┌──────────────┐     ┌──────────────┐    ┌──────────────┐         ┌──────────────┐
+ │ JVMTI agent  │     │ static-lite  │    │ emulate      │         │ Ghidra       │
+ │ -agentpath   │     │ stubs        │    │ unicorn      │         │ DumpFromMan. │
+ │ (or attach)  │     └──────┬───────┘    └──────┬───────┘         └──────┬───────┘
+ └──────┬───────┘            │ recovered stubs   │ oracle / strings       │ ghidra-dump
+        │ trace.jsonl        │                   │                        ▼
+        ▼                    │                   │                 ast-matcher
+ ┌──────┴───────┐            │                   │                        │
+ │trace-to-bc   │            │                   │                        │
+ └──────┬───────┘            │                   │                        │
+        └────────────────────┴───────────────────┴────────────────────────┘
+        │ recovered/*.json
+        ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ class-rebuilder  — replace stubs, strip loader + native blob → out.jar   │
+ └──────────────────────────────────────────────────────────────────────────┘
+
+ Surfaces (not engines):  scripts/j2c   ·   scripts/gui.sh (desktop-ui)
+ Adjacent (not on this path):  native-x86/   ·   privileged-observer/
 ```
+
+`recover` uses the **dynamic** column (`-agentpath` at startup).
+`attach` loads the same agent into an already-running same-user JVM
+and writes `trace.jsonl`; it does not rebuild a jar by itself.
+`static-lite` stops at stubs. Emulation does not auto-emit bytecode.
+Ghidra is only for optional method-body lift after discovery.
 
 ## Module boundaries
 
@@ -65,13 +76,17 @@ How `c2j-native-deobfuscator` is structured, and where to plug things in.
 |---|---|---|---|---|
 | `jvm/jar-parser` | Kotlin + ASM | input.jar | `classes.json` | Walk classes, find loader, flag obfuscated natives |
 | `py/binary_introspect` | Python + LIEF + capstone | .dll / .so | `binary.json` | Disassembly-driven discovery of native-method tables |
-| `py/manifest_merge` | Python | `classes.json` + `binary.json` | `manifest.json` | Cross-check + bind fn addresses to (class, method, desc) |
-| `native/` | C++ + JVMTI | runnable jar | `trace.jsonl` | Hook RegisterNatives + 80+ JNI fns at runtime |
+| `py/manifest_merge` | Python | `classes.json` + `binary.json` | `manifest.json` | Bind fn addresses; record `bindingGaps` |
+| `native/` | C++ + JVMTI | runnable or attachable JVM | `trace.jsonl` | `Agent_OnLoad` / `Agent_OnAttach`; hook RegisterNatives + 80+ JNI fns when capabilities allow |
 | `jvm/trace-to-bytecode` | Kotlin + ASM | `manifest.json` + `trace.jsonl` | `recovered/*.json` | Translate JNI call sequences back to JVM bytecode |
-| `ghidra/scripts/` | Java (Ghidra API) | native blob + manifest | `ghidra-dump.json` | Decompile each fn-addr to pseudo-C |
+| `ghidra/scripts/` | Java (Ghidra API) | native blob + manifest | `ghidra-dump.json` | Optional: decompile each fn-addr to pseudo-C |
 | `py/ast_matcher` | Python + tree-sitter | `ghidra-dump.json` + manifest | `recovered/*.json` | Lift pseudo-C to JVM bytecode |
 | `jvm/class-rebuilder` | Kotlin + ASM | input.jar + recovered + manifest | output jar | Replace stubs, strip loader |
-| `py/j2c_dumper_cli` | Python + typer | — | — | Top-level orchestrator |
+| `py/native_emulate` | Python + unicorn | native blob | registrations / strings / oracle | Execute under mock JNI; no bytecode emit |
+| `py/j2c_dumper_cli` | Python + typer | — | — | Top-level orchestrator (`scripts/j2c`) |
+| `jvm/desktop-ui` | Kotlin + Swing + FlatLaf | session directory | — | Optional viewer; JDK 21; runs attach only via the CLI |
+| `native-x86/` | C | owned process | metadata records | Preview process inspection; no Java types in the ABI |
+| `privileged-observer/` | C + Python | owned pid + two flags | module-map JSONL | Userspace maps only; default off; no kernel image |
 
 Schemas: `schemas/*.schema.json`.
 
@@ -132,8 +147,10 @@ CLI: `--enable <flag>` / `--disable <flag>` (repeatable),
 JSON Schema documents under `schemas/`:
 
 - `classes.schema.json`    — `jar-parser` output
-- `binary.schema.json`     — `binary-introspect` output
-- `manifest.schema.json`   — `manifest-merge` output
+- `binary.schema.json`     — `binary-introspect` output (`analysis.profile`,
+  `analysis.unreadableTables`)
+- `manifest.schema.json`   — `manifest-merge` output (`bindingGaps` as
+  `ambiguous-count-only-table` or `unreadable-table`)
 - `trace.schema.json`      — JVMTI agent line format
 - `recovered.schema.json`  — per-method recovered bytecode
 
@@ -151,15 +168,26 @@ Each schema is versioned (`schemaVersion: int`).
 4. **Fail soft.** When a single method's recovery is malformed (e.g.
    stack-imbalanced), the class-rebuilder falls back to a stub for
    that method only; the rest of the jar still ships.
+5. **Honest gaps.** Ambiguous or unreadable `RegisterNatives` tables
+   become `bindingGaps` / `unreadableTables`; they are never silent
+   empty successes and never fabricated names.
+6. **Optional surfaces stay optional.** The desktop viewer, live
+   attach, native-x86, and privileged observer must not become
+   prerequisites of `recover`.
 
 ## Runtime requirements
 
 | Component | Minimum |
 |---|---|
-| JDK (for build + runtime) | 21 |
+| JDK (repository baseline: build + recover) | 17 |
+| JDK (`jvm/desktop-ui` only) | 21 |
 | Python | 3.11 |
 | `lief` | any 0.14+ |
 | `capstone` | 5.x |
-| `tree-sitter-c` | any 0.21+ |
-| Ghidra (static path only) | 11.x |
+| `tree-sitter-c` | any 0.21+ (static body path) |
+| Ghidra (optional static body path only) | 11.x |
 | zig (native agent build) | 0.16+ |
+| unicorn (optional emulation) | any current |
+
+The native agent (`native/build.sh`) targets x86-64. On other CPUs setup
+skips it and `doctor` does not report the dynamic path as ready.
