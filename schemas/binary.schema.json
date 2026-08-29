@@ -31,6 +31,7 @@
         "type": "object",
         "properties": {
           "source":           { "type": "string" },
+          "reason":           { "type": "string" },
           "classId":          { "type": "integer" },
           "className":        { "type": "string" },
           "classNameCandidate": { "type": "string" },
@@ -72,7 +73,8 @@
       "type": "object",
       "properties": {
         "profile": { "type": "string" },
-        "methodDiscovery": { "type": "string" }
+        "methodDiscovery": { "type": "string" },
+        "unreadableTables": { "type": "integer", "minimum": 0 }
       }
     },
     "perClassLookups": {
