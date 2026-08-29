@@ -934,6 +934,192 @@ def test_shared_dispatch_tables_bind_by_count_and_gap_when_ambiguous() -> None:
     }
 
 
+def test_pe_j2cc_detector_selects_named_profile_on_real_dll() -> None:
+    """The NAMED ``j2cc`` profile detector (``_detect_j2cc``) fires on a REAL PE
+    x86-64 DLL — not the mocked LIEF object of
+    ``test_specific_profile_wins_when_its_detector_matches``.
+
+    LIEF confirms the PE magic and the AMD64 machine id; the two Java_* exports
+    (``initClass`` + ``bootstrap``, ``<=4``) plus a ``Cannot invoke `` literal
+    make ``_detect_j2cc`` outscore the generic fallback. ``introspect`` then
+    stamps the selected profile onto the report's ``analysis`` block. This is
+    the Windows sibling of the ELF ``auto``-harvest fixture and closes the gap
+    where the named detector was proven only by a mock (the committed ELF proved
+    generic ``auto`` harvest, not this detector, which returns 0.0 on ELF).
+    """
+    path = FIXTURES / "jni_dispatch_j2cc.dll"
+
+    binary = lief.parse(str(path))
+    assert binary.format == lief.Binary.FORMATS.PE
+    assert int(binary.header.machine) == 0x8664  # IMAGE_FILE_MACHINE_AMD64
+
+    assert detect_profile(binary) is get_profile("j2cc")
+
+    report = introspect(path)
+    assert report.fmt == "PE"
+    assert report.arch == "x86_64"
+    assert report.analysis == {"profile": "j2cc", "methodDiscovery": "jni-spec"}
+
+
+def test_pe_j2cc_shared_dispatch_recovers_two_tables_from_one_call_site() -> None:
+    """The ``j2cc`` profile's ``shared_dispatch`` harvest recovers BOTH stack
+    tables (``nMethods`` 2 and 3) from the ONE Microsoft x64 ``RegisterNatives``
+    call site on a real PE.
+
+    Unlike the ELF fixture (which exercises the generic ``auto`` fallback), this
+    binary selects the named ``j2cc`` profile, whose ``harvest_strategy`` is
+    ``shared_dispatch`` — the path in ``find_jni_method_tables`` that ALWAYS
+    calls ``_harvest_dispatch`` rather than the ``auto`` fallback. The two
+    branches (env in RCX, ``methods*`` in R8, ``nMethods`` in R9D, one
+    ``call *0x6b8(%rax)``) both precede the shared call, so both tables land in
+    the back-scan window. Recovered fnAddrs cross-check the ``fixture_*`` export
+    addresses; stack-built tables expose ordered fnAddrs but no fabricated
+    method names/descriptors.
+    """
+    path = FIXTURES / "jni_dispatch_j2cc.dll"
+    report = introspect(path)
+
+    assert report.analysis["profile"] == "j2cc"
+
+    tables = _stack_tables(report)
+    assert len(tables) == 2, (
+        "shared dispatch must yield two tables, not one collapsed bind"
+    )
+
+    # Both branches were harvested from the SAME RegisterNatives call site.
+    call_sites = {t["registerNativesCallSite"] for t in tables}
+    assert len(call_sites) == 1
+
+    assert all(t["abi"] == "amd64-windows" for t in tables)
+    assert all(t["profile"] == "j2cc" for t in tables)
+    # Stack-built tables carry ordered function pointers and a per-branch
+    # nMethods but NO decoded/fabricated names.
+    assert all("methods" not in t for t in tables)
+
+    by_count = {t["nMethods"]: t["fnAddrs"] for t in tables}
+    assert set(by_count) == {2, 3}
+
+    # Each recovered fnAddr cross-checks against its export address; a collapsed
+    # or misordered harvest would desync these.
+    assert by_count[2] == [
+        _export_addr(report, "fixture_alpha"),
+        _export_addr(report, "fixture_beta"),
+    ]
+    assert by_count[3] == [
+        _export_addr(report, "fixture_gamma"),
+        _export_addr(report, "fixture_delta"),
+        _export_addr(report, "fixture_epsilon"),
+    ]
+
+
+def test_pe_j2cc_java_exports_are_exactly_initclass_and_bootstrap() -> None:
+    """The dispatcher exports exactly the two Java_* names the detector budgets
+    for — ``initClass`` + ``bootstrap`` (``<=4``). The five method bodies are
+    exported under ``fixture_*`` names and register through the stack tables, not
+    by Java_* export."""
+    report = introspect(FIXTURES / "jni_dispatch_j2cc.dll")
+    exported = {e["fnSymbol"] for e in _jni_exports(report)}
+    assert exported == {
+        "Java_com_example_Boot_initClass",
+        "Java_com_example_Boot_bootstrap",
+    }
+
+
+def test_pe_j2cc_shared_dispatch_tables_bind_by_count_and_gap_when_ambiguous() -> None:
+    """End-to-end merge of the PE ``j2cc`` shared-dispatch tables (the Windows
+    sibling of the ELF shared-dispatch merge test).
+
+    When each branch's method count uniquely identifies a class, the two tables
+    bind by count with no gaps. When counts are ambiguous (several classes share
+    a branch's method count), the tables are left UNBOUND and an
+    ``ambiguous-count-only-table`` gap is emitted for each — never a silent,
+    arbitrary bind.
+    """
+    import copy
+
+    from manifest_merge.core import merge
+
+    report = introspect(FIXTURES / "jni_dispatch_j2cc.dll")
+    binary = report.to_json_obj()
+
+    def _classes(specs: list[tuple[str, int]]) -> dict:
+        return {
+            "input": {"jarPath": "input.jar"},
+            "classes": [
+                {
+                    "name": name,
+                    "methods": [
+                        {
+                            "name": f"m{index}",
+                            "desc": "()V",
+                            "access": 0x0100,
+                            "isObfuscatedNative": True,
+                        }
+                        for index in range(count)
+                    ],
+                }
+                for name, count in specs
+            ],
+        }
+
+    # Unambiguous: exactly one 2-method class and one 3-method class. Each shared
+    # branch binds to its unique count match, and no gap remains.
+    unique = merge(
+        _classes([("com/example/ClassA", 2), ("com/example/ClassB", 3)]),
+        copy.deepcopy(binary),
+    )
+    bound = {
+        cls["name"]: [m.get("fnAddr") for m in cls["methods"]]
+        for cls in unique["classes"]
+    }
+    assert all(bound["com/example/ClassA"]), "2-method class must bind by count"
+    assert all(bound["com/example/ClassB"]), "3-method class must bind by count"
+    assert bound["com/example/ClassA"] == [
+        _export_addr(report, "fixture_alpha"),
+        _export_addr(report, "fixture_beta"),
+    ]
+    assert bound["com/example/ClassB"] == [
+        _export_addr(report, "fixture_gamma"),
+        _export_addr(report, "fixture_delta"),
+        _export_addr(report, "fixture_epsilon"),
+    ]
+    assert unique["bindingGaps"] == []
+
+    # Ambiguous: two classes share each branch's count, so neither branch can be
+    # attributed by count alone. Both stay unbound and both raise a gap.
+    ambiguous = merge(
+        _classes(
+            [
+                ("com/example/First", 2),
+                ("com/example/Second", 2),
+                ("com/example/Third", 3),
+                ("com/example/Fourth", 3),
+            ]
+        ),
+        copy.deepcopy(binary),
+    )
+    assert all(
+        "fnAddr" not in method
+        for cls in ambiguous["classes"]
+        for method in cls["methods"]
+    )
+    gaps = ambiguous["bindingGaps"]
+    assert [g["kind"] for g in gaps] == [
+        "ambiguous-count-only-table",
+        "ambiguous-count-only-table",
+    ]
+    assert {g["nMethods"] for g in gaps} == {2, 3}
+    assert {tuple(g["candidateClasses"]) for g in gaps} == {
+        ("com/example/First", "com/example/Second"),
+        ("com/example/Third", "com/example/Fourth"),
+    }
+    # Every gap points back at the shared RegisterNatives call site.
+    assert all(g["source"] == "register-natives-stack" for g in gaps)
+    assert {g["registerNativesCallSite"] for g in gaps} == {
+        table["registerNativesCallSite"] for table in _stack_tables(report)
+    }
+
+
 def test_introspect_real_i386_elf_recovers_static_table_and_export() -> None:
     """i386 / System V cdecl proven end-to-end on a committed 32-bit ELF ``.so``.
 
