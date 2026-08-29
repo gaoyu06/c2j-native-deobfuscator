@@ -8,10 +8,10 @@
  *   - replays a fixed script of synthetic records (default, no target),
  *     proving the ABI links, loads and dispatches; or
  *
- *   - attaches to a process the invoking user owns (--pid N, with the
+ *   - inspects a process the invoking user owns (--pid N, with the
  *     --i-own-this-process confirmation) and reports metadata-only
- *     records — module loads, resolved symbols, and live call sites for
- *     the exports the loaded plugins asked to watch.
+ *     records — module loads, resolved symbols, and, where implemented,
+ *     live call sites for the exports the loaded plugins asked to watch.
  *
  * The host owns no library-specific knowledge: it does not know what
  * "SSL_write" or "Java_" mean. Plugins declare those names through
@@ -347,15 +347,16 @@ static void usage(const char *argv0)
            (unsigned)NX86_ABI_VERSION_MAJOR, (unsigned)NX86_ABI_VERSION_MINOR);
     printf("\n");
     printf("With no target, replays a fixed script of synthetic records.\n");
-    printf("With --pid, attaches to a process you own and reports\n");
+    printf("With --pid, inspects a process you own and reports\n");
     printf("metadata-only records for the exports the plugins watch.\n");
     printf("\n");
     printf("Options:\n");
     printf("  --pid N                observe process N (a positive integer,\n");
     printf("                         owned by the same user)\n");
-    printf("  --i-own-this-process   required to attach; you assert you own N\n");
+    printf("  --i-own-this-process   required to inspect; you assert you own N\n");
     printf("                         and are authorized to inspect it\n");
-    printf("  --no-live              read-only pass only (no breakpoints)\n");
+    printf("  --no-live              read-only pass only (Windows is always\n");
+    printf("                         read-only; live is unavailable there)\n");
     printf("  --max-events K         stop after K call-site records (default 16)\n");
     printf("  --max-seconds T        safety time budget (default 20)\n");
     printf("  --help                 this text\n");
@@ -521,17 +522,17 @@ int main(int argc, char **argv)
 
     /* Gate attachment before loading anything if the CLI is inconsistent. */
     if (pid_set) {
-        uint32_t owner_uid = 0u;
+        uint32_t owner_id = 0u;
         int owned;
         if (!own_confirmed) {
             fprintf(stderr,
-                    "host: attaching to a live process requires "
+                    "host: inspecting a process requires "
                     "--i-own-this-process\n"
                     "host: (you assert you own PID %ld and are authorized to "
                     "inspect it)\n", pid);
             return 2;
         }
-        owned = nx86_observe_owner_check((uint32_t)pid, &owner_uid);
+        owned = nx86_observe_owner_check((uint32_t)pid, &owner_id);
         if (owned < 0) {
             fprintf(stderr, "host: process %ld does not exist or cannot be "
                     "inspected\n", pid);
@@ -539,8 +540,8 @@ int main(int argc, char **argv)
         }
         if (owned == 0) {
             fprintf(stderr,
-                    "host: process %ld is owned by uid %u, not the current "
-                    "user; refusing to attach\n", pid, (unsigned)owner_uid);
+                    "host: process %ld is owned by a different user; "
+                    "refusing inspection\n", pid);
             return 1;
         }
         printf("host: target pid=%ld owned by the current user; backend: %s\n",
@@ -573,22 +574,27 @@ int main(int argc, char **argv)
 
     if (pid_set) {
         nx86_observe_config cfg;
+        const char *mode;
         memset(&cfg, 0, sizeof(cfg));
         cfg.pid = (uint32_t)pid;
         cfg.allow_live = no_live ? 0 : 1;
         cfg.max_call_events = max_events;
         cfg.max_seconds = max_seconds;
+        if (!nx86_observe_live_supported()) {
+            mode = " (read-only pass; live unavailable)";
+        } else if (no_live) {
+            mode = " (read-only pass)";
+        } else {
+            mode = "";
+        }
         printf("host: watching %u export name(s); observing pid %ld%s\n",
-               (unsigned)state.n_watches, pid,
-               no_live ? " (read-only pass)" : "");
+               (unsigned)state.n_watches, pid, mode);
         status = nx86_observe_run(&state.bus, &cfg, state.watches,
                                   state.n_watches, host_log_level);
         if (status != NX86_OK) {
-            /* A non-OK status means the live pass could not complete
-             * cleanly: attach or inspection failed, or a breakpoint or the
-             * attachment may still be active. Never report success in that
-             * case — fail the command so the exit code is non-zero and the
-             * closing line reads "shutdown with errors". */
+            /* A non-OK status means inspection failed or a requested live
+             * pass could not complete cleanly. Never report success in that
+             * case: fail the command so the exit code is non-zero. */
             fprintf(stderr, "host: observation ended with status %d\n",
                     (int)status);
             rc = 1;

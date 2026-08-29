@@ -9,13 +9,13 @@ What is here today:
 | Path | What it is |
 |---|---|
 | `include/nativex86/plugin.h` | The versioned C plugin ABI (v0.2). The only contract. |
-| `src/host/` | Host: loads plugins, dispatches events, and — given a pid you own — runs the observation engine (`observe_linux.c`). |
+| `src/host/` | Host: loads plugins, dispatches events, and — given a pid you own — runs the Linux or Windows observation engine. |
 | `plugins/hello/` | Sample plugin: emits a hello note, prints what it receives. |
 | `plugins/crypto-openssl/` | Observes OpenSSL `SSL_*` / `RSA_*` / `AES_*` / `EVP_*` exports (metadata only). |
 | `plugins/jni-natives/` | Observes JNI-convention `Java_*` / `JNI_OnLoad` exports by name/address (no `jni.h`). |
-| `plugins/crypto-cng/` | Observes Windows CNG `BCrypt*` exports; source-complete, needs a Windows host backend. |
+| `plugins/crypto-cng/` | Observes Windows CNG `BCrypt*` exports by name/address through the Windows read-only backend. |
 | `tests/abi_checks.c` | Prefix-negotiation, lifecycle-window, phase and watch-request checks. |
-| `tests/fixtures/` | A name-only fixture library + a single-threaded and a multithreaded target process, so the observation path (and the single-thread live policy) is testable with no OpenSSL / JVM / traffic. |
+| `tests/fixtures/` | Name-only native fixtures, including a committed PE image for export-parser tests that run on any host. |
 | `CMakeLists.txt` | Build for the host, plugins, fixtures, and the checks. |
 | `smoke-test.sh` | Linux compile + run + observe check (skips when no C compiler). |
 | `bridge-notes.md` | Sketch of a future JVM-side adapter. No code, by design. |
@@ -35,7 +35,7 @@ bash native-x86/smoke-test.sh --no-cmake # direct cc invocation
 ```
 
 The smoke test exercises the synthetic script against the sample plugin,
-the ABI checks, and a live observation of a tiny fixture process (attaching
+the ABI checks, the platform-neutral PE parser, and a live observation of a tiny fixture process (attaching
 with ptrace to confirm metadata-only module / symbol / call-site records).
 If ptrace attach is blocked in the environment, it falls back to the
 read-only module/symbol pass and says so. Further sections drive the strict
@@ -67,6 +67,13 @@ cmake -S native-x86 -B native-x86/build && cmake --build native-x86/build
     ./native-x86/build/lib/libnx86_plugin_jni_natives.so
 ```
 
+```powershell
+# Windows is read-only by default; --no-live states the same choice explicitly:
+.\native-x86\build\bin\nx86_host.exe `
+    --pid <PID> --i-own-this-process --no-live `
+    .\native-x86\build\lib\nx86_plugin_crypto_cng.dll
+```
+
 ## Documentation
 
 - [`docs/native-x86-module.md`](../docs/native-x86-module.md) — purpose,
@@ -82,12 +89,13 @@ cmake -S native-x86 -B native-x86/build && cmake --build native-x86/build
 ## Scope guard
 
 Contributions to this module must stay user-mode and observation-only.
-Well-known cryptographic and JNI library entry points may be *named* and
-*observed* at entry/return, reporting program structure (module, symbol,
-address, control-flow edge). Out of scope, permanently: capturing the
+Well-known library entry points may be *named* and, on the Linux live
+preview, *observed* at entry/return, reporting program structure (module,
+symbol, address, control-flow edge). Windows reports module and symbol
+records only. Out of scope, permanently: capturing the
 content those functions move (arguments, buffers, keys, IVs, return
 values), TLS interception or traffic modification, credential capture,
 anti-debug or stealth techniques, signature-bypass helpers, hidden
 loaders, and any kernel component. Observation must never alter what the
-target computes: place a breakpoint, note the entry/return, restore the
-original code.
+target computes. Windows never places breakpoints; its backend only takes a
+module snapshot and parses export metadata from image files on disk.

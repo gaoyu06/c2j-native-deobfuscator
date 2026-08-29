@@ -2,10 +2,10 @@
 
 Status: **preview**. These are the first observation plugins for the
 experimental [`native-x86/`](../../native-x86/) module. They let the
-user-mode host report *metadata-only* records when a process the user
-owns enters or returns from well-known library exports. This is a
-diagnostics preview, **not** a cryptographic debugger and **not** a
-traffic tool.
+user-mode host resolve well-known library exports in a process the user
+owns. The Linux preview can also report entry/return metadata; Windows is
+read-only and reports module/symbol records only. This is a diagnostics
+preview, **not** a traffic tool.
 
 > Content capture is out of scope. These plugins observe *that* a
 > well-known entry was reached and *where* it lives — module, symbol
@@ -29,7 +29,7 @@ loaded in the target and reports generic records:
 
 - `module-load` — which file-backed image is loaded, at which base;
 - `symbol` — a watched export's name and absolute address in a module;
-- `call-site` — a live entry (`phase = enter`) or return
+- `call-site` — on the Linux live preview, an entry (`phase = enter`) or return
   (`phase = return`) at a watched export, carrying the callee name, the
   callee address, the caller-side return address (a code address), and
   the module. Nothing else.
@@ -59,13 +59,14 @@ the map a static analyst wants without a breakpoint on every variant.
 
 | Watched name | Match | Reports | Label |
 |---|---|---|---|
-| `BCryptEncrypt` | exact | symbol + entry/return | CNG symmetric encrypt boundary |
-| `BCryptDecrypt` | exact | symbol + entry/return | CNG symmetric decrypt boundary |
-| `BCryptSignHash` | exact | symbol + entry/return | CNG signature boundary |
+| `BCryptEncrypt` | exact | symbol | CNG symmetric encrypt boundary |
+| `BCryptDecrypt` | exact | symbol | CNG symmetric decrypt boundary |
+| `BCryptSignHash` | exact | symbol | CNG signature boundary |
 
-The plugin source is portable and builds on any platform, but it only
-matches when `bcrypt.dll` is loaded in the target, which needs a Windows
-host observation backend. See [Platforms](#platforms) below.
+The plugin source is portable and builds on any platform. On Windows, the
+read-only host enumerates loaded modules and resolves these names from each
+module's on-disk PE export table. Windows live entry/return observation is
+not shipped. See [Platforms](#platforms) below.
 
 ### `jni-natives` — JNI-transpiled native entries
 
@@ -121,12 +122,31 @@ With no `--pid`, the host replays a fixed synthetic script instead — the
 original skeleton behaviour, useful for exercising the ABI without a
 target.
 
+### Windows read-only preview
+
+```powershell
+cmake -S native-x86 -B native-x86/build
+cmake --build native-x86/build --config Release
+
+.\native-x86\build\bin\Release\nx86_host.exe `
+    --pid <PID> --i-own-this-process --no-live `
+    .\native-x86\build\lib\Release\nx86_plugin_crypto_cng.dll
+```
+
+`--no-live` is optional on Windows because read-only is the default and only
+available mode. With or without it, the host says that live observation is
+unavailable, verifies that the target token has the same user SID as the
+host, takes a Toolhelp module snapshot, and reads named exports from the
+module files on disk. It does not start a debug session, set breakpoints,
+read process memory, or inspect registers.
+
 ---
 
-## The technique, stated plainly
+## The techniques, stated plainly
 
-The engine ([`native-x86/src/host/observe_linux.c`](../../native-x86/src/host/observe_linux.c))
-uses documented user-mode debugging only:
+The Linux engine
+([`native-x86/src/host/observe_linux.c`](../../native-x86/src/host/observe_linux.c))
+uses documented user-mode facilities:
 
 1. **Read-only pass.** Parse `/proc/PID/maps` for file-backed modules and
    read each module's ELF symbol table *from disk*. This resolves watched
@@ -163,6 +183,21 @@ module/symbol pass with an honest note that live observation is
 single-thread only. A single-threaded target still gets the full live
 entry/return pass.
 
+The Windows engine
+([`native-x86/src/host/observe_windows.c`](../../native-x86/src/host/observe_windows.c))
+is a separate, strictly read-only path:
+
+1. Compare the target process token's user SID with the host's and refuse
+   inspection unless they match.
+2. Enumerate the target's current modules with a Toolhelp module snapshot.
+3. Open each listed image file read-only and parse its PE named-export table.
+4. Emit module records and watched symbol names, ordinals, and absolute
+   addresses (`module base + export RVA`).
+
+There is no Windows live pass. The backend does not start a debug session,
+place or remove breakpoints, read target memory, or inspect arguments,
+returns, registers, or buffers.
+
 ### What this is not
 
 - **Not TLS interception or modification.** Nothing decrypts, rewrites,
@@ -170,8 +205,8 @@ entry/return pass.
   boundaries, not the data at them.
 - **Not credential or key capture.** No argument, buffer, key, IV or
   return value is read or reported.
-- **Not stealthy.** Attachment is explicit, same-user, and visible; a
-  target that looks will see it is being traced.
+- **Not stealthy.** Inspection is explicit, same-user, and visible in the
+  host invocation.
 - **No kernel component.** Everything here is an ordinary user-mode
   process using ptrace with the privileges the invoking user already has.
 
@@ -183,37 +218,31 @@ entry/return pass.
 |---|---|---|
 | Linux x86-64 | implemented | implemented (ptrace + INT3) |
 | Linux x86-32 target | module/symbol only | not in this preview |
-| Windows | not shipped | not shipped |
+| Windows | implemented (Toolhelp modules + on-disk PE exports) | not shipped |
 
-The Windows CNG plugin source is complete and portable, but a Windows
-host observation backend (an `observe_windows.c` using documented
-user-mode debugging APIs such as `DebugActiveProcess` /
-`WaitForDebugEvent`, with the same record model and the same
-metadata-only guarantee) is **not shipped in this preview**. Until it
-exists, the CNG plugin loads and stays idle on non-Windows hosts, and
-`BCrypt*` names match nothing.
+The Windows read-only backend is shipped as a preview. Live Windows
+breakpoints and call-site events remain unshipped.
 
 ---
 
 ## Limits and honest caveats
 
-- **Modules present at attach time.** The read-only and live passes
-  enumerate the modules loaded when the host attaches. A module the
-  target `dlopen`s *after* attach is not (yet) picked up; re-run against
-  a target that has already loaded the library of interest.
-- **Single-threaded targets only for the live pass.** The live pass places
+- **Modules present at inspection time.** The passes enumerate a snapshot of
+  the modules already loaded in the target. A module loaded after that
+  snapshot is not picked up; re-run after the module is present.
+- **Single-threaded targets only for the Linux live pass.** The live pass places
   process-wide software breakpoints and steps them, which is only safe in a
   single-threaded target. A target with more than one thread (counted from
   `/proc/PID/task` before any attach) is refused the live pass and gets the
   read-only module/symbol pass instead, with an honest note. Tracing every
   thread of a multithreaded process is out of scope for this preview.
-- **Return observation is best-effort.** A one-shot breakpoint at the
+- **Linux return observation is best-effort.** A one-shot breakpoint at the
   captured return address reports the matching return for the common
   case of sequential, non-recursive calls (the fixture's shape). Deep
   recursion can miss or mis-pair a return in this preview; entries are
   always reported. (Multithreaded targets do not reach the live pass at
   all — see above.)
-- **x86-64 only for the live pass.** Other architectures get the
+- **x86-64 only for the Linux live pass.** Other architectures get the
   read-only module/symbol pass.
 - **ptrace must be permitted.** In some sandboxes attach is blocked
   (`PTRACE_ATTACH` refused); the host reports this and runs the
@@ -245,3 +274,9 @@ smoke test also drives the deterministic cleanup-failure seams
 (`NX86_TEST_INJECT`) for a resume (`PTRACE_CONT`) failure and a
 breakpoint-arming (`bp_insert`) failure, asserting each fails the run with
 "shutdown with errors" rather than a false "shutdown ok".
+
+The same smoke test opens the committed
+[`jni_registrar.dll`](../../native-x86/tests/fixtures/jni_registrar.dll)
+as an ordinary file and verifies its machine type, named export RVAs, and
+ordinals. That PE parser test runs on Linux and does not load or execute the
+fixture or require a Windows process.

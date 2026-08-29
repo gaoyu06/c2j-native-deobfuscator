@@ -47,6 +47,7 @@ if [ "$USE_CMAKE" = "1" ] && command -v cmake >/dev/null 2>&1; then
     HOST_BIN="$BUILD_DIR/bin/nx86_host"
     CHECKS_BIN="$BUILD_DIR/bin/nx86_abi_checks"
     UNIT_BIN="$BUILD_DIR/bin/nx86_observe_unit"
+    PE_TEST_BIN="$BUILD_DIR/bin/nx86_pe_exports_test"
     HELLO_LIB="$BUILD_DIR/lib/libnx86_plugin_hello.so"
     OPENSSL_LIB="$BUILD_DIR/lib/libnx86_plugin_crypto_openssl.so"
     JNI_LIB="$BUILD_DIR/lib/libnx86_plugin_jni_natives.so"
@@ -63,7 +64,9 @@ else
         "$SCRIPT_DIR/src/host/main.c" \
         "$SCRIPT_DIR/src/host/event_bus.c" \
         "$SCRIPT_DIR/src/host/platform.c" \
+        "$SCRIPT_DIR/src/host/pe_exports.c" \
         "$SCRIPT_DIR/src/host/observe_linux.c" \
+        "$SCRIPT_DIR/src/host/observe_windows.c" \
         "$SCRIPT_DIR/src/host/observe_stub.c" -ldl
     # shellcheck disable=SC2086
     "$CC_BIN" $WARN $INC -o "$BUILD_DIR/bin/nx86_abi_checks" \
@@ -78,6 +81,11 @@ else
         "$SCRIPT_DIR/tests/observe_unit.c" \
         "$SCRIPT_DIR/src/host/event_bus.c" \
         "$SCRIPT_DIR/src/host/platform.c" -ldl
+    # Cross-platform parser check: opens the committed PE fixture as bytes.
+    # shellcheck disable=SC2086
+    "$CC_BIN" $WARN $INC -o "$BUILD_DIR/bin/nx86_pe_exports_test" \
+        "$SCRIPT_DIR/tests/pe_exports_test.c" \
+        "$SCRIPT_DIR/src/host/pe_exports.c"
     for p in hello:hello/hello crypto_openssl:crypto-openssl/crypto_openssl \
              jni_natives:jni-natives/jni_natives; do
         stem="${p%%:*}"; src="${p##*:}"
@@ -103,6 +111,7 @@ else
     HOST_BIN="$BUILD_DIR/bin/nx86_host"
     CHECKS_BIN="$BUILD_DIR/bin/nx86_abi_checks"
     UNIT_BIN="$BUILD_DIR/bin/nx86_observe_unit"
+    PE_TEST_BIN="$BUILD_DIR/bin/nx86_pe_exports_test"
     HELLO_LIB="$BUILD_DIR/lib/libnx86_plugin_hello.so"
     OPENSSL_LIB="$BUILD_DIR/lib/libnx86_plugin_crypto_openssl.so"
     JNI_LIB="$BUILD_DIR/lib/libnx86_plugin_jni_natives.so"
@@ -808,6 +817,17 @@ if ! grep -qE 'observe-unit: (PASS|SKIP)' <<<"$UNIT_OUT"; then
     FAILED=1
 fi
 echo "PASS: unique-address restore invariant holds"
+
+echo "-- 15. on-disk PE named-export parser (no Windows host required)"
+set +e
+PE_OUT="$("$PE_TEST_BIN" "$SCRIPT_DIR/tests/fixtures/jni_registrar.dll")"
+PE_RC=$?
+set -e
+echo "$PE_OUT"
+if [ "$PE_RC" != "0" ] || ! grep -qF "pe-exports-test: PASS" <<<"$PE_OUT"; then
+    echo "FAIL: PE named-export parser check did not pass"
+    FAILED=1
+fi
 
 if [ "$FAILED" != "0" ]; then
     echo "SMOKE TEST: FAIL"

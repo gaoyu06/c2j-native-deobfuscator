@@ -9,11 +9,11 @@
  * reported. Content capture is out of scope.
  *
  * This source is portable: it uses only the plugin ABI and holds string
- * names, so it compiles on any platform. It matches CNG exports only when
- * bcrypt.dll is loaded in the target, which requires a Windows host
- * observation backend (observe_windows.c) that is documented but not
- * shipped in this preview. On other platforms the plugin loads and stays
- * idle, matching nothing.
+ * names, so it compiles on any platform. On Windows, the read-only host
+ * backend resolves matching exports from the on-disk PE image. Live
+ * entry/return observation remains unavailable on Windows. On other
+ * platforms the plugin loads and stays idle unless a matching image is
+ * present.
  */
 #include "nativex86/plugin.h"
 

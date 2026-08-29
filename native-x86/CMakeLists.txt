@@ -26,11 +26,16 @@ add_executable(nx86_host
     src/host/main.c
     src/host/event_bus.c
     src/host/platform.c
+    src/host/pe_exports.c
     src/host/observe_linux.c
+    src/host/observe_windows.c
     src/host/observe_stub.c
 )
 target_include_directories(nx86_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/host)
 target_link_libraries(nx86_host PRIVATE nativex86_abi ${CMAKE_DL_LIBS})
+if(WIN32)
+    target_link_libraries(nx86_host PRIVATE advapi32)
+endif()
 target_compile_options(nx86_host PRIVATE ${NX86_WARNINGS})
 
 # Observation plugins. Each exports exactly one symbol; all knowledge of
@@ -59,14 +64,15 @@ add_executable(nx86_fixture_target tests/fixtures/fixture_target.c)
 target_link_libraries(nx86_fixture_target PRIVATE nx86_fixture_exports)
 target_compile_options(nx86_fixture_target PRIVATE ${NX86_WARNINGS})
 
-# A multithreaded variant of the same fixture, used to check that the live
-# pass refuses a target with more than one thread and falls back to the
-# read-only pass (single-thread-only preview policy).
-find_package(Threads REQUIRED)
-add_executable(nx86_fixture_target_mt tests/fixtures/fixture_target_mt.c)
-target_link_libraries(nx86_fixture_target_mt
-    PRIVATE nx86_fixture_exports Threads::Threads)
-target_compile_options(nx86_fixture_target_mt PRIVATE ${NX86_WARNINGS})
+# A Linux multithreaded variant used to check the ptrace preview's
+# single-thread-only policy. Windows has no live pass to exercise.
+if(UNIX)
+    find_package(Threads REQUIRED)
+    add_executable(nx86_fixture_target_mt tests/fixtures/fixture_target_mt.c)
+    target_link_libraries(nx86_fixture_target_mt
+        PRIVATE nx86_fixture_exports Threads::Threads)
+    target_compile_options(nx86_fixture_target_mt PRIVATE ${NX86_WARNINGS})
+endif()
 
 # ABI contract checks: prefix negotiation and the lifecycle delivery
 # window. Compiles the host event bus and the sample plugin directly so
@@ -94,6 +100,22 @@ target_include_directories(nx86_observe_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(nx86_observe_unit PRIVATE nativex86_abi ${CMAKE_DL_LIBS})
 target_compile_options(nx86_observe_unit PRIVATE ${NX86_WARNINGS})
 
+# Cross-platform, file-only PE parser checks. The committed DLL fixture is
+# opened as bytes and never loaded or executed.
+add_executable(nx86_pe_exports_test
+    tests/pe_exports_test.c
+    src/host/pe_exports.c
+)
+target_include_directories(nx86_pe_exports_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/host)
+target_link_libraries(nx86_pe_exports_test PRIVATE nativex86_abi)
+target_compile_options(nx86_pe_exports_test PRIVATE ${NX86_WARNINGS})
+
 enable_testing()
 add_test(NAME abi_checks COMMAND nx86_abi_checks)
 add_test(NAME observe_unit COMMAND nx86_observe_unit)
+add_test(
+    NAME pe_exports
+    COMMAND nx86_pe_exports_test
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/jni_registrar.dll
+)

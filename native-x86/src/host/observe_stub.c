@@ -3,13 +3,10 @@
  * implementation. It attaches to nothing and resolves nothing; it fails
  * honestly so a caller never mistakes silence for an empty target.
  *
- * A real Windows implementation would live in an observe_windows.c
- * alongside this file, using documented user-mode debugging APIs
- * (DebugActiveProcess / WaitForDebugEvent) with the same record model
- * and the same metadata-only guarantee. It is intentionally not shipped
- * here; see docs/plugins/crypto-libraries.md.
+ * Linux and Windows have their own implementations. Other hosts keep this
+ * honest stub rather than silently reporting an empty target.
  */
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(_WIN32)
 
 #include "observe.h"
 
@@ -49,8 +46,8 @@ nx86_status nx86_observe_run(nx86_event_bus *bus,
     return NX86_ERR_UNSUPPORTED;
 }
 
-#else /* __linux__ : this translation unit is intentionally empty */
+#else /* implemented platform: this translation unit is intentionally empty */
 
 typedef int nx86_observe_stub_unused;
 
-#endif /* !__linux__ */
+#endif /* !__linux__ && !_WIN32 */
