@@ -17,9 +17,18 @@ tooling**, not a one-click decompiler: every real target needs some adaptation
 (reading a decompile, supplying state, extending a harness). Your job as the
 agent is to *drive and adapt* these tools, not just run them.
 
-Repo root: the `j2c-dumper/` directory. Build once before use (see README
-"Quick start"): `jvm/` via gradle, `py/` via uv, `native/` via zig (dynamic
-path only), and `pip install unicorn` in the py venv (emulation path).
+Repo root: the `j2c-dumper/` directory. Build once before use with
+`scripts/setup.sh` (`scripts/setup.ps1` on Windows): `jvm/` via gradle, `py/`
+via uv, `native/` via zig (dynamic path only). For the emulation path also run
+`(cd py && uv pip install unicorn)`, which puts unicorn in the same workspace
+venv (`py/.venv`) setup installed the packages into.
+
+**One interpreter.** Run the CLI through `scripts/j2c ...`; it selects the
+interpreter setup installed into. The two things the CLI does not wrap — the
+emulation harness and the lifter's feature flags — run under that same
+interpreter, written below as `py/.venv/bin/python`
+(`py\.venv\Scripts\python.exe` on Windows). A system `python3 -m ...` would not
+see the packages. `scripts/j2c doctor` reports which interpreter is in use.
 
 ## Pick a path
 
@@ -34,7 +43,7 @@ emulation to extract the C-only secrets the others miss.
 
 ## Path 1 — Dynamic (JVMTI)
 
-One-shot: `python -m j2c_dumper_cli.main recover IN.jar -o clean.jar --run-cmd "java -jar IN.jar"`
+One-shot: `scripts/j2c recover IN.jar -o clean.jar --run-cmd "java -jar IN.jar"`
 (chains parse-jar → inspect-binary → merge-manifest → dynamic-trace → trace-to-bc → rebuild).
 
 Adaptation you will likely need:
@@ -55,7 +64,8 @@ parse-jar → inspect-binary → merge-manifest → (Ghidra headless DumpFromMan
 ```
 Ghidra headless invocation and the lifter flags are in README "Static recovery"
 and "Generality". Disable a misfiring lifter feature with
-`python -m ast_matcher.cli --list-flags` / `--disable <flag>`.
+`py/.venv/bin/python -m ast_matcher.cli --list-flags` / `--disable <flag>`
+(the flags are not exposed by `scripts/j2c static-reverse`).
 
 Adaptation: add an obfuscator **profile** for an unseen variant
 ([`docs/adding-obfuscator-profile.md`](../../docs/adding-obfuscator-profile.md));
@@ -63,7 +73,7 @@ design notes in [`docs/static-reverse-approach.md`](../../docs/static-reverse-ap
 
 ## Path 3 — Emulation (Unicorn + mock JNI)
 
-The tool: `py/native_emulate/j2c_emu.py`. Three commands:
+The tool: `py/.venv/bin/python py/native_emulate/j2c_emu.py`. Three commands:
 - `recover DLL_OR_SO` — list native methods; entry points auto-discovered
   (`Java_*` exports → `JNI_OnLoad` emulation → `--registrar 0x..` / `--binary-json`).
 - `strings DLL --fn 0xADDR` — dump a function's decrypted string constants

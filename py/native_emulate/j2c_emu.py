@@ -17,7 +17,8 @@ Generality: rests on the JVM-fixed JNI ABI, not on any obfuscator's choices.
 Backends: x86-64  PE/Win64  and  ELF/System-V.  (Unicorn supports more arches;
 add an ABI/Fmt pair to extend.)
 
-Requires: unicorn   (pip install unicorn)
+Requires: unicorn, in the interpreter that runs this script
+          ((cd py && uv pip install unicorn) for the workspace venv).
 """
 import argparse, json, re, struct, sys
 
@@ -25,7 +26,12 @@ try:
     from unicorn import *
     from unicorn.x86_const import *
 except ImportError:
-    sys.exit("need unicorn:  python -m pip install unicorn")
+    # Name the interpreter: unicorn has to land in the one running this script,
+    # not in whichever `pip` happens to be on PATH.
+    sys.exit(
+        "need unicorn:  (cd py && uv pip install unicorn)"
+        f"   or:  {sys.executable} -m pip install unicorn"
+    )
 
 NUL = bytes([0])
 

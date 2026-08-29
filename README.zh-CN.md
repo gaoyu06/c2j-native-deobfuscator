@@ -12,23 +12,51 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 | 路径 | 输入 | 思路 |
 |---|---|---|
 | **动态** | 混淆后的 JAR + 一条可运行的命令 | 加载 JVMTI agent，观察 JNI 调用流，把它重新拼回 JVM 字节码 |
-| **静态** | 混淆后的 JAR + Ghidra | 在 native blob 里定位 JNI method table，逐函数反编译，把 pseudo-C 抬升回 JVM 字节码 |
+| **静态** | 离线 manifest + 可选 Ghidra | 先做通用 JNI 发现；需要静态方法体时再逐函数反编译，把 pseudo-C 抬升回 JVM 字节码 |
 | **模拟** | 混淆后的 blob（不需运行、不需 Ghidra） | 用 CPU 模拟器 + mock JNI 直接跑 native 代码：恢复方法表、dump 解密后的常量、把方法当纯函数来调用 |
 
-动态/静态路径会输出一个干净的 `out.jar`：原先的 native 方法现在拥有真实的字节码方法体，loader / native blob 资源条目被剥离。模拟路径则负责挖出另外两条路看不到的"纯 C 秘密"（被内联的比较、`<clinit>` 字符串表），并给你一个可执行的 oracle。
+离线发现是各路径共用的第一步，**不需要 Ghidra**：`parse-jar` 读取 JAR 声明，
+`inspect-binary` 按 JNI 规范检查入口（直接导出的 `Java_*` 符号和
+`RegisterNatives` 动态注册），`merge-manifest` 再合并这些证据。发现边界位于
+[`py/binary_introspect`](py/binary_introspect)；更完整的 generic-first 覆盖正在
+[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4) 中完成。
+只有当 JAR 无法运行、而你又希望从 pseudo-C 恢复静态方法体时，才需要在后续
+可选地使用 Ghidra。
+
+动态/静态路径会输出一个 `out.jar`：原先的 native 方法桩被替换成*尽力恢复出的方法体*，loader / native blob 资源条目被剥离。覆盖度是按方法计的 —— 动态路径只能恢复本次运行真正执行到的分支，静态路径只能恢复反编译结果能干净抬升的部分，因此未被观察到或未能抬升的方法可能仍是桩或只有部分方法体。请检查产物，难度较大的目标要预期人工补齐。模拟路径则负责挖出另外两条路看不到的"纯 C 秘密"（被内联的比较、`<clinit>` 字符串表），并给你一个可执行的 oracle。
 
 协议：**GPLv3**。
 
 ---
 
-## ⭐ 最佳用法：用编码智能体来驱动
+## 自己动手运行
 
-**本项目的最佳用法是用您喜爱的编码智能体，加载随仓库附带的 skill
-（[`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md)）来完成工作。**
+默认的恢复路径完全可以手动跑起来，不需要任何编码智能体：
 
-本项目提供的是对所有类似工具（凡是"把 Java 转译成 C/C++ 再通过 JNI 回调"的混淆器家族）的**通杀思路 + 工具**，但这不可避免地需要对具体情况做出一定适配（读反编译、补每个方法依赖的状态、扩展 harness、加 profile）。如今的 AI 已经可以很好地胜任这一工作。
+```bash
+git clone <本仓库> && cd c2j-native-deobfuscator
+bash scripts/setup.sh                      # 构建 JVM + Python（x86-64 上再构建 native agent）
+scripts/j2c doctor                         # 检查版本 + 构建产物
+scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
+```
 
-所以，**请不要尝试手动单纯地执行现成的脚本**。在没有手工修复的情况下，本项目并不能达到惊艳的效果。把 skill 和目标交给智能体，让它把工具适配到具体的二进制上。
+> **请通过 `scripts/j2c` 运行 CLI**（Windows 上为 `scripts\j2c.ps1`）。setup 会用
+> `uv` 把 Python 工作区装进 `py/.venv`，所以直接用*系统* `python3 -m j2c_dumper_cli`
+> 找不到这些包。该启动器会挑选真正装了这些包的解释器。
+
+详见下方的 [Quick start](#quick-start) 以及
+[10 分钟上手指南](docs/getting-started.zh-CN.md)
+（[English](docs/getting-started.md)）。
+
+**什么时候需要人工过一遍。** 本项目提供的是对整个"把 Java 转译成 C/C++
+再通过 JNI 回调"混淆器家族的**通用思路**，所以难度较大的目标仍可能需要针对
+具体方法做适配（读反编译、补每个方法依赖的状态、扩展 harness、加 profile）。
+遇到这种情况，恢复出的 `*.json` 中间产物本就是给你手工编辑的 —— 参见
+[`docs/manual-restoration.md`](docs/manual-restoration.md)。
+
+**可选：** 编码智能体很擅长做这类适配。如果你用它，可以加载随仓库附带的 skill
+（[`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md)）
+再把目标交给它。这只是锦上添花，并非必需 —— CLI 本身即可独立运行。
 
 ---
 
@@ -106,18 +134,23 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
   / `ACONST_NULL`，让最终的字节码可以通过 ASM 的
   `COMPUTE_FRAMES` 校验。
 
-### 静态路径
+### 离线发现（无需 Ghidra）
 
-- **反汇编层的 native 表发现**（`py/binary_introspect/`，`capstone`）。
-  扫描 native blob 的可执行节，定位所有
-  `call qword ptr [reg + 0x6B8]`（`RegisterNatives` 在 JNI vtable 中的偏移）
-  调用点，往前回扫 PC 相对的 `lea`（指向 `.text`，即栈上构造的
-  `JNINativeMethod[]` 里的函数指针）以及最近的
-  `mov <nMethods-reg>, imm`（表长度）。
+- **JAR 与 JNI 发现**（`jar-parser`、`py/binary_introspect/`、
+  `manifest-merge`）。`parse-jar`、`inspect-binary`、`merge-manifest`
+  从 JAR 声明以及 JNI 规范定义的机制构建 `manifest.json`：直接导出的
+  `Java_*` 符号和 `RegisterNatives` 动态注册。这个阶段既不需要活 JVM，也不
+  需要 Ghidra。通用发现实现位于
+  [`py/binary_introspect`](py/binary_introspect)；更完整的 generic-first
+  覆盖正在
+  [PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4) 中完成。
+
+### 静态方法体恢复（可选 Ghidra 步骤）
+
 - **Ghidra 反编译器**（`ghidra/scripts/DumpFromManifest.java`，Ghidra
-  Headless）。读取 `manifest.json` 中的 `(class, method, fnAddr)`，对每个
-  地址跑一次 p-code 反编译，结果汇总到 `ghidra-dump.json`，每个方法对应
-  一段 pseudo-C。
+  Headless）。当 JAR 无法运行、而你又需要静态方法体时，才在后续使用它。
+  它读取 `manifest.json` 中的 `(class, method, fnAddr)`，对每个地址跑一次
+  p-code 反编译，结果汇总到 `ghidra-dump.json`，每个方法对应一段 pseudo-C。
 - **tree-sitter-c AST 解析**（`py/ast_matcher/`，`tree-sitter-c`）。把
   Ghidra 输出的 pseudo-C 解析成 AST，再由按 feature flag 控制的 driver
   识别 `env->FnName(args)` 形式的 JNI 调用（这是从 Ghidra 的
@@ -168,7 +201,7 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 | | 动态 | 静态 | 模拟 |
 |---|---|---|---|
 | **适合的场景** | 二进制被加壳 / 虚拟机保护 / 反调试 —— JVMTI agent 工作在 Java 侧，native 层的保护不影响它的可见性。 | 二进制未经额外保护（例如直接 native-obfuscator + zig c++ 输出），Ghidra 能直接反编译每个 `fnAddr`。 | 逻辑被改写成纯 C（比较 / 加密 / 字符串表），或者 jar 跑不起来**且** Ghidra 结构化不了，或者你需要解密后的常量。 |
-| **要求** | 一条可执行的命令（`java -jar ...`），并且能跑到目标类。 | 安装了 Ghidra 11.x。 | 只要 blob + `pip install unicorn`。不需要 JVM，不需要 Ghidra。 |
+| **要求** | 一条可执行的命令（`java -jar ...`），并且能跑到目标类。 | 安装了 Ghidra 11.x。 | 只要 blob + `unicorn` 包。不需要 JVM，不需要 Ghidra。 |
 | **覆盖率** | 只覆盖实际被执行到的分支；从未被调用的方法完全采集不到。 | 通过 `RegisterNatives` 注册的所有方法，无论运行时是否被触发。 | 方法表 + 解密常量总能拿到；单个方法的行为通过 oracle 探测。 |
 | **准确性** | 高 —— 每条 opcode 都对应 JVM 实际观察到的 JNI 调用。 | best-effort —— 抬升器靠模式匹配，无法保持栈平衡时退化为 stub。 | 精确（它执行真实代码），但算法要你从 oracle 的输入/输出去逆 —— 它**不会**自动产出字节码。 |
 | **耗时** | 受目标本身执行时长 + agent 开销限制。 | 受 Ghidra 自动分析限制（1 MB 量级的 blob 通常需要数分钟）。 | 快 —— 无 Ghidra、无活 JVM。 |
@@ -201,26 +234,49 @@ JAR 的 `.dll` / `.so` 回调 Java 的混淆方案，都在覆盖范围内。
 
 ## Quick start
 
-### 一次性构建
+前置条件：**JDK 17+**（并设置 `JAVA_HOME`）与 **Python 3.11+**。在 Windows 上
+构建 native agent 还需要 **Git Bash**（随 Git for Windows 提供）；WSL 会构建出
+Linux 的 `.so`，而不是这里 JVM 加载的 Windows `.dll`。
+第一次上手？请按
+[10 分钟上手指南](docs/getting-started.zh-CN.md)（[English](docs/getting-started.md)）操作。
+
+### 1. 安装（一次性构建全部）
 
 ```bash
-# JVM 模块
-cd jvm && ./gradlew installDist
-
-# Python 工作区
-cd py && uv sync --all-packages
-
-# Native agent（仅动态路径需要）
-cd native && JDK_HOME="$JAVA_HOME" bash build.sh
-
-# 模拟路径
-cd py && .venv/Scripts/python -m pip install unicorn   # 或用你的 venv 的 pip
+# 幂等脚本：构建 JVM 模块、同步 Python 工作区，并在 x86-64 主机上检测到 JDK + zig
+# 时构建 native agent。可以放心重复执行。
+bash scripts/setup.sh            # Linux / macOS
+# Windows（PowerShell）：
+#   pwsh scripts/setup.ps1
 ```
 
-### 动态恢复（首选，前提是目标在你环境里能跑）
+`scripts/setup.sh` 在可用时用 [`uv`](https://docs.astral.sh/uv/) 同步 Python
+工作区，否则回退到 `pip install -e`。native agent 这一步需要 JDK 和 `zig`；
+缺任意一个时会带清晰提示跳过（只有动态路径需要它）。`native/build.sh` 面向
+x86-64，因此在 ARM（或其他 CPU）上 setup 会跳过 native agent，并且不会报告动态
+路径就绪 —— 那里请改用模拟兜底。
+
+### 2. 检查工具链
 
 ```bash
-python -m j2c_dumper_cli.main recover \
+scripts/j2c doctor       # Windows：scripts\j2c.ps1 doctor
+```
+
+`doctor` 会报告 Java/JDK、Python、Python 恢复阶段是否可 import（`capstone` +
+`lief`）、已构建的 JVM 模块与本机匹配的 native agent，以及可选工具（Ghidra、
+unicorn、zig），并为每个缺失项打印下一步命令。它只校验工具版本与产物是否存在，
+不会启动 JVM 模块或加载 agent。只有当某个必需项**缺失**时它才以非零码退出；
+`WARN`（例如 `JAVA_HOME` 未设）只是提醒，不是阻塞。agent 必须在文件名和 CPU 架构
+两方面都与本机匹配：在非 x86-64 主机上，`native/build.sh` 无法产出可加载的 agent，
+因此它始终被报告为 missing，动态路径不算就绪。
+
+### 3. 恢复（默认路径 —— 动态）
+
+**当目标在你环境里能跑起来时用这条。** 它把 JVMTI agent 挂到一次真实运行上，
+观察 JNI 调用流，再抬升回字节码：
+
+```bash
+scripts/j2c recover \
     path/to/obfuscated.jar \
     -o path/to/clean.jar \
     --run-cmd "java -jar path/to/obfuscated.jar"
@@ -235,37 +291,49 @@ python -m j2c_dumper_cli.main recover \
 5. `trace-to-bc`       抬升到 `recovered/*.json`
 6. `rebuild`           输出 loader 已剥离的最终 JAR
 
-### 静态恢复（目标跑不起来时使用 —— 需要 Ghidra）
+输出包含的是**针对本次运行中观察到的行为、尽力恢复出的方法体**。动态 trace 只
+覆盖实际执行到的路径，因此未观察到的方法可能仍是桩或只有部分方法体；请检查结果，
+难度较大的目标要预期需要人工补全（见上文的"人工过一遍"说明）。
+
+> **只用一个解释器。** `scripts/j2c ...` 会用 setup 安装这些包的解释器来运行 CLI
+> （`py/.venv` 下的 `uv` venv，或 `pip` 兜底所用的解释器），你不必自己挑。少数
+> CLI 没有包装的用法（下面的模拟 harness、抬升器的 feature flag）也走同一个解释器，
+> 本文写作 `py/.venv/bin/python`（Windows 上为 `py\.venv\Scripts\python`）。如果
+> setup 走的是 `pip` 兜底，就换成它安装到的那个解释器。
+
+### 离线发现（无需运行、无需 Ghidra）
+
+当 JAR 无法运行时先从这里开始。下面的通用发现步骤会检查标准 JNI 导出符号和
+`RegisterNatives` 注册证据，再生成合并后的 manifest；它们**不需要 Ghidra**：
 
 ```bash
-# 1. 解析 jar + 内省二进制（不需要 --run-cmd）
-python -m j2c_dumper_cli.main parse-jar      in.jar      -o classes.json
-python -m j2c_dumper_cli.main inspect-binary natives.bin -o binary.json
-python -m j2c_dumper_cli.main merge-manifest classes.json binary.json -o manifest.json
-
-# 2. 用 Ghidra Headless 跑 native blob
-<GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
-    -import natives.bin \
-    -scriptPath <repo>/ghidra/scripts \
-    -postScript DumpFromManifest.java manifest.json ghidra-dump.json
-
-# 3. pseudo-C 抬升到字节码 + 重建 JAR
-python -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
-python -m j2c_dumper_cli.main rebuild --input in.jar --recovered recovered/ \
-    --manifest manifest.json -o out.jar
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
 ```
 
-### 模拟恢复（无需 JVM、无需 Ghidra —— 针对纯 C 改写的逻辑 / 解密常量）
+通用发现实现位于 [`py/binary_introspect`](py/binary_introspect)；更完整的
+generic-first 覆盖正在
+[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4) 中完成。
+
+### 兜底：模拟恢复（无需运行、无需 Ghidra）
+
+**当目标在你环境里跑不起来时用这条** —— 例如你只有 blob，或者你需要那些只藏在
+纯 C 里的解密常量。它在 CPU 模拟器 + mock JNI 下直接执行 native 代码，不需要 JVM，
+也不需要 Ghidra：
 
 ```bash
+# 把 unicorn 装进工作区解释器（走 pip 兜底时，`scripts/j2c doctor` 会打印确切命令）
+(cd py && uv pip install unicorn)
+
 # 列出 native 方法（入口自动发现）
-python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 
 # dump 某个函数解密后的字符串常量（字母表、密文、提示语）
-python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+py/.venv/bin/python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
 
 # 把 native 方法当纯函数调用（oracle）
-python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+py/.venv/bin/python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
     --arg-bytes "input" --static "v=@alphabet.txt"
 ```
 
@@ -275,7 +343,33 @@ python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
 ### 分阶段执行
 
 每个阶段都有独立的子命令，详见
-`python -m j2c_dumper_cli.main --help`。
+`scripts/j2c --help`。
+
+---
+
+## 进阶：静态恢复（离线，需要 Ghidra）
+
+这是上面无 Ghidra 发现之后的**可选后续步骤**。只有当 JAR 无法运行、而你又需要
+模拟兜底不会自动产出的静态方法体 pseudo-C 时才使用它；这一步需要
+**Ghidra 11.x**：
+
+```bash
+# 1. 通用 JNI 发现（不需要 --run-cmd，也不需要 Ghidra）
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
+
+# 2. 可选：通过 Ghidra Headless 抬升静态方法体
+<GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
+    -import natives.bin \
+    -scriptPath <repo>/ghidra/scripts \
+    -postScript DumpFromManifest.java manifest.json ghidra-dump.json
+
+# 3. pseudo-C 抬升到字节码 + 重建 JAR
+scripts/j2c static-reverse ghidra-dump.json --manifest manifest.json -o recovered/
+scripts/j2c rebuild --input in.jar --recovered recovered/ \
+    --manifest manifest.json -o out.jar
+```
 
 ---
 
@@ -294,11 +388,13 @@ python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
 hint、ExceptionCheck-guard 跳过、符号表跟踪、查表解析等等）。哪个 flag
 对当前二进制误判，就把它关掉：
 
+这些 flag 没有暴露在 `scripts/j2c static-reverse` 上，因此用工作区解释器直接跑抬升器：
+
 ```bash
-python -m ast_matcher.cli ghidra-dump.json -o recovered/ \
+py/.venv/bin/python -m ast_matcher.cli ghidra-dump.json -o recovered/ \
     --disable use_throw_reason_invoke_hints \
     --disable skip_native_exception_guards
-python -m ast_matcher.cli --list-flags
+py/.venv/bin/python -m ast_matcher.cli --list-flags
 ```
 
 ---
@@ -336,6 +432,8 @@ python -m ast_matcher.cli --list-flags
 
 ## 文档
 
+- [getting-started.zh-CN.md](docs/getting-started.zh-CN.md) — 10 分钟默认路径
+  上手、常见故障、JSON 产物在哪
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — 模块边界、管线、artifact schema、扩展点
 - [emulation-recovery.md](docs/emulation-recovery.md) — 模拟路径使用指南
   （命令参考见 [`py/native_emulate/README.md`](py/native_emulate/README.md)）

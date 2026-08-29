@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Single entry point for the j2c-dumper CLI.
+#
+# `scripts/setup.sh` syncs the Python workspace with `uv`, which installs the
+# packages into `py/.venv` — a *system* `python3 -m j2c_dumper_cli` cannot see
+# them. This launcher always runs the interpreter that has the packages: the
+# uv-managed venv when it exists, otherwise `$PYTHON` / `python3` (the pip
+# fallback installs into that interpreter's own environment).
+#
+#   scripts/j2c doctor
+#   scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+VENV_PY="$ROOT/py/.venv/bin/python"
+if [ -x "$VENV_PY" ]; then
+    PY="$VENV_PY"
+else
+    PY="${PYTHON:-python3}"
+fi
+
+# Let the CLI echo this launcher (not a bare `python3 -m ...`) in its own hints,
+# so every printed follow-up command is one that actually works here.
+export J2C_CMD="scripts/j2c"
+
+exec "$PY" -m j2c_dumper_cli "$@"

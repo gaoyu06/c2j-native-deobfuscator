@@ -25,22 +25,31 @@ So the same engine works across the family; only two things are
 platform-specific (and abstracted): the object format and the calling convention.
 
 ## Install
-```
-python -m pip install unicorn
+`unicorn` must land in the interpreter that runs the harness — the workspace
+venv `scripts/setup.sh` created at `py/.venv`. Run from the repo root:
+
+```bash
+(cd py && uv pip install unicorn)
 ```
 
 ## Commands
+The `scripts/j2c` launcher does not wrap this harness, so call it with the
+workspace interpreter directly: `py/.venv/bin/python`
+(`py\.venv\Scripts\python.exe` on Windows). If setup fell back to `pip`, use
+the interpreter it installed into instead. Paths below are relative to the repo
+root.
+
 ```bash
 # 1) recover every native method (name, sig, fnPtr) — entry points auto-discovered
-python j2c_emu.py recover lib.so|natives.dll
+py/.venv/bin/python py/native_emulate/j2c_emu.py recover lib.so|natives.dll
 #    discovery order: Java_* exports  ->  JNI_OnLoad emulation (mock JavaVM)
 #                     ->  --registrar 0x.. / --binary-json (j2cc regc dispatch)
 
 # 2) dump the decrypted string constants of a function (alphabet, secret, msgs)
-python j2c_emu.py strings natives.dll --fn 0x10a23e30
+py/.venv/bin/python py/native_emulate/j2c_emu.py strings natives.dll --fn 0x10a23e30
 
 # 3) oracle: call a recovered native method as a pure function
-python j2c_emu.py call natives.dll --fn 0x10a3fb10 \
+py/.venv/bin/python py/native_emulate/j2c_emu.py call natives.dll --fn 0x10a3fb10 \
        --arg-bytes "AAAABBBBCCCC" --static "v=@alphabet.txt"
 #    --arg-bytes  -> a byte[] arg ;  --arg-str -> a String arg
 #    --static field=value | field=@file  -> supply a static field (e.g. an

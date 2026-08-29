@@ -13,33 +13,63 @@ Three complementary recovery paths:
 | Path | Input | Approach |
 |---|---|---|
 | **Dynamic** | obfuscated jar + a runnable command | Attach a JVMTI agent, observe the JNI call stream, lift it back to JVM bytecode |
-| **Static** | obfuscated jar + Ghidra | Locate the JNI method tables in the native blob, decompile each function, lift pseudo-C to JVM bytecode |
+| **Static** | offline manifest + optional Ghidra | Start with generic JNI discovery; when static bodies are needed, decompile each function and lift pseudo-C to JVM bytecode |
 | **Emulation** | obfuscated blob (no run, no Ghidra) | Run the native code under a CPU emulator + mock JNI; recover the method table, dump decrypted constants, and call methods as pure-function oracles |
 
-The dynamic/static paths emit a clean `out.jar` whose native methods now have
-real bytecode bodies and whose loader / native-blob entries are stripped. The
-emulation path recovers the C-only secrets the other two can't see (inlined
-comparisons, the `<clinit>` string tables) and gives you an executable oracle.
+Offline discovery is a common, **Ghidra-free** first step:
+`parse-jar` reads the JAR declarations, `inspect-binary` inspects JNI entry
+points (direct `Java_*` exports and `RegisterNatives` registrations), and
+`merge-manifest` combines the evidence. The discovery boundary lives in
+[`py/binary_introspect`](py/binary_introspect); broader generic-first coverage
+is being completed on [PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+Ghidra is only a later option when the JAR cannot run and you want pseudo-C
+from which to recover static method bodies.
+
+The dynamic/static paths emit an `out.jar` whose native-method stubs are
+replaced with *best-effort recovered bodies* and whose loader / native-blob
+entries are stripped. Coverage is per method: the dynamic path recovers the
+paths a run actually executes, the static path what the decompile lifts
+cleanly — so unobserved or unlifted methods may keep a stub or a partial body.
+Inspect the output and expect manual completion on hard targets. The emulation
+path recovers the C-only secrets the other two can't see (inlined comparisons,
+the `<clinit>` string tables) and gives you an executable oracle.
 
 License: **GPLv3**.
 
 ---
 
-## ⭐ Recommended workflow: drive it with a coding agent
+## Run it yourself
 
-**The best way to use this project is to load the bundled skill
-([`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md))
-into your favourite coding agent and let it do the work.**
+You can run the default recovery path by hand — no coding agent required:
 
-This project gives you a **universal approach + tooling** for the whole
-"transpile Java → C/C++ and call back via JNI" obfuscator family — but a
-universal approach unavoidably needs some adaptation to each specific target
+```bash
+git clone <this repo> && cd c2j-native-deobfuscator
+bash scripts/setup.sh                      # build JVM + Python (+ native agent on x86-64)
+scripts/j2c doctor                         # check versions + build artifacts
+scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
+```
+
+> **Run the CLI through `scripts/j2c`** (`scripts\j2c.ps1` on Windows). Setup
+> installs the Python workspace into `py/.venv` (via `uv`), so a bare
+> `python3 -m j2c_dumper_cli` on the *system* interpreter would not find the
+> packages. The launcher picks the interpreter that actually has them.
+
+See [Quick start](#quick-start) below and the
+[10-minute getting-started guide](docs/getting-started.md)
+([中文](docs/getting-started.zh-CN.md)).
+
+**When the auto-output needs a human pass.** This project is a *universal*
+approach for the whole "transpile Java → C/C++ and call back via JNI"
+obfuscator family, so hard targets can still need per-method adaptation
 (reading a decompile, supplying per-method state, extending a harness, adding a
-profile). Today's AI agents handle exactly this kind of adaptation well.
+profile). For those, the recovered `*.json` intermediates are meant to be
+hand-edited — see [`docs/manual-restoration.md`](docs/manual-restoration.md).
 
-So **don't expect to just run the ready-made scripts by hand.** Without that
-human/agent fix-up step, the results will be partial — not impressive. Hand the
-agent the skill and the target, and let it adapt the tools to the binary.
+**Optional:** a coding agent handles that adaptation well. If you use one, load
+the bundled skill
+([`.claude/skills/j2c-deobfuscate`](.claude/skills/j2c-deobfuscate/SKILL.md))
+and hand it the target. This is a convenience, not a requirement — the CLI runs
+fine on its own.
 
 ---
 
@@ -69,17 +99,23 @@ agent the skill and the target, and let it adapt the tools to the binary.
   `POP` / `CHECKCAST` / `ACONST_NULL` corrections so the emitted
   sequence verifies under ASM `COMPUTE_FRAMES`.
 
-### Static path
+### Offline discovery (no Ghidra)
 
-- **Disassembly-level table discovery** (`py/binary_introspect/`,
-  `capstone`). Walks the native blob's executable sections, locates
-  every `call qword ptr [reg + 0x6B8]` (the `RegisterNatives` JNI vtable
-  slot), backscans the preceding instructions for PC-relative `lea`s
-  whose targets land in `.text` (= function pointers in the
-  `JNINativeMethod[]` being built on the stack) plus the most recent
-  `mov <nMethods-reg>, imm` (= the table size).
+- **JAR and JNI discovery** (`jar-parser`, `py/binary_introspect/`,
+  `manifest-merge`). `parse-jar`, `inspect-binary`, and `merge-manifest`
+  build `manifest.json` from the JAR declarations and the JNI mechanisms
+  defined by the specification: direct `Java_*` exports and dynamic
+  `RegisterNatives` registrations. This stage does not require a live JVM or
+  Ghidra. The generic discovery implementation lives in
+  [`py/binary_introspect`](py/binary_introspect); broader generic-first
+  coverage is being completed on
+  [PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+
+### Static body recovery (optional Ghidra step)
+
 - **Ghidra decompiler** (`ghidra/scripts/DumpFromManifest.java`,
-  Ghidra Headless). Reads the `(class, method, fnAddr)` triples from
+  Ghidra Headless). Use this later when the JAR cannot run and you want static
+  method bodies. It reads the `(class, method, fnAddr)` triples from
   `manifest.json` and runs Ghidra's p-code decompiler on each address,
   yielding a single `ghidra-dump.json` with one pseudo-C body per
   method.
@@ -141,7 +177,7 @@ All three target the same input but trade off coverage versus accuracy:
 | | Dynamic | Static | Emulation |
 |---|---|---|---|
 | **Best fit** | Binary is packed / VM-protected / has anti-debug — the JVMTI agent sits at the Java side of the wall so the native protection layer doesn't matter. | Binary is unprotected (e.g. straight native-obfuscator + zig c++ output). Ghidra can decompile each `fnAddr` directly. | Logic is rewritten to pure C (comparisons / crypto / string tables), or the jar won't run **and** Ghidra can't structure the code, or you need the decrypted constants. |
-| **Requires** | A runnable command line (`java -jar ...`) that exercises the obfuscated classes. | Ghidra 11.x installed. | Just the blob + `pip install unicorn`. No JVM, no Ghidra. |
+| **Requires** | A runnable command line (`java -jar ...`) that exercises the obfuscated classes. | Ghidra 11.x installed. | Just the blob + the `unicorn` package. No JVM, no Ghidra. |
 | **Coverage** | Only branches you actually run. | Every method registered through `RegisterNatives`. | Method list + decrypted constants always; per-method behaviour via the oracle. |
 | **Accuracy** | High — every opcode maps to an observed JNI call. | Best-effort — pattern matching on decompiled C, stubs on stack imbalance. | Exact (it executes the real code), but you reverse the algorithm from oracle I/O — it does **not** auto-emit bytecode. |
 | **Speed** | Target run time + agent overhead. | Ghidra auto-analysis (minutes for ~1 MB blobs). | Fast — no Ghidra, no live JVM. |
@@ -253,26 +289,53 @@ render them.
 
 ## Quick start
 
-### One-time build
+Prerequisites: **JDK 17+** (with `JAVA_HOME` set) and **Python 3.11+**. On
+Windows, building the native agent also needs **Git Bash** (from Git for
+Windows); WSL builds a Linux `.so`, not the Windows `.dll` the JVM loads here.
+New here? Follow the [10-minute getting-started guide](docs/getting-started.md)
+([中文](docs/getting-started.zh-CN.md)).
+
+### 1. Install (build everything)
 
 ```bash
-# JVM modules
-cd jvm && ./gradlew installDist
-
-# Python workspace
-cd py && uv sync --all-packages
-
-# Native agent (only needed for the dynamic path)
-cd native && JDK_HOME="$JAVA_HOME" bash build.sh
-
-# Emulation path
-cd py && .venv/Scripts/python -m pip install unicorn   # or your venv's pip
+# Idempotent: builds the JVM modules, syncs the Python workspace, and builds
+# the native agent when a JDK + zig are present on an x86-64 host. Safe to re-run.
+bash scripts/setup.sh            # Linux / macOS
+# Windows (PowerShell):
+#   pwsh scripts/setup.ps1
 ```
 
-### Dynamic recovery (preferred when the jar runs in your environment)
+`scripts/setup.sh` uses [`uv`](https://docs.astral.sh/uv/) for the Python
+workspace when available and falls back to `pip install -e` otherwise. The
+native agent step needs a JDK and `zig`; it is skipped with a clear message if
+either is missing (only the dynamic path needs it). `native/build.sh` targets
+x86-64, so on ARM (or any other CPU) setup skips the native agent and does not
+report the dynamic path as ready — use the emulation fallback there.
+
+### 2. Check your toolchain
 
 ```bash
-python -m j2c_dumper_cli.main recover \
+scripts/j2c doctor       # Windows:  scripts\j2c.ps1 doctor
+```
+
+`doctor` reports Java/JDK, Python, the importability of the Python recover
+stage (`capstone` + `lief`), the built JVM modules and the host-matching native
+agent, plus the optional tools (Ghidra, unicorn, zig), and prints the next
+command for anything missing. It verifies tool versions and artifact presence —
+it does not launch the JVM modules or load the agent. It exits non-zero only
+when a required piece is *missing*; a `WARN` (e.g. `JAVA_HOME` unset) is a
+caveat, not a blocker. The agent must match this host in both name and CPU: on a
+non-x86-64 host, where `native/build.sh` cannot produce a loadable agent, it is
+always reported missing and the dynamic path is not ready.
+
+### 3. Recover (default path — dynamic)
+
+**Use this when the jar can be launched in your environment.** It attaches the
+JVMTI agent to a live run, observes the JNI call stream, and lifts it back to
+bytecode:
+
+```bash
+scripts/j2c recover \
     path/to/obfuscated.jar \
     -o path/to/clean.jar \
     --run-cmd "java -jar path/to/obfuscated.jar"
@@ -287,37 +350,55 @@ This chains:
 5. `trace-to-bc`       lifts to `recovered/*.json`
 6. `rebuild`           emits the loader-stripped output jar
 
-### Static recovery (when you can't run the jar — needs Ghidra)
+The output contains *best-effort recovered bodies for the behavior observed
+during the run*. Dynamic tracing only covers executed paths, so unobserved
+methods may keep a stub or a partial body; inspect the result and expect manual
+completion on hard targets (see the human-pass note above).
+
+> **One interpreter.** `scripts/j2c ...` runs the CLI through the interpreter
+> setup installed the packages into (the `uv` venv at `py/.venv`, or the
+> `pip`-fallback interpreter), so you never have to pick one. The few things the
+> CLI does not wrap — the emulation harness and the lifter's feature flags below
+> — run under that same interpreter, written here as `py/.venv/bin/python`
+> (`py\.venv\Scripts\python` on Windows). If setup fell back to `pip`, use the
+> interpreter it installed into instead.
+
+### Offline discovery (no live run, no Ghidra)
+
+Start here when the JAR cannot run. These generic discovery stages inspect
+standard JNI exports and `RegisterNatives` registration evidence and produce a
+merged manifest; they do **not** require Ghidra:
 
 ```bash
-# 1. Parse jar + introspect binary as above (no --run-cmd needed)
-python -m j2c_dumper_cli.main parse-jar      in.jar      -o classes.json
-python -m j2c_dumper_cli.main inspect-binary natives.bin -o binary.json
-python -m j2c_dumper_cli.main merge-manifest classes.json binary.json -o manifest.json
-
-# 2. Run Ghidra headless against the native blob
-<GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
-    -import natives.bin \
-    -scriptPath <repo>/ghidra/scripts \
-    -postScript DumpFromManifest.java manifest.json ghidra-dump.json
-
-# 3. Lift the pseudo-C to bytecode + rebuild
-python -m ast_matcher.cli ghidra-dump.json --manifest manifest.json -o recovered/
-python -m j2c_dumper_cli.main rebuild --input in.jar --recovered recovered/ \
-    --manifest manifest.json -o out.jar
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
 ```
 
-### Emulation recovery (no JVM, no Ghidra — for C-rewritten logic / decrypted constants)
+The generic discovery implementation lives in
+[`py/binary_introspect`](py/binary_introspect); broader generic-first coverage
+is being completed on
+[PR #4](https://github.com/gaoyu06/c2j-native-deobfuscator/pull/4).
+
+### Fallback: emulation (no live run, no Ghidra)
+
+**Use this when the jar won't run in your environment** — e.g. you only have the
+blob, or you need the decrypted C-only constants. It runs the native code under
+a CPU emulator with a mock JNI; no JVM and no Ghidra required:
 
 ```bash
+# add unicorn to the workspace interpreter (`scripts/j2c doctor` prints the
+# exact command if setup fell back to pip)
+(cd py && uv pip install unicorn)
+
 # list native methods (entry points auto-discovered)
-python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
+py/.venv/bin/python py/native_emulate/j2c_emu.py recover natives.bin --binary-json binary.json
 
 # dump a function's decrypted string constants (alphabet, secret, messages)
-python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
+py/.venv/bin/python py/native_emulate/j2c_emu.py strings natives.bin --fn 0x<addr>
 
 # call a native method as a pure function (oracle)
-python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
+py/.venv/bin/python py/native_emulate/j2c_emu.py call natives.bin --fn 0x<addr> \
     --arg-bytes "input" --static "v=@alphabet.txt"
 ```
 
@@ -326,8 +407,35 @@ command reference + verified matrix: [`py/native_emulate/README.md`](py/native_e
 
 ### Stage-by-stage
 
-Every stage has its own subcommand under `j2c-dumper`; see
-`python -m j2c_dumper_cli.main --help` for the full list.
+Every stage has its own subcommand; see
+`scripts/j2c --help` for the full list.
+
+---
+
+## Advanced: static recovery (offline, needs Ghidra)
+
+This is an **optional later step** after the Ghidra-free discovery above. Use
+it only when you cannot run the JAR and want pseudo-C for static method bodies
+that the emulation fallback does not auto-emit. This step requires
+**Ghidra 11.x**:
+
+```bash
+# 1. Generic JNI discovery (no --run-cmd and no Ghidra needed)
+scripts/j2c parse-jar      in.jar      -o classes.json
+scripts/j2c inspect-binary natives.bin -o binary.json
+scripts/j2c merge-manifest classes.json binary.json -o manifest.json
+
+# 2. Optional: lift static bodies through Ghidra headless
+<GHIDRA>/support/analyzeHeadless.bat <project-dir> proj \
+    -import natives.bin \
+    -scriptPath <repo>/ghidra/scripts \
+    -postScript DumpFromManifest.java manifest.json ghidra-dump.json
+
+# 3. Lift the pseudo-C to bytecode + rebuild
+scripts/j2c static-reverse ghidra-dump.json --manifest manifest.json -o recovered/
+scripts/j2c rebuild --input in.jar --recovered recovered/ \
+    --manifest manifest.json -o out.jar
+```
 
 ---
 
@@ -347,11 +455,14 @@ feature flag (throw-reason hint parsing, ExceptionCheck-guard skipping,
 symbol-table tracking, lookup-table resolution, etc.). Disable a flag
 when it misbehaves on a specific binary:
 
+The flags are not exposed by `scripts/j2c static-reverse`, so drive the lifter
+directly with the workspace interpreter:
+
 ```bash
-python -m ast_matcher.cli ghidra-dump.json -o recovered/ \
+py/.venv/bin/python -m ast_matcher.cli ghidra-dump.json -o recovered/ \
     --disable use_throw_reason_invoke_hints \
     --disable skip_native_exception_guards
-python -m ast_matcher.cli --list-flags
+py/.venv/bin/python -m ast_matcher.cli --list-flags
 ```
 
 ---
@@ -389,6 +500,8 @@ python -m ast_matcher.cli --list-flags
 
 ## Documentation
 
+- [getting-started.md](docs/getting-started.md) — 10-minute default-path
+  walkthrough, common failures, where the JSON artifacts land
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — module boundaries, pipeline,
   artifact schemas, extension points
 - [emulation-recovery.md](docs/emulation-recovery.md) — emulation path how-to

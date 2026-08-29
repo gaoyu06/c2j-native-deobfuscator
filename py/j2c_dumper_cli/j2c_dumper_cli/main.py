@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -15,12 +16,62 @@ from typing import Optional
 import typer
 from rich.console import Console
 
+from j2c_dumper_cli import doctor as doctor_mod
+
+
+def _cli_invocation() -> str:
+    """How to re-invoke this CLI in a way that actually works here.
+
+    `scripts/setup.sh` installs the packages into `py/.venv` (via uv), so a
+    bare ``python3 -m j2c_dumper_cli`` on a *system* interpreter would not find
+    them. Every hint the CLI prints must therefore point at an interpreter that
+    has the packages:
+
+    * when launched through ``scripts/j2c`` (or ``scripts/j2c.ps1``), echo that
+      launcher — it resolves the venv/pip interpreter itself;
+    * otherwise echo :data:`sys.executable`, which by definition already
+      imported this module, so the command is guaranteed to run.
+    """
+    launcher = os.environ.get("J2C_CMD")
+    if launcher:
+        return launcher
+    exe = sys.executable or ("python" if os.name == "nt" else "python3")
+    return f"{shlex.quote(exe)} -m j2c_dumper_cli"
+
+
+CLI = _cli_invocation()
+
+HELP = f"""\
+Recover JNI-native transpiled JARs back to readable JVM bytecode.
+
+DEFAULT PATH (dynamic): if the JAR can be launched, run
+
+    scripts/j2c recover IN.jar -o OUT.jar --run-cmd "java -jar IN.jar"
+
+FIRST TIME? run `scripts/setup.sh` (or `scripts/setup.ps1` on Windows) to build
+everything, then `scripts/j2c doctor` to check your toolchain. The `scripts/j2c`
+launcher runs the interpreter the setup step installed the packages into.
+
+FALLBACK (no live run): the emulation path needs no JVM and no Ghidra.
+ADVANCED (offline, needs Ghidra): the static path — see `--help` of the
+individual stage commands and docs/getting-started.md.
+"""
+
 app = typer.Typer(
     add_completion=False,
-    no_args_is_help=True,
-    help="Reverse-engineer native-obfuscator-style transpiled jars.",
+    help=HELP,
 )
 console = Console(stderr=True)
+
+
+@app.callback(invoke_without_command=True)
+def _root(ctx: typer.Context) -> None:
+    # Running with no subcommand prints help and exits 0 (a successful,
+    # intentional "show me what's here"), rather than Typer's default
+    # usage-error exit code.
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit(code=0)
 
 
 # ------------------------------------------------------------------
@@ -43,8 +94,10 @@ def jvm_bin(name: str) -> Path:
     candidate = root / "jvm" / name / "build" / "install" / name / "bin" / f"{name}{suffix}"
     if not candidate.exists():
         raise FileNotFoundError(
-            f"JVM module '{name}' not built. Run "
-            f"`./gradlew :{name}:installDist` from jvm/ first."
+            f"JVM module '{name}' is not built.\n"
+            f"  Fix: run scripts/setup.sh (or scripts/setup.ps1 on Windows),\n"
+            f"       or `cd jvm && ./gradlew :{name}:installDist`.\n"
+            f"  Diagnose: {CLI} doctor"
         )
     return candidate
 
@@ -53,12 +106,25 @@ def native_lib() -> Path:
     """Path to the JVMTI agent shared library, if built."""
     root = project_root()
     libdir = root / "native" / "build" / "lib"
+    hint = (
+        "  Fix: run scripts/setup.sh (or scripts/setup.ps1 on Windows),\n"
+        "       or `cd native && JDK_HOME=\"$JAVA_HOME\" bash build.sh`.\n"
+        f"  Diagnose: {CLI} doctor"
+    )
     if not libdir.exists():
-        raise FileNotFoundError("native agent not built. Run native/build.sh first.")
-    for name in ("j2c_agent.dll", "j2c_agent.so", "j2c_agent.dylib"):
-        if (libdir / name).exists():
-            return libdir / name
-    raise FileNotFoundError(f"No j2c_agent.* under {libdir}")
+        raise FileNotFoundError(
+            "Native JVMTI agent is not built (the dynamic path needs it).\n" + hint
+        )
+    # Only the host-matching artifact can be loaded here; a leftover .so on
+    # Windows (or .dll on Linux) is not usable.
+    want = doctor_mod.host_agent_name()
+    target = libdir / want
+    if target.exists():
+        return target
+    raise FileNotFoundError(
+        f"Native JVMTI agent is not built for this host: no {want} under {libdir}.\n"
+        + hint
+    )
 
 
 def run(cmd: list[str | Path], **kwargs) -> subprocess.CompletedProcess:
@@ -140,6 +206,34 @@ def _run_rebuild(input: Path, recovered: Path, output: Path, manifest: Optional[
     run(args)
 
 
+def _preflight_recover(run_cmd: Optional[str], no_dynamic: bool) -> None:
+    """Fail early with a clear pointer when the toolchain the default path
+    needs is missing, instead of a mid-pipeline traceback."""
+    try:
+        root = project_root()
+    except RuntimeError:
+        return  # non-fatal; the stage that needs it will report specifically
+
+    problems: list[str] = []
+    jvm_check = doctor_mod.check_jvm_modules(root)
+    if not jvm_check.ok:
+        problems.append(f"{jvm_check.detail} — {jvm_check.fix}")
+    if run_cmd and not no_dynamic:
+        agent_check = doctor_mod.check_native_agent(root)
+        if not agent_check.ok:
+            problems.append(f"{agent_check.detail} — {agent_check.fix}")
+
+    if problems:
+        console.print("[bold red]recover cannot start:[/] required build "
+                      "artifacts are missing.")
+        for p in problems:
+            console.print(f"  - {p}")
+        console.print(f"Run [bold]{CLI} doctor[/] for a full "
+                      "report, then [bold]scripts/setup.sh[/] "
+                      "(or scripts/setup.ps1 on Windows).")
+        raise typer.Exit(code=2)
+
+
 @app.command("parse-jar")
 def cli_parse_jar(
     jar: Path = typer.Argument(..., exists=True, dir_okay=False),
@@ -210,6 +304,64 @@ def cli_rebuild(
 
 
 @app.command()
+def doctor() -> None:
+    """Check that your toolchain is ready for the default (dynamic) path.
+
+    Reports Java/JDK, Python, the built JVM modules and native agent, plus
+    the optional tools (Ghidra, unicorn, zig). Exits non-zero if a required
+    piece is missing so it is safe to gate a setup script on it.
+    """
+    from rich.table import Table
+
+    try:
+        root = project_root()
+    except RuntimeError:
+        root = Path.cwd()
+
+    report = doctor_mod.build_report(root)
+
+    symbol = {
+        doctor_mod.STATUS_OK: "[green]OK[/]",
+        doctor_mod.STATUS_MISSING: "[red]MISSING[/]",
+        doctor_mod.STATUS_WARN: "[yellow]WARN[/]",
+        doctor_mod.STATUS_OPTIONAL: "[dim]optional[/]",
+    }
+
+    table = Table(title="j2c-dumper doctor", show_lines=False)
+    table.add_column("Check", style="bold")
+    table.add_column("Status")
+    table.add_column("Detail")
+    for c in report.checks:
+        table.add_row(c.name, symbol.get(c.status, c.status), c.detail)
+    console.print(table)
+
+    fixes = [c for c in report.checks if c.fix and c.status != doctor_mod.STATUS_OK]
+    if fixes:
+        console.print("\n[bold]Next steps:[/]")
+        for c in fixes:
+            tag = "(optional) " if c.optional else ""
+            console.print(f"  - {tag}{c.name}: {c.fix}")
+
+    if report.healthy:
+        # These checks confirm the required tool versions and that the build
+        # artifacts the default path needs are present. They do not launch the
+        # JVM modules or load the agent, so this is a readiness of the inputs,
+        # not a guarantee that a given target recovers cleanly.
+        console.print("\n[bold green]Required checks passed.[/] "
+                      "Versions and build artifacts for the default path are "
+                      "in place.")
+        for c in report.warnings:
+            console.print(f"[yellow]note:[/] {c.name}: {c.detail}")
+        console.print(f"Try: {CLI} recover IN.jar -o OUT.jar "
+                      "--run-cmd \"java -jar IN.jar\"")
+    else:
+        missing = ", ".join(c.name for c in report.blocking)
+        console.print(f"\n[bold red]Not ready.[/] Missing: {missing}. "
+                      "Run scripts/setup.sh (or scripts/setup.ps1) to fix.")
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def recover(
     jar: Path = typer.Argument(..., exists=True, dir_okay=False, help="Input (obfuscated) jar"),
     lib: Optional[Path] = typer.Option(None, "--lib", help="Native library (auto-extracted from jar if omitted)"),
@@ -221,7 +373,13 @@ def recover(
     ghidra_dump: Optional[Path] = typer.Option(None, "--ghidra-dump", help="Pre-generated Ghidra dump JSON (skip Ghidra invocation)"),
     workdir: Optional[Path] = typer.Option(None, "--workdir", help="Working directory for intermediate files"),
 ):
-    """One-shot orchestration: parse → introspect → merge → trace → recover → rebuild."""
+    """One-shot orchestration: parse → introspect → merge → trace → recover → rebuild.
+
+    This is the default path. With --run-cmd it runs the JVMTI agent against a
+    live launch of the JAR (dynamic recovery). Without a runnable JAR, use the
+    emulation fallback instead — see docs/getting-started.md.
+    """
+    _preflight_recover(run_cmd=run_cmd, no_dynamic=no_dynamic)
     if workdir is None:
         workdir = Path(tempfile.mkdtemp(prefix="j2c-"))
     workdir.mkdir(parents=True, exist_ok=True)
