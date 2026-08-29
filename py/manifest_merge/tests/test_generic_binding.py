@@ -167,3 +167,46 @@ def test_ambiguous_unnamed_count_only_table_is_left_unbound_with_gap() -> None:
             "registerNativesCallSite": "0x5000",
         }
     ]
+
+
+def test_unreadable_register_natives_entry_is_recorded_as_binding_gap() -> None:
+    """A binary.json nativeRegistry entry marked ``register-natives-unreadable``
+    (a visible RegisterNatives site whose ``JNINativeMethod[]`` did not decode)
+    must surface as an ``unreadable-table`` binding gap and must NEVER bind a
+    class — the garbage table is never turned into a bind."""
+    classes = _classes([("alpha", "()V"), ("beta", "(I)I")])
+    manifest = merge(
+        classes,
+        {
+            "nativeRegistry": [
+                {
+                    "source": "register-natives-unreadable",
+                    "registerNativesCallSite": "0x1016",
+                    "nMethods": 2,
+                    "tableAddress": "0x3ef0",
+                    "reason": "invalid-method-descriptors",
+                }
+            ]
+        },
+    )
+
+    assert all(
+        "fnAddr" not in method
+        for cls in manifest["classes"]
+        for method in cls["methods"]
+    )
+    assert manifest["bindingGaps"] == [
+        {
+            "kind": "unreadable-table",
+            "nMethods": 2,
+            "reason": "invalid-method-descriptors",
+            "message": (
+                "RegisterNatives table at 0x1016 was seen but its method "
+                "name/descriptor bytes did not decode "
+                "(invalid-method-descriptors); 2 methods left unbound"
+            ),
+            "source": "register-natives-unreadable",
+            "registerNativesCallSite": "0x1016",
+            "tableAddress": "0x3ef0",
+        }
+    ]

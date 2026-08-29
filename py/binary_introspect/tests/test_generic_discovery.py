@@ -49,6 +49,14 @@ def _stack_tables(report) -> list[dict]:
     ]
 
 
+def _unreadable_tables(report) -> list[dict]:
+    return [
+        entry
+        for entry in report.native_registry
+        if entry.get("source") == "register-natives-unreadable"
+    ]
+
+
 def _capstone_disassembles_x86_32() -> bool:
     """True when the host capstone can decode 32-bit x86. This is the base x86
     backend that every capstone build carries, so it is effectively always
@@ -1118,6 +1126,102 @@ def test_pe_j2cc_shared_dispatch_tables_bind_by_count_and_gap_when_ambiguous() -
     assert {g["registerNativesCallSite"] for g in gaps} == {
         table["registerNativesCallSite"] for table in _stack_tables(report)
     }
+
+
+def test_introspect_elf_records_unreadable_register_natives_table_as_honest_gap() -> None:
+    """A RegisterNatives call site whose in-image ``JNINativeMethod[]`` is
+    VISIBLE (right stride, ``nMethods`` immediate 2) but whose name/descriptor
+    bytes are high-bit / XOR-looking garbage that is not valid UTF-8 must be
+    recorded as an HONEST GAP — the site was seen but the table did not decode —
+    rather than silently dropped or turned into fabricated methods.
+
+    This proves only that a visible-but-unreadable table is never silently
+    skipped; it does NOT decrypt or recover the table (that stays out of scope).
+    """
+    path = FIXTURES / "libjni_unreadable_table.so"
+
+    binary = lief.parse(str(path))
+    assert binary.format == lief.Binary.FORMATS.ELF
+    assert int(binary.header.machine_type) == 0x3E  # EM_X86_64
+
+    report = introspect(path)
+    assert report.fmt == "ELF"
+    assert report.arch == "x86_64"
+    # No variant detector fires on this image, so the profile stays generic.
+    assert report.analysis["profile"] == "generic"
+    assert report.analysis["methodDiscovery"] == "jni-spec"
+    # The honest gap is surfaced on analysis as a count.
+    assert report.analysis["unreadableTables"] == 1
+
+    # NO static or stack method table is claimed, and crucially NO methods and
+    # NO fnAddrs are fabricated from the garbage table.
+    assert _static_tables(report) == []
+    assert _stack_tables(report) == []
+    assert all("methods" not in entry for entry in report.native_registry)
+    assert all("fnAddrs" not in entry for entry in report.native_registry)
+
+    # The RegisterNatives site is recorded as a first-class unreadable-table
+    # gap carrying the call site, count, table address, and a reason — no names.
+    gaps = _unreadable_tables(report)
+    assert len(gaps) == 1
+    gap = gaps[0]
+    assert gap["nMethods"] == 2
+    assert gap["abi"] == "amd64-sysv"
+    assert gap["profile"] == "generic"
+    assert gap["reason"] == "invalid-method-descriptors"
+    assert gap["registerNativesCallSite"].startswith("0x")
+    assert gap["tableAddress"].startswith("0x")
+    assert "methods" not in gap
+    assert "fnAddrs" not in gap
+
+    # The genuine Java_* export is still recorded as a second registration
+    # family on the same image, independent of the unreadable table.
+    exported = {e["fnSymbol"] for e in _jni_exports(report)}
+    assert exported == {"Java_com_example_Enc_ping"}
+
+
+def test_unreadable_table_leaves_two_method_class_unbound_with_gap() -> None:
+    """End-to-end merge of the unreadable-table fixture against a classes.json
+    with a 2-native-method class: that class stays UNBOUND (no fnAddr invented
+    from the garbage) and an ``unreadable-table`` binding gap is recorded."""
+    from manifest_merge.core import merge
+
+    report = introspect(FIXTURES / "libjni_unreadable_table.so")
+    binary = report.to_json_obj()
+    classes = {
+        "input": {"jarPath": "input.jar"},
+        "classes": [
+            {
+                "name": "com/example/Enc",
+                "methods": [
+                    {
+                        "name": "a",
+                        "desc": "()V",
+                        "access": 0x0100,
+                        "isObfuscatedNative": True,
+                    },
+                    {
+                        "name": "b",
+                        "desc": "(I)I",
+                        "access": 0x0100,
+                        "isObfuscatedNative": True,
+                    },
+                ],
+            }
+        ],
+    }
+    manifest = merge(classes, binary)
+
+    assert all(
+        "fnAddr" not in method
+        for cls in manifest["classes"]
+        for method in cls["methods"]
+    )
+    gaps = manifest["bindingGaps"]
+    assert [g["kind"] for g in gaps] == ["unreadable-table"]
+    assert gaps[0]["nMethods"] == 2
+    assert gaps[0]["source"] == "register-natives-unreadable"
+    assert gaps[0]["registerNativesCallSite"].startswith("0x")
 
 
 def test_introspect_real_i386_elf_recovers_static_table_and_export() -> None:

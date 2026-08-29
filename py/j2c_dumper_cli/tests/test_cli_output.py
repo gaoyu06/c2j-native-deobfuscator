@@ -29,6 +29,14 @@ FIXTURE_DLL = (
     / "jni_dispatch_j2cc.dll"
 )
 
+FIXTURE_UNREADABLE = (
+    Path(__file__).resolve().parents[2]
+    / "binary_introspect"
+    / "tests"
+    / "fixtures"
+    / "libjni_unreadable_table.so"
+)
+
 runner = CliRunner()
 
 
@@ -113,6 +121,82 @@ def test_merge_manifest_prints_binding_gaps_and_writes_them(tmp_path: Path) -> N
         "ambiguous-count-only-table",
     ]
     assert {g["nMethods"] for g in gaps} == {2, 3}
+
+
+def test_inspect_binary_reports_unreadable_table_count(tmp_path: Path) -> None:
+    """inspect-binary must surface a visible-but-unreadable RegisterNatives
+    table in its human output (``unreadableTables=1``), and binary.json must
+    carry the honest gap both under ``analysis.unreadableTables`` and as a
+    ``register-natives-unreadable`` registry record — with no fabricated
+    methods or fnAddrs from the garbage table."""
+    binary_json = tmp_path / "binary.json"
+
+    result = runner.invoke(
+        app, ["inspect-binary", str(FIXTURE_UNREADABLE), "-o", str(binary_json)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "unreadableTables=1" in result.output
+
+    doc = json.loads(binary_json.read_text(encoding="utf-8"))
+    assert doc["analysis"]["unreadableTables"] == 1
+    unreadable = [
+        entry
+        for entry in doc["nativeRegistry"]
+        if entry.get("source") == "register-natives-unreadable"
+    ]
+    assert len(unreadable) == 1
+    assert unreadable[0]["nMethods"] == 2
+    assert all("methods" not in entry for entry in doc["nativeRegistry"])
+    assert all("fnAddrs" not in entry for entry in doc["nativeRegistry"])
+
+
+def test_merge_manifest_reports_unreadable_table_gap(tmp_path: Path) -> None:
+    """Merging the unreadable-table binary.json against a 2-native-method class
+    leaves that class unbound and prints an ``unreadable-table`` binding gap."""
+    binary_json = tmp_path / "binary.json"
+    classes_json = tmp_path / "classes.json"
+    manifest_json = tmp_path / "manifest.json"
+
+    inspect = runner.invoke(
+        app, ["inspect-binary", str(FIXTURE_UNREADABLE), "-o", str(binary_json)]
+    )
+    assert inspect.exit_code == 0, inspect.output
+
+    classes = {
+        "input": {"jarPath": "input.jar"},
+        "classes": [
+            {
+                "name": "com/example/Enc",
+                "methods": [
+                    {"name": "a", "desc": "()V", "access": 0x0100, "isObfuscatedNative": True},
+                    {"name": "b", "desc": "(I)I", "access": 0x0100, "isObfuscatedNative": True},
+                ],
+            }
+        ],
+    }
+    classes_json.write_text(json.dumps(classes), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "merge-manifest",
+            str(classes_json),
+            str(binary_json),
+            "-o",
+            str(manifest_json),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "bindingGaps=1" in result.output
+    assert "unreadable-table" in result.output
+
+    manifest = json.loads(manifest_json.read_text(encoding="utf-8"))
+    assert [g["kind"] for g in manifest["bindingGaps"]] == ["unreadable-table"]
+    assert all(
+        "fnAddr" not in method
+        for cls in manifest["classes"]
+        for method in cls["methods"]
+    )
 
 
 def test_inspect_binary_alone_reports_zero_free_gaps_only_after_merge(tmp_path: Path) -> None:
