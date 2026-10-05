@@ -1,86 +1,338 @@
-name: Build CLI tools only
+name: Build CLI + separate prebuilt DLL/SO agents
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-cli:
-    runs-on: windows-latest
-
-    permissions:
-      contents: write
+    name: Build original CLI ZIP
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Java 17
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           architecture: x64
           cache: gradle
 
+      - name: Remember JDK 17 path
+        shell: bash
+        run: echo "JDK17=$JAVA_HOME" >> "$GITHUB_ENV"
+
       - name: Set up Java 21
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
           architecture: x64
-          set-default: false
+
+      - name: Remember JDK 21 path
+        shell: bash
+        run: echo "JDK21=$JAVA_HOME" >> "$GITHUB_ENV"
 
       - name: Configure Gradle Java toolchains
-        shell: powershell
+        shell: bash
         run: |
-          if (-not $env:JAVA_HOME_17_X64 -or -not $env:JAVA_HOME_21_X64) {
-            throw "setup-java did not provision both JDKs (JAVA_HOME_17_X64 / JAVA_HOME_21_X64)"
-          }
-          $jdk17 = $env:JAVA_HOME_17_X64.Replace('\', '/')
-          $jdk21 = $env:JAVA_HOME_21_X64.Replace('\', '/')
-
-          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.gradle" | Out-Null
-
-          @"
+          set -euo pipefail
+          mkdir -p "$HOME/.gradle"
+          cat > "$HOME/.gradle/gradle.properties" <<EOF
           org.gradle.java.installations.auto-detect=true
           org.gradle.java.installations.auto-download=false
-          org.gradle.java.installations.paths=$jdk17,$jdk21
-          "@ | Set-Content "$env:USERPROFILE\.gradle\gradle.properties"
+          org.gradle.java.installations.paths=$JDK17,$JDK21
+          EOF
 
       - name: Build CLI distributions
         working-directory: jvm
-        shell: powershell
-        run: .\gradlew.bat installDist --no-daemon
-
-      - name: Archive entire project without .git
-        shell: powershell
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Path "dist_package" -Force
+          set -euo pipefail
+          chmod +x gradlew
+          JAVA_HOME="$JDK17" ./gradlew installDist --no-daemon
 
-          Get-ChildItem -Path . -Force |
-            Where-Object {
-              $_.Name -ne ".git" -and
-              $_.Name -ne "dist_package" -and
-              $_.Name -ne "project.zip" -and
-              $_.Name -ne "c2j-native-deobfuscator.zip"
-            } |
-            Copy-Item -Destination "dist_package" -Recurse -Force
+      - name: Archive original project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f c2j-native-deobfuscator.zip
 
-          Compress-Archive `
-            -Path "dist_package\*" `
-            -DestinationPath "c2j-native-deobfuscator.zip"
+          zip -r c2j-native-deobfuscator.zip . \
+            -x '.git/*' \
+               '.git' \
+               'prebuilt/*' \
+               'prebuilt' \
+               'c2j-native-deobfuscator.zip'
 
-      - name: Generate Tag Name
+          unzip -l c2j-native-deobfuscator.zip | tail -n 20
+
+      - name: Upload original project ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-release-zip
+          path: c2j-native-deobfuscator.zip
+          if-no-files-found: error
+
+  # Each architecture is built in its own matrix job and uploaded as its own
+  # artifact. No architecture can overwrite another architecture's file.
+  build-native-windows:
+    name: Windows DLL (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-windows-gnu
+            output: j2c_agent-windows-x64.dll
+          - arch: arm64
+            target: aarch64-windows-gnu
+            output: j2c_agent-windows-arm64.dll
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21 headers
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          architecture: x64
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build ${{ matrix.arch }} DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path native-out | Out-Null
+
+          $output = Join-Path 'native-out' '${{ matrix.output }}'
+          $args = @(
+            'c++',
+            '-target', '${{ matrix.target }}',
+            '-std=c++17',
+            '-O2',
+            '-DNDEBUG',
+            '-shared',
+            '-Wno-nullability-completeness',
+            "-I$env:JAVA_HOME\include",
+            "-I$env:JAVA_HOME\include\win32",
+            '-Inative\include',
+            '-o', $output,
+            'native\src\agent.cpp',
+            'native\src\trace_writer.cpp',
+            'native\src\jni_hook.cpp'
+          )
+
+          & zig @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if (-not (Test-Path $output)) {
+            throw "Expected output was not created: $output"
+          }
+
+          Get-Item $output | Format-List Name,Length,FullName
+
+      - name: Upload ${{ matrix.arch }} DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-${{ matrix.arch }}
+          path: native-out/${{ matrix.output }}
+          if-no-files-found: error
+
+  build-native-linux:
+    name: Linux SO (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-linux-gnu
+            output: j2c_agent-linux-x64.so
+          - arch: arm64
+            target: aarch64-linux-gnu
+            output: j2c_agent-linux-arm64.so
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21 headers
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          architecture: x64
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build ${{ matrix.arch }} SO
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native-out
+
+          zig c++ \
+            -target '${{ matrix.target }}' \
+            -std=c++17 \
+            -O2 \
+            -DNDEBUG \
+            -shared \
+            -fPIC \
+            -Wno-nullability-completeness \
+            -I "$JAVA_HOME/include" \
+            -I "$JAVA_HOME/include/linux" \
+            -I native/include \
+            -o 'native-out/${{ matrix.output }}' \
+            native/src/agent.cpp \
+            native/src/trace_writer.cpp \
+            native/src/jni_hook.cpp
+
+          test -f 'native-out/${{ matrix.output }}'
+          ls -lh 'native-out/${{ matrix.output }}'
+          file 'native-out/${{ matrix.output }}' || true
+
+      - name: Upload ${{ matrix.arch }} SO
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-${{ matrix.arch }}
+          path: native-out/${{ matrix.output }}
+          if-no-files-found: error
+
+  # Download all 4 architecture-specific artifacts and package ONLY the native
+  # files into prebuilt_dll_so.zip.
+  package-prebuilt:
+    name: Package prebuilt_dll_so.zip
+    needs:
+      - build-native-windows
+      - build-native-linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: incoming
+          merge-multiple: true
+
+      - name: Verify downloaded native files
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Downloaded files:'
+          find incoming -maxdepth 2 -type f -print | sort
+
+          expected=(
+            j2c_agent-windows-x64.dll
+            j2c_agent-windows-arm64.dll
+            j2c_agent-linux-x64.so
+            j2c_agent-linux-arm64.so
+          )
+
+          for file in "${expected[@]}"; do
+            if [[ ! -f "incoming/$file" ]]; then
+              echo "ERROR: missing incoming/$file" >&2
+              exit 1
+            fi
+          done
+
+          count=$(find incoming -maxdepth 1 -type f \( -name '*.dll' -o -name '*.so' \) | wc -l)
+          if [[ "$count" -ne 4 ]]; then
+            echo "ERROR: expected exactly 4 native files, got $count" >&2
+            exit 1
+          fi
+
+      - name: Create prebuilt_dll_so.zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            prebuilt/windows/x64 \
+            prebuilt/windows/arm64 \
+            prebuilt/linux/x64 \
+            prebuilt/linux/arm64
+
+          cp incoming/j2c_agent-windows-x64.dll   prebuilt/windows/x64/j2c_agent.dll
+          cp incoming/j2c_agent-windows-arm64.dll prebuilt/windows/arm64/j2c_agent.dll
+
+          cp incoming/j2c_agent-linux-x64.so      prebuilt/linux/x64/j2c_agent.so
+          cp incoming/j2c_agent-linux-arm64.so    prebuilt/linux/arm64/j2c_agent.so
+
+          echo 'Final prebuilt tree:'
+          find prebuilt -type f -print | sort
+
+          native_count=$(find prebuilt -type f \( -name '*.dll' -o -name '*.so' \) | wc -l)
+          if [[ "$native_count" -ne 4 ]]; then
+            echo "ERROR: prebuilt should contain exactly 4 native files, got $native_count" >&2
+            exit 1
+          fi
+
+          zip -r prebuilt_dll_so.zip prebuilt
+          unzip -l prebuilt_dll_so.zip
+
+      - name: Upload prebuilt ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-release-zip
+          path: prebuilt_dll_so.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub pre-release
+    needs:
+      - build-cli
+      - package-prebuilt
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download original project ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-release-zip
+          path: release-assets
+
+      - name: Download prebuilt ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-release-zip
+          path: release-assets
+
+      - name: Show release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh release-assets
+          test -f release-assets/c2j-native-deobfuscator.zip
+          test -f release-assets/prebuilt_dll_so.zip
+
+      - name: Generate tag name
         id: tag
-        shell: powershell
-        run: |
-          $tagName = "cli-" + (Get-Date -Format "yyyy.MM.dd-HHmm")
-          echo "TAG_NAME=$tagName" >> $env:GITHUB_OUTPUT
+        shell: bash
+        run: echo "TAG_NAME=cli-native-$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Pre-release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.TAG_NAME }}
-          name: "CLI Tools Pre-release (${{ steps.tag.outputs.TAG_NAME }})"
+          name: "CLI + Prebuilt Agents Pre-release (${{ steps.tag.outputs.TAG_NAME }})"
           prerelease: true
-          files: c2j-native-deobfuscator.zip
+          files: |
+            release-assets/c2j-native-deobfuscator.zip
+            release-assets/prebuilt_dll_so.zip
