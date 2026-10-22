@@ -53,11 +53,11 @@ class ClassRebuilderCmd : Callable<Int> {
 
     @Option(
         names = ["--allow-unverified-classes"],
-        description = ["When ASM frame computation rejects the lifted bytecode for a class, fall back to writing the methods with COMPUTE_MAXS only (no StackMapTable). The class becomes non-loadable but stays decompilable — preserves the lifted opcodes for inspection instead of stubbing them out. Default: true."],
+        description = ["When ASM frame computation rejects the lifted bytecode for a class, fall back to writing the methods with COMPUTE_MAXS only (no StackMapTable). The class becomes non-loadable but stays decompilable — preserves the lifted opcodes for inspection instead of stubbing them out. Default: false."],
         arity = "1",
-        defaultValue = "true",
+        defaultValue = "false",
     )
-    var allowUnverifiedClasses: Boolean = true
+    var allowUnverifiedClasses: Boolean = false
 
     @Option(names = ["--analysis-only"], description = ["Allow incomplete output for decompilation; not a runnable mod"])
     var analysisOnly = false
@@ -66,6 +66,9 @@ class ClassRebuilderCmd : Callable<Int> {
         val loaderCfg = detectLoaderConfig()
         val recovered = RecoveredIndex.loadDir(recoveredDir)
         System.err.println("Loaded ${recovered.size()} recovered methods")
+        require(analysisOnly || !recovered.hasDynamicBodies()) {
+            "JNI trace bodies lack reconstructed native control/data flow; use --analysis-only"
+        }
         val missing = mutableListOf<String>()
         JarFile(input.toFile()).use { jar ->
             val entries = jar.entries()
@@ -84,19 +87,30 @@ class ClassRebuilderCmd : Callable<Int> {
             return 2
         }
         if (analysisOnly) System.err.println("ANALYSIS ONLY: native loader/libraries may be removed; output is not a runnable mod")
+        require(analysisOnly || !allowUnverifiedClasses) {
+            "--allow-unverified-classes requires --analysis-only"
+        }
         val rebuilder = ClassRebuilder(
             loaderCfg, recovered,
             annotateRuntimeValues = annotateRuntimeValues,
             inlineTraceMarkers = inlineTraceMarkers,
             allowUnverifiedClasses = allowUnverifiedClasses,
         )
-        val stats = rebuilder.rebuild(input, output)
+        val stats = try { rebuilder.rebuild(input, output) } catch (e: Exception) {
+            Files.deleteIfExists(output)
+            throw e
+        }
         System.err.println(
             "Wrote ${output} | classes=${stats.classes} replaced=${stats.replaced} " +
                 "leftAsStub=${stats.leftAsStub} unverifiedClasses=${stats.unverifiedClasses} " +
                 "unverifiedMethods=${stats.unverifiedMethods} loaderStripped=${stats.loaderStripped} " +
                 "nativeLibsStripped=${stats.nativeLibsStripped}"
         )
+        if (!analysisOnly && (stats.leftAsStub > 0 || stats.unverifiedClasses > 0)) {
+            Files.deleteIfExists(output)
+            System.err.println("Rebuild refused: incomplete or unverified bodies; output removed")
+            return 2
+        }
         return 0
     }
 
@@ -130,6 +144,8 @@ class RecoveredIndex(private val map: Map<Key, RecoveredMethod>) {
 
     fun lookup(owner: String, name: String, desc: String): RecoveredMethod? =
         map[Key(owner, name, desc)]
+
+    fun hasDynamicBodies(): Boolean = map.values.any { it.source == "dynamic" }
 
     fun size(): Int = map.size
 
@@ -178,7 +194,7 @@ class ClassRebuilder(
     private val recovered: RecoveredIndex,
     private val annotateRuntimeValues: Boolean = true,
     private val inlineTraceMarkers: Boolean = false,
-    private val allowUnverifiedClasses: Boolean = true,
+    private val allowUnverifiedClasses: Boolean = false,
 ) {
     private val loaderClass: String? get() = loaderCfg.loaderClass
     private val nativeDir: String? get() = loaderCfg.nativeDir
@@ -383,6 +399,9 @@ class ClassRebuilder(
                 }
             }
 
+            if (!allowUnverifiedClasses) {
+                throw IllegalStateException("Cannot emit verified class ${cn.name}; no stub substitution permitted", t1)
+            }
             // Tier 3: full stub fallback — we couldn't even write the class
             // structurally. Reset bodies + retry with COMPUTE_FRAMES so the
             // rest of the jar still ships.
@@ -490,28 +509,8 @@ class ClassRebuilder(
                 k--
             }
         }
-        // native-obfuscator additionally emits a `<hiddenClass>.special_clinit_N_M(Class)V`
-        // proxy call that holds the original <clinit> body. Strip that too —
-        // we don't have a way to recover the hidden proxy's bytecode without
-        // the JNI trace.
-        for (j in arr.indices) {
-            val node = arr[j]
-            if (node is MethodInsnNode &&
-                node.opcode == Opcodes.INVOKESTATIC &&
-                node.name.startsWith("special_clinit_")
-            ) {
-                toRemove += node
-                var k = j - 1
-                while (k >= 0) {
-                    val n = arr[k]
-                    if (n !is LabelNode && n !is LineNumberNode && n !is FrameNode) {
-                        toRemove += n
-                        break
-                    }
-                    k--
-                }
-            }
-        }
+        // Preserve special_clinit_* calls: they contain original initialization
+        // semantics, even when their implementation is not yet recovered.
         toRemove.forEach { insns.remove(it) }
     }
 

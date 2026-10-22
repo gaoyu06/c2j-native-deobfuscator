@@ -44,6 +44,9 @@ class TraceToBytecodeCmd : Callable<Int> {
         val knownOwners = mani.classes.map { it.name }.toSet()
         require(overrides.values.all { it in knownOwners }) { "Owner map names must identify classes present in the manifest" }
         val events = parseTrace(trace)
+        require(events.none { it["ev"]?.asText() == "truncate" }) {
+            "Trace has truncated frames; recapture with max-frame-events=0"
+        }
         val groups = groupByMethodInvocation(events)
         val byMethod = mutableMapOf<MethodKey, MutableList<TraceGroup>>()
         for (g in groups) {
@@ -58,8 +61,21 @@ class TraceToBytecodeCmd : Callable<Int> {
         translator.warmup(events)
         var produced = 0
         val failures = mutableListOf<Map<String, String>>()
+        val evidenceDir = output.toAbsolutePath().resolveSibling(output.fileName.toString() + ".invocations")
+        require(!Files.exists(evidenceDir)) { "Invocation evidence directory already exists: $evidenceDir" }
+        Files.createDirectories(evidenceDir)
+        for (cls in mani.classes) for (method in cls.methods) {
+            if ((method.access and 0x0100) != 0 && MethodKey(cls.name, method.name, method.desc) !in byMethod) {
+                failures += mapOf("owner" to cls.name, "name" to method.name, "desc" to method.desc, "reason" to "native method never observed")
+            }
+        }
         for ((mk, invocations) in byMethod) {
-            // Pick the longest (most informative) trace for this method
+            // Preserve every invocation outside recovered/; these are raw evidence,
+            // not alternative bodies to overwrite each other during rebuild.
+            for ((index, invocation) in invocations.withIndex()) {
+                JsonIO.write(evidenceDir.resolve("${safeFilename(mk)}.$index.json"), invocation)
+            }
+            // Longest trace is an analysis view, not a merged CFG.
             val pick = invocations.maxByOrNull { it.events.size } ?: continue
             // Union of exception types observed across ALL invocations of
             // this method — single-invocation traces may not exercise every
@@ -79,7 +95,7 @@ class TraceToBytecodeCmd : Callable<Int> {
         }
         val report = output.toAbsolutePath().resolveSibling(output.fileName.toString() + ".report.json")
         JsonIO.write(report, mapOf("schemaVersion" to 1, "produced" to produced, "unresolved" to failures,
-            "status" to if (failures.isEmpty()) "translated-not-runtime-validated" else "incomplete"))
+            "status" to "analysis-only-native-cfg-unrecovered", "invocationEvidence" to evidenceDir.toString(), "runtimeValidated" to false))
         System.err.println("Recovered $produced methods → $output; unresolved=${failures.size}; report=$report")
         return if (failures.isEmpty() || allowPartial) 0 else 2
     }
@@ -110,7 +126,7 @@ private fun parseTrace(path: Path): List<JsonNode> {
             if (l.isEmpty()) return@forEach
             try {
                 list.add(JsonIO.mapper.readTree(l))
-            } catch (ignore: Throwable) { /* skip malformed */ }
+            } catch (ex: Exception) { throw IllegalArgumentException("Malformed trace JSON; refusing partial recovery", ex) }
         }
     }
     return list
@@ -566,7 +582,7 @@ class TraceTranslator(private val manifest: ManifestJson, private val ownerOverr
         when (call) {
             "GetStaticObjectField", "GetStaticBooleanField", "GetStaticByteField",
             "GetStaticCharField", "GetStaticShortField", "GetStaticIntField",
-            "GetStaticLongField" -> {
+            "GetStaticLongField", "GetStaticFloatField", "GetStaticDoubleField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: error("Unresolved field ID in $call: $args")
                 val rawOwner = fid.owner ?: error("Unresolved field owner: ${fid.name}${fid.desc}")
                 val owner = if (rawOwner.startsWith("[")) currentOwner else rawOwner
@@ -579,7 +595,7 @@ class TraceTranslator(private val manifest: ManifestJson, private val ownerOverr
             }
 
             "GetObjectField", "GetBooleanField", "GetByteField",
-            "GetCharField", "GetShortField", "GetIntField", "GetLongField" -> {
+            "GetCharField", "GetShortField", "GetIntField", "GetLongField", "GetFloatField", "GetDoubleField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: error("Unresolved field ID in $call: $args")
                 val rawOwner = fid.owner ?: error("Unresolved field owner: ${fid.name}${fid.desc}")
                 val owner = if (rawOwner.startsWith("[")) currentOwner else rawOwner
@@ -593,7 +609,7 @@ class TraceTranslator(private val manifest: ManifestJson, private val ownerOverr
             }
 
             "SetObjectField", "SetBooleanField", "SetByteField",
-            "SetCharField", "SetShortField", "SetIntField", "SetLongField" -> {
+            "SetCharField", "SetShortField", "SetIntField", "SetLongField", "SetFloatField", "SetDoubleField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: error("Unresolved field ID in $call: $args")
                 val rawOwner = fid.owner ?: error("Unresolved field owner: ${fid.name}${fid.desc}")
                 val owner = if (rawOwner.startsWith("[")) currentOwner else rawOwner
@@ -603,6 +619,14 @@ class TraceTranslator(private val manifest: ManifestJson, private val ownerOverr
                     RecoveredInsn(op = "PUTFIELD", owner = owner, name = fid.name, desc = fid.desc),
                     consume = 2, produce = null,
                 )
+            }
+
+            "SetStaticObjectField", "SetStaticBooleanField", "SetStaticByteField", "SetStaticCharField",
+            "SetStaticShortField", "SetStaticIntField", "SetStaticLongField", "SetStaticFloatField", "SetStaticDoubleField" -> {
+                val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: error("Unresolved static field in $call")
+                val owner = fid.owner ?: error("Unresolved static field owner")
+                b.pushArg(extractScalar(args?.get(2)), fid.desc ?: error("Missing field descriptor"), dynamicKind = "field_value")
+                b.emitRaw(RecoveredInsn(op = "PUTSTATIC", owner = owner, name = fid.name, desc = fid.desc), 1, null)
             }
 
             "AllocObject" -> {
@@ -638,7 +662,10 @@ class TraceTranslator(private val manifest: ManifestJson, private val ownerOverr
                 }
             }
 
-            "CallNonvirtualVoidMethod", "CallNonvirtualObjectMethod" -> {
+            "CallNonvirtualVoidMethod", "CallNonvirtualObjectMethod",
+            "CallNonvirtualBooleanMethod", "CallNonvirtualByteMethod", "CallNonvirtualCharMethod",
+            "CallNonvirtualShortMethod", "CallNonvirtualIntMethod", "CallNonvirtualLongMethod",
+            "CallNonvirtualFloatMethod", "CallNonvirtualDoubleMethod" -> {
                 val mid = symbols[args?.get(2)?.asText()] as? Sym.MethodId
                 check(mid?.owner != null) { "Unresolved method owner in $call: $args" }
                 if (mid != null && mid.owner != null) {
@@ -734,6 +761,12 @@ class TraceTranslator(private val manifest: ManifestJson, private val ownerOverr
             "SetFloatArrayRegion"   -> emitArrayStore(b, args, "[F", "F", "FASTORE")
             "SetDoubleArrayRegion"  -> emitArrayStore(b, args, "[D", "D", "DASTORE")
 
+            "GetBooleanArrayElements", "GetByteArrayElements", "GetCharArrayElements", "GetShortArrayElements",
+            "GetIntArrayElements", "GetLongArrayElements", "GetFloatArrayElements", "GetDoubleArrayElements",
+            "ReleaseBooleanArrayElements", "ReleaseByteArrayElements", "ReleaseCharArrayElements", "ReleaseShortArrayElements",
+            "ReleaseIntArrayElements", "ReleaseLongArrayElements", "ReleaseFloatArrayElements", "ReleaseDoubleArrayElements",
+            "NewString", "GetStringChars", "GetStringUTFChars", "MonitorEnter", "MonitorExit",
+            "ExceptionOccurred", "ExceptionClear" -> error("$call requires native data/control-flow reconstruction")
             "Throw", "ThrowNew" -> error("JNI pending exception control flow requires reconstruction; refusing to emit an unrelated ATHROW")
 
             else -> {}
@@ -878,15 +911,17 @@ class TraceTranslator(private val manifest: ManifestJson, private val ownerOverr
     private fun emitArrayLoad(b: StackBalancer, args: JsonNode?, arrType: String, op: String, produces: StackBalancer.V) {
         // ArrayRegion args: [array, start, len, (value)] — when len==1 we
         // treat this as a single element load (xALOAD).
+        require(args?.get(2)?.asInt() == 1) { "Bulk ArrayRegion needs loop/dataflow reconstruction" }
         b.ensureReceiver(args?.get(0)?.asText(), arrType)
         b.pushInt(args?.get(1)?.asInt() ?: 0, dynamicKind = "arr_idx")
         b.emitRaw(RecoveredInsn(op = op), 2, produces)
     }
 
     private fun emitArrayStore(b: StackBalancer, args: JsonNode?, arrType: String, elemDesc: String, op: String) {
+        require(args?.get(2)?.asInt() == 1) { "Bulk ArrayRegion needs loop/dataflow reconstruction" }
         b.ensureReceiver(args?.get(0)?.asText(), arrType)
         b.pushInt(args?.get(1)?.asInt() ?: 0, dynamicKind = "arr_idx")
-        b.pushArg(extractScalar(args?.get(3)), elemDesc, dynamicKind = "arr_value")
+        b.pushArg(extractScalar(args?.get(3)?.let { if (it.isArray) it.get(0) else it }), elemDesc, dynamicKind = "arr_value")
         b.emitRaw(RecoveredInsn(op = op), 3, null)
     }
 
@@ -1121,7 +1156,9 @@ class TraceTranslator(private val manifest: ManifestJson, private val ownerOverr
         private val CALL_PRIM_VARIANTS = setOf(
             "CallBooleanMethod", "CallByteMethod", "CallCharMethod",
             "CallShortMethod", "CallIntMethod", "CallLongMethod",
-            "CallVoidMethod",
+            "CallVoidMethod", "CallFloatMethod", "CallDoubleMethod",
+            "CallStaticBooleanMethod", "CallStaticByteMethod", "CallStaticCharMethod",
+            "CallStaticShortMethod", "CallStaticLongMethod", "CallStaticFloatMethod", "CallStaticDoubleMethod",
             "CallStaticIntMethod", "CallStaticVoidMethod",
         )
     }

@@ -1,3 +1,5 @@
+> Modified source: see [PATCH-NOTES.zh-TW.md](PATCH-NOTES.zh-TW.md). No build/tests were run. Dynamic JNI recovery is analysis-only until native control/data flow is reconstructed.
+
 **English** | [中文](README.zh-CN.md)
 
 # c2j-native-deobfuscator

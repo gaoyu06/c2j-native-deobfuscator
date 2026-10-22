@@ -441,7 +441,7 @@ class StackBalancer(private val isStatic: Boolean) {
                         if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
                         else out += RecoveredInsn(op = "POP")
                     }
-                    out += RecoveredInsn(op = "ICONST_0"); stack.addLast(V.Int)
+                    out += RecoveredInsn(op = "ICONST_0", dynamic = "unrecovered_return_default"); stack.addLast(V.Int)
                 }
                 stack.removeLast(); out += RecoveredInsn(op = "IRETURN")
             }
@@ -452,7 +452,7 @@ class StackBalancer(private val isStatic: Boolean) {
                         if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
                         else out += RecoveredInsn(op = "POP")
                     }
-                    out += RecoveredInsn(op = "LCONST_0"); stack.addLast(V.Long)
+                    out += RecoveredInsn(op = "LCONST_0", dynamic = "unrecovered_return_default"); stack.addLast(V.Long)
                 }
                 stack.removeLast(); out += RecoveredInsn(op = "LRETURN")
             }
@@ -463,7 +463,7 @@ class StackBalancer(private val isStatic: Boolean) {
                         if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
                         else out += RecoveredInsn(op = "POP")
                     }
-                    out += RecoveredInsn(op = "FCONST_0"); stack.addLast(V.Float)
+                    out += RecoveredInsn(op = "FCONST_0", dynamic = "unrecovered_return_default"); stack.addLast(V.Float)
                 }
                 stack.removeLast(); out += RecoveredInsn(op = "FRETURN")
             }
@@ -474,7 +474,7 @@ class StackBalancer(private val isStatic: Boolean) {
                         if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
                         else out += RecoveredInsn(op = "POP")
                     }
-                    out += RecoveredInsn(op = "DCONST_0"); stack.addLast(V.Double)
+                    out += RecoveredInsn(op = "DCONST_0", dynamic = "unrecovered_return_default"); stack.addLast(V.Double)
                 }
                 stack.removeLast(); out += RecoveredInsn(op = "DRETURN")
             }

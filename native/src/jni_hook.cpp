@@ -6,6 +6,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <iomanip>
+#include <limits>
+#include <type_traits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -393,6 +397,26 @@ std::string maybe_track_string_return(JNIEnv* env, jmethodID m, jobject r) {
     return content;
 }
 
+// JSON numeric encoding shared by scalar and array wrappers. Non-finite
+// values use explicit strings so the event remains valid JSON.
+template<class T> std::string trace_number(T value) {
+    std::ostringstream out;
+    if constexpr (std::is_floating_point<T>::value) {
+        if (std::isnan(value)) return "\"NaN\"";
+        if (std::isinf(value)) return value < 0 ? "\"-Infinity\"" : "\"Infinity\"";
+        out << std::setprecision(std::numeric_limits<T>::max_digits10) << value;
+    } else out << static_cast<long long>(value);
+    return out.str();
+}
+template<class T> std::string trace_buffer(const T* buf, jsize len) {
+    std::ostringstream out; out << "[";
+    if (buf) for (jsize i = 0; i < len; ++i) {
+        if (i) out << ",";
+        out << trace_number(buf[i]);
+    }
+    out << "]"; return out.str();
+}
+
 #define ORIG(name) (g_original->name)
 
 // ---------- wrappers ----------
@@ -562,7 +586,7 @@ void JNICALL h_DeleteWeakGlobalRef(JNIEnv* env, jweak ref) {
     jtype JNICALL h_Get##jname##Field(JNIEnv* env, jobject obj, jfieldID f) {                 \
         jtype r = ORIG(Get##jname##Field)(env, obj, f);                                       \
         std::ostringstream args; args << hex_ptr(obj) << "," << hex_ptr(f);                   \
-        char rb[64]; std::snprintf(rb, sizeof(rb), fmtarg, (long long) r);                    \
+        std::string rb = trace_number(r);                    \
         emit("Get" #jname "Field", args.str(), rb);                                           \
         return r;                                                                              \
     }
@@ -571,7 +595,7 @@ void JNICALL h_DeleteWeakGlobalRef(JNIEnv* env, jweak ref) {
     void JNICALL h_Set##jname##Field(JNIEnv* env, jobject obj, jfieldID f, jtype v) {         \
         ORIG(Set##jname##Field)(env, obj, f, v);                                              \
         std::ostringstream args; args << hex_ptr(obj) << "," << hex_ptr(f) << "," <<          \
-            ([](jtype x){ char b[64]; std::snprintf(b, sizeof(b), fmtarg, (long long)x); return std::string(b); })(v); \
+            trace_number(v); \
         emit("Set" #jname "Field", args.str(), "null");                                       \
     }
 
@@ -579,7 +603,7 @@ void JNICALL h_DeleteWeakGlobalRef(JNIEnv* env, jweak ref) {
     jtype JNICALL h_GetStatic##jname##Field(JNIEnv* env, jclass clazz, jfieldID f) {           \
         jtype r = ORIG(GetStatic##jname##Field)(env, clazz, f);                                \
         std::ostringstream args; args << hex_ptr(clazz) << "," << hex_ptr(f);                  \
-        char rb[64]; std::snprintf(rb, sizeof(rb), fmtarg, (long long) r);                     \
+        std::string rb = trace_number(r);                     \
         emit("GetStatic" #jname "Field", args.str(), rb);                                      \
         return r;                                                                               \
     }
@@ -660,7 +684,7 @@ WRAP_GET_STATIC_FIELD(jlong,    Long,    "%lld")
         va_list ap3; va_copy(ap3, ap);                                                       \
         jtype r = ORIG(kindprefix##jname##MethodV)(env, obj, m, ap2);                        \
         va_end(ap2);                                                                          \
-        char rb[64]; std::snprintf(rb, sizeof(rb), fmt, (long long) r);                      \
+        std::string rb = trace_number(r);                      \
         std::ostringstream args; args << hex_ptr(obj) << "," << hex_ptr(m)                   \
             << decode_variadic(m, ap3);                                                       \
         va_end(ap3);                                                                          \
@@ -670,7 +694,7 @@ WRAP_GET_STATIC_FIELD(jlong,    Long,    "%lld")
     jtype JNICALL h_##kindprefix##jname##MethodA(JNIEnv* env, jobject obj, jmethodID m,      \
                                                   const jvalue* a) {                          \
         jtype r = ORIG(kindprefix##jname##MethodA)(env, obj, m, a);                          \
-        char rb[64]; std::snprintf(rb, sizeof(rb), fmt, (long long) r);                      \
+        std::string rb = trace_number(r);                      \
         std::ostringstream args; args << hex_ptr(obj) << "," << hex_ptr(m)                   \
             << decode_array(m, a);                                                            \
         emit(#kindprefix #jname "Method", args.str(), rb, m);                                   \
@@ -914,30 +938,19 @@ void JNICALL h_SetObjectArrayElement(JNIEnv* env, jobjectArray arr, jsize index,
     emit("SetObjectArrayElement", args.str(), "null");
 }
 
-#define WRAP_GET_ARRAY_REGION(jname, jtype, fmt)                                          \
-    void JNICALL h_Get##jname##ArrayRegion(JNIEnv* env, jtype##Array arr,                 \
-                                            jsize start, jsize len, jtype* buf) {        \
-        ORIG(Get##jname##ArrayRegion)(env, arr, start, len, buf);                         \
-        std::ostringstream args;                                                          \
-        args << hex_ptr(arr) << "," << (int) start << "," << (int) len;                   \
-        if (buf && len > 0) {                                                              \
-            char vb[64]; std::snprintf(vb, sizeof(vb), fmt, (long long) buf[0]);          \
-            args << "," << vb;                                                             \
-        }                                                                                  \
-        emit("Get" #jname "ArrayRegion", args.str(), "null");                             \
+#define WRAP_GET_ARRAY_REGION(jname, jtype, fmt) \
+    void JNICALL h_Get##jname##ArrayRegion(JNIEnv* env, jtype##Array arr, jsize start, jsize len, jtype* buf) { \
+        ORIG(Get##jname##ArrayRegion)(env, arr, start, len, buf); \
+        std::ostringstream args; args << hex_ptr(arr) << "," << start << "," << len << ","; \
+        args << (ORIG(ExceptionCheck)(env) ? "null" : trace_buffer(buf, len)); \
+        emit("Get" #jname "ArrayRegion", args.str(), "null"); \
     }
-
-#define WRAP_SET_ARRAY_REGION(jname, jtype, fmt)                                          \
-    void JNICALL h_Set##jname##ArrayRegion(JNIEnv* env, jtype##Array arr,                 \
-                                            jsize start, jsize len, const jtype* buf) {  \
-        ORIG(Set##jname##ArrayRegion)(env, arr, start, len, buf);                         \
-        std::ostringstream args;                                                          \
-        args << hex_ptr(arr) << "," << (int) start << "," << (int) len;                   \
-        if (buf && len > 0) {                                                              \
-            char vb[64]; std::snprintf(vb, sizeof(vb), fmt, (long long) buf[0]);          \
-            args << "," << vb;                                                             \
-        }                                                                                  \
-        emit("Set" #jname "ArrayRegion", args.str(), "null");                             \
+#define WRAP_SET_ARRAY_REGION(jname, jtype, fmt) \
+    void JNICALL h_Set##jname##ArrayRegion(JNIEnv* env, jtype##Array arr, jsize start, jsize len, const jtype* buf) { \
+        const auto values = trace_buffer(buf, len); \
+        ORIG(Set##jname##ArrayRegion)(env, arr, start, len, buf); \
+        std::ostringstream args; args << hex_ptr(arr) << "," << start << "," << len << "," << values; \
+        emit("Set" #jname "ArrayRegion", args.str(), "null"); \
     }
 
 WRAP_GET_ARRAY_REGION(Boolean, jboolean, "%lld")
@@ -1001,8 +1014,559 @@ jobject JNICALL h_CallNonvirtualObjectMethod(JNIEnv* env, jobject obj, jclass cl
     return r;
 }
 
+WRAP_GET_FIELD(jfloat, Float, "")
+WRAP_SET_FIELD(jfloat, Float, "")
+WRAP_GET_STATIC_FIELD(jfloat, Float, "")
+WRAP_CALL_RET_PRIM(jfloat, Float, "", Call)
+WRAP_CALL_VARIADIC_PRIM(jfloat, Float, Call)
+WRAP_GET_FIELD(jdouble, Double, "")
+WRAP_SET_FIELD(jdouble, Double, "")
+WRAP_GET_STATIC_FIELD(jdouble, Double, "")
+WRAP_CALL_RET_PRIM(jdouble, Double, "", Call)
+WRAP_CALL_VARIADIC_PRIM(jdouble, Double, Call)
+void JNICALL h_SetStaticObjectField(JNIEnv* env, jclass c, jfieldID f, jobject v) {
+    ORIG(SetStaticObjectField)(env,c,f,v);
+    emit("SetStaticObjectField", hex_ptr(c)+","+hex_ptr(f)+","+hex_ptr(v), "null");
+}
+void JNICALL h_SetStaticBooleanField(JNIEnv* env, jclass c, jfieldID f, jboolean v) {
+    ORIG(SetStaticBooleanField)(env,c,f,v);
+    emit("SetStaticBooleanField", hex_ptr(c)+","+hex_ptr(f)+","+trace_number(v), "null");
+}
+void JNICALL h_SetStaticByteField(JNIEnv* env, jclass c, jfieldID f, jbyte v) {
+    ORIG(SetStaticByteField)(env,c,f,v);
+    emit("SetStaticByteField", hex_ptr(c)+","+hex_ptr(f)+","+trace_number(v), "null");
+}
+void JNICALL h_SetStaticCharField(JNIEnv* env, jclass c, jfieldID f, jchar v) {
+    ORIG(SetStaticCharField)(env,c,f,v);
+    emit("SetStaticCharField", hex_ptr(c)+","+hex_ptr(f)+","+trace_number(v), "null");
+}
+void JNICALL h_SetStaticShortField(JNIEnv* env, jclass c, jfieldID f, jshort v) {
+    ORIG(SetStaticShortField)(env,c,f,v);
+    emit("SetStaticShortField", hex_ptr(c)+","+hex_ptr(f)+","+trace_number(v), "null");
+}
+void JNICALL h_SetStaticIntField(JNIEnv* env, jclass c, jfieldID f, jint v) {
+    ORIG(SetStaticIntField)(env,c,f,v);
+    emit("SetStaticIntField", hex_ptr(c)+","+hex_ptr(f)+","+trace_number(v), "null");
+}
+void JNICALL h_SetStaticLongField(JNIEnv* env, jclass c, jfieldID f, jlong v) {
+    ORIG(SetStaticLongField)(env,c,f,v);
+    emit("SetStaticLongField", hex_ptr(c)+","+hex_ptr(f)+","+trace_number(v), "null");
+}
+void JNICALL h_SetStaticFloatField(JNIEnv* env, jclass c, jfieldID f, jfloat v) {
+    ORIG(SetStaticFloatField)(env,c,f,v);
+    emit("SetStaticFloatField", hex_ptr(c)+","+hex_ptr(f)+","+trace_number(v), "null");
+}
+void JNICALL h_SetStaticDoubleField(JNIEnv* env, jclass c, jfieldID f, jdouble v) {
+    ORIG(SetStaticDoubleField)(env,c,f,v);
+    emit("SetStaticDoubleField", hex_ptr(c)+","+hex_ptr(f)+","+trace_number(v), "null");
+}
+jobject JNICALL h_CallStaticObjectMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jobject r = ORIG(CallStaticObjectMethodA)(env,c,m,a);
+    emit("CallStaticObjectMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, hex_ptr(r), m);
+    return r;
+}
+jboolean JNICALL h_CallStaticBooleanMethodV(JNIEnv* env, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jboolean r = ORIG(CallStaticBooleanMethodV)(env,c,m,ap);
+    emit("CallStaticBooleanMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jboolean JNICALL h_CallStaticBooleanMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jboolean r = ORIG(CallStaticBooleanMethodA)(env,c,m,a);
+    emit("CallStaticBooleanMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jboolean JNICALL h_CallStaticBooleanMethod(JNIEnv* env, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jboolean r = h_CallStaticBooleanMethodV(env,c,m,ap); va_end(ap); return r;
+}
+jbyte JNICALL h_CallStaticByteMethodV(JNIEnv* env, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jbyte r = ORIG(CallStaticByteMethodV)(env,c,m,ap);
+    emit("CallStaticByteMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jbyte JNICALL h_CallStaticByteMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jbyte r = ORIG(CallStaticByteMethodA)(env,c,m,a);
+    emit("CallStaticByteMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jbyte JNICALL h_CallStaticByteMethod(JNIEnv* env, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jbyte r = h_CallStaticByteMethodV(env,c,m,ap); va_end(ap); return r;
+}
+jchar JNICALL h_CallStaticCharMethodV(JNIEnv* env, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jchar r = ORIG(CallStaticCharMethodV)(env,c,m,ap);
+    emit("CallStaticCharMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jchar JNICALL h_CallStaticCharMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jchar r = ORIG(CallStaticCharMethodA)(env,c,m,a);
+    emit("CallStaticCharMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jchar JNICALL h_CallStaticCharMethod(JNIEnv* env, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jchar r = h_CallStaticCharMethodV(env,c,m,ap); va_end(ap); return r;
+}
+jshort JNICALL h_CallStaticShortMethodV(JNIEnv* env, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jshort r = ORIG(CallStaticShortMethodV)(env,c,m,ap);
+    emit("CallStaticShortMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jshort JNICALL h_CallStaticShortMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jshort r = ORIG(CallStaticShortMethodA)(env,c,m,a);
+    emit("CallStaticShortMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jshort JNICALL h_CallStaticShortMethod(JNIEnv* env, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jshort r = h_CallStaticShortMethodV(env,c,m,ap); va_end(ap); return r;
+}
+jint JNICALL h_CallStaticIntMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jint r = ORIG(CallStaticIntMethodA)(env,c,m,a);
+    emit("CallStaticIntMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jlong JNICALL h_CallStaticLongMethodV(JNIEnv* env, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jlong r = ORIG(CallStaticLongMethodV)(env,c,m,ap);
+    emit("CallStaticLongMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jlong JNICALL h_CallStaticLongMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jlong r = ORIG(CallStaticLongMethodA)(env,c,m,a);
+    emit("CallStaticLongMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jlong JNICALL h_CallStaticLongMethod(JNIEnv* env, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jlong r = h_CallStaticLongMethodV(env,c,m,ap); va_end(ap); return r;
+}
+jfloat JNICALL h_CallStaticFloatMethodV(JNIEnv* env, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jfloat r = ORIG(CallStaticFloatMethodV)(env,c,m,ap);
+    emit("CallStaticFloatMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jfloat JNICALL h_CallStaticFloatMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jfloat r = ORIG(CallStaticFloatMethodA)(env,c,m,a);
+    emit("CallStaticFloatMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jfloat JNICALL h_CallStaticFloatMethod(JNIEnv* env, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jfloat r = h_CallStaticFloatMethodV(env,c,m,ap); va_end(ap); return r;
+}
+jdouble JNICALL h_CallStaticDoubleMethodV(JNIEnv* env, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jdouble r = ORIG(CallStaticDoubleMethodV)(env,c,m,ap);
+    emit("CallStaticDoubleMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jdouble JNICALL h_CallStaticDoubleMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jdouble r = ORIG(CallStaticDoubleMethodA)(env,c,m,a);
+    emit("CallStaticDoubleMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jdouble JNICALL h_CallStaticDoubleMethod(JNIEnv* env, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jdouble r = h_CallStaticDoubleMethodV(env,c,m,ap); va_end(ap); return r;
+}
+void JNICALL h_CallStaticVoidMethodA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    ORIG(CallStaticVoidMethodA)(env,c,m,a);
+    emit("CallStaticVoidMethod", hex_ptr(c)+","+hex_ptr(m)+decoded, "null", m);
+}
+jobject JNICALL h_CallNonvirtualObjectMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jobject r = ORIG(CallNonvirtualObjectMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualObjectMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, hex_ptr(r), m);
+    return r;
+}
+jboolean JNICALL h_CallNonvirtualBooleanMethodV(JNIEnv* env, jobject obj, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jboolean r = ORIG(CallNonvirtualBooleanMethodV)(env,obj,c,m,ap);
+    emit("CallNonvirtualBooleanMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jboolean JNICALL h_CallNonvirtualBooleanMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jboolean r = ORIG(CallNonvirtualBooleanMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualBooleanMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jboolean JNICALL h_CallNonvirtualBooleanMethod(JNIEnv* env, jobject obj, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jboolean r = h_CallNonvirtualBooleanMethodV(env,obj,c,m,ap); va_end(ap); return r;
+}
+jbyte JNICALL h_CallNonvirtualByteMethodV(JNIEnv* env, jobject obj, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jbyte r = ORIG(CallNonvirtualByteMethodV)(env,obj,c,m,ap);
+    emit("CallNonvirtualByteMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jbyte JNICALL h_CallNonvirtualByteMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jbyte r = ORIG(CallNonvirtualByteMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualByteMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jbyte JNICALL h_CallNonvirtualByteMethod(JNIEnv* env, jobject obj, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jbyte r = h_CallNonvirtualByteMethodV(env,obj,c,m,ap); va_end(ap); return r;
+}
+jchar JNICALL h_CallNonvirtualCharMethodV(JNIEnv* env, jobject obj, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jchar r = ORIG(CallNonvirtualCharMethodV)(env,obj,c,m,ap);
+    emit("CallNonvirtualCharMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jchar JNICALL h_CallNonvirtualCharMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jchar r = ORIG(CallNonvirtualCharMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualCharMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jchar JNICALL h_CallNonvirtualCharMethod(JNIEnv* env, jobject obj, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jchar r = h_CallNonvirtualCharMethodV(env,obj,c,m,ap); va_end(ap); return r;
+}
+jshort JNICALL h_CallNonvirtualShortMethodV(JNIEnv* env, jobject obj, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jshort r = ORIG(CallNonvirtualShortMethodV)(env,obj,c,m,ap);
+    emit("CallNonvirtualShortMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jshort JNICALL h_CallNonvirtualShortMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jshort r = ORIG(CallNonvirtualShortMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualShortMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jshort JNICALL h_CallNonvirtualShortMethod(JNIEnv* env, jobject obj, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jshort r = h_CallNonvirtualShortMethodV(env,obj,c,m,ap); va_end(ap); return r;
+}
+jint JNICALL h_CallNonvirtualIntMethodV(JNIEnv* env, jobject obj, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jint r = ORIG(CallNonvirtualIntMethodV)(env,obj,c,m,ap);
+    emit("CallNonvirtualIntMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jint JNICALL h_CallNonvirtualIntMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jint r = ORIG(CallNonvirtualIntMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualIntMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jint JNICALL h_CallNonvirtualIntMethod(JNIEnv* env, jobject obj, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jint r = h_CallNonvirtualIntMethodV(env,obj,c,m,ap); va_end(ap); return r;
+}
+jlong JNICALL h_CallNonvirtualLongMethodV(JNIEnv* env, jobject obj, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jlong r = ORIG(CallNonvirtualLongMethodV)(env,obj,c,m,ap);
+    emit("CallNonvirtualLongMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jlong JNICALL h_CallNonvirtualLongMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jlong r = ORIG(CallNonvirtualLongMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualLongMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jlong JNICALL h_CallNonvirtualLongMethod(JNIEnv* env, jobject obj, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jlong r = h_CallNonvirtualLongMethodV(env,obj,c,m,ap); va_end(ap); return r;
+}
+jfloat JNICALL h_CallNonvirtualFloatMethodV(JNIEnv* env, jobject obj, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jfloat r = ORIG(CallNonvirtualFloatMethodV)(env,obj,c,m,ap);
+    emit("CallNonvirtualFloatMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jfloat JNICALL h_CallNonvirtualFloatMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jfloat r = ORIG(CallNonvirtualFloatMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualFloatMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jfloat JNICALL h_CallNonvirtualFloatMethod(JNIEnv* env, jobject obj, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jfloat r = h_CallNonvirtualFloatMethodV(env,obj,c,m,ap); va_end(ap); return r;
+}
+jdouble JNICALL h_CallNonvirtualDoubleMethodV(JNIEnv* env, jobject obj, jclass c, jmethodID m, va_list ap) {
+    va_list copy; va_copy(copy,ap); auto decoded=decode_variadic(m,copy); va_end(copy);
+    jdouble r = ORIG(CallNonvirtualDoubleMethodV)(env,obj,c,m,ap);
+    emit("CallNonvirtualDoubleMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jdouble JNICALL h_CallNonvirtualDoubleMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    jdouble r = ORIG(CallNonvirtualDoubleMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualDoubleMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, trace_number(r), m);
+    return r;
+}
+jdouble JNICALL h_CallNonvirtualDoubleMethod(JNIEnv* env, jobject obj, jclass c, jmethodID m, ...) {
+    va_list ap; va_start(ap,m); jdouble r = h_CallNonvirtualDoubleMethodV(env,obj,c,m,ap); va_end(ap); return r;
+}
+void JNICALL h_CallNonvirtualVoidMethodA(JNIEnv* env, jobject obj, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a);
+    ORIG(CallNonvirtualVoidMethodA)(env,obj,c,m,a);
+    emit("CallNonvirtualVoidMethod", hex_ptr(obj)+","+hex_ptr(c)+","+hex_ptr(m)+decoded, "null", m);
+}
+jboolean JNICALL h_ExceptionCheck(JNIEnv* env) { auto r=ORIG(ExceptionCheck)(env); emit("ExceptionCheck", "", trace_number(r)); return r; }
+jthrowable JNICALL h_ExceptionOccurred(JNIEnv* env) { auto r=ORIG(ExceptionOccurred)(env); emit("ExceptionOccurred", "", hex_ptr(r)); return r; }
+jint JNICALL h_MonitorEnter(JNIEnv* env, jobject obj) { auto r=ORIG(MonitorEnter)(env,obj); emit("MonitorEnter", hex_ptr(obj), trace_number(r)); return r; }
+jint JNICALL h_MonitorExit(JNIEnv* env, jobject obj) { auto r=ORIG(MonitorExit)(env,obj); emit("MonitorExit", hex_ptr(obj), trace_number(r)); return r; }
+void JNICALL h_ExceptionClear(JNIEnv* env) { ORIG(ExceptionClear)(env); emit("ExceptionClear", "", "null"); }
+jobject JNICALL h_NewObjectA(JNIEnv* env, jclass c, jmethodID m, const jvalue* a) {
+    auto decoded=decode_array(m,a); auto r=ORIG(NewObjectA)(env,c,m,a);
+    emit("NewObject",hex_ptr(c)+","+hex_ptr(m)+decoded,hex_ptr(r),m); return r;
+}
+
+jboolean* JNICALL h_GetBooleanArrayElements(JNIEnv* env, jbooleanArray arr, jboolean* copy) {
+    auto r=ORIG(GetBooleanArrayElements)(env,arr,copy);
+    if (r && !ORIG(ExceptionCheck)(env)) {
+        auto len=ORIG(GetArrayLength)(env,arr);
+        emit("GetBooleanArrayElements",hex_ptr(arr)+","+trace_number(len),trace_buffer(r,len));
+    }
+    return r;
+}
+void JNICALL h_ReleaseBooleanArrayElements(JNIEnv* env, jbooleanArray arr, jboolean* buf, jint mode) {
+    // Pending exceptions permit release, but not an extra GetArrayLength call.
+    std::string values="null";
+    if (buf && !ORIG(ExceptionCheck)(env)) values=trace_buffer(buf,ORIG(GetArrayLength)(env,arr));
+    ORIG(ReleaseBooleanArrayElements)(env,arr,buf,mode);
+    emit("ReleaseBooleanArrayElements",hex_ptr(arr)+","+trace_number(mode)+","+values,"null");
+}
+jbyte* JNICALL h_GetByteArrayElements(JNIEnv* env, jbyteArray arr, jboolean* copy) {
+    auto r=ORIG(GetByteArrayElements)(env,arr,copy);
+    if (r && !ORIG(ExceptionCheck)(env)) {
+        auto len=ORIG(GetArrayLength)(env,arr);
+        emit("GetByteArrayElements",hex_ptr(arr)+","+trace_number(len),trace_buffer(r,len));
+    }
+    return r;
+}
+void JNICALL h_ReleaseByteArrayElements(JNIEnv* env, jbyteArray arr, jbyte* buf, jint mode) {
+    // Pending exceptions permit release, but not an extra GetArrayLength call.
+    std::string values="null";
+    if (buf && !ORIG(ExceptionCheck)(env)) values=trace_buffer(buf,ORIG(GetArrayLength)(env,arr));
+    ORIG(ReleaseByteArrayElements)(env,arr,buf,mode);
+    emit("ReleaseByteArrayElements",hex_ptr(arr)+","+trace_number(mode)+","+values,"null");
+}
+jchar* JNICALL h_GetCharArrayElements(JNIEnv* env, jcharArray arr, jboolean* copy) {
+    auto r=ORIG(GetCharArrayElements)(env,arr,copy);
+    if (r && !ORIG(ExceptionCheck)(env)) {
+        auto len=ORIG(GetArrayLength)(env,arr);
+        emit("GetCharArrayElements",hex_ptr(arr)+","+trace_number(len),trace_buffer(r,len));
+    }
+    return r;
+}
+void JNICALL h_ReleaseCharArrayElements(JNIEnv* env, jcharArray arr, jchar* buf, jint mode) {
+    // Pending exceptions permit release, but not an extra GetArrayLength call.
+    std::string values="null";
+    if (buf && !ORIG(ExceptionCheck)(env)) values=trace_buffer(buf,ORIG(GetArrayLength)(env,arr));
+    ORIG(ReleaseCharArrayElements)(env,arr,buf,mode);
+    emit("ReleaseCharArrayElements",hex_ptr(arr)+","+trace_number(mode)+","+values,"null");
+}
+jshort* JNICALL h_GetShortArrayElements(JNIEnv* env, jshortArray arr, jboolean* copy) {
+    auto r=ORIG(GetShortArrayElements)(env,arr,copy);
+    if (r && !ORIG(ExceptionCheck)(env)) {
+        auto len=ORIG(GetArrayLength)(env,arr);
+        emit("GetShortArrayElements",hex_ptr(arr)+","+trace_number(len),trace_buffer(r,len));
+    }
+    return r;
+}
+void JNICALL h_ReleaseShortArrayElements(JNIEnv* env, jshortArray arr, jshort* buf, jint mode) {
+    // Pending exceptions permit release, but not an extra GetArrayLength call.
+    std::string values="null";
+    if (buf && !ORIG(ExceptionCheck)(env)) values=trace_buffer(buf,ORIG(GetArrayLength)(env,arr));
+    ORIG(ReleaseShortArrayElements)(env,arr,buf,mode);
+    emit("ReleaseShortArrayElements",hex_ptr(arr)+","+trace_number(mode)+","+values,"null");
+}
+jint* JNICALL h_GetIntArrayElements(JNIEnv* env, jintArray arr, jboolean* copy) {
+    auto r=ORIG(GetIntArrayElements)(env,arr,copy);
+    if (r && !ORIG(ExceptionCheck)(env)) {
+        auto len=ORIG(GetArrayLength)(env,arr);
+        emit("GetIntArrayElements",hex_ptr(arr)+","+trace_number(len),trace_buffer(r,len));
+    }
+    return r;
+}
+void JNICALL h_ReleaseIntArrayElements(JNIEnv* env, jintArray arr, jint* buf, jint mode) {
+    // Pending exceptions permit release, but not an extra GetArrayLength call.
+    std::string values="null";
+    if (buf && !ORIG(ExceptionCheck)(env)) values=trace_buffer(buf,ORIG(GetArrayLength)(env,arr));
+    ORIG(ReleaseIntArrayElements)(env,arr,buf,mode);
+    emit("ReleaseIntArrayElements",hex_ptr(arr)+","+trace_number(mode)+","+values,"null");
+}
+jlong* JNICALL h_GetLongArrayElements(JNIEnv* env, jlongArray arr, jboolean* copy) {
+    auto r=ORIG(GetLongArrayElements)(env,arr,copy);
+    if (r && !ORIG(ExceptionCheck)(env)) {
+        auto len=ORIG(GetArrayLength)(env,arr);
+        emit("GetLongArrayElements",hex_ptr(arr)+","+trace_number(len),trace_buffer(r,len));
+    }
+    return r;
+}
+void JNICALL h_ReleaseLongArrayElements(JNIEnv* env, jlongArray arr, jlong* buf, jint mode) {
+    // Pending exceptions permit release, but not an extra GetArrayLength call.
+    std::string values="null";
+    if (buf && !ORIG(ExceptionCheck)(env)) values=trace_buffer(buf,ORIG(GetArrayLength)(env,arr));
+    ORIG(ReleaseLongArrayElements)(env,arr,buf,mode);
+    emit("ReleaseLongArrayElements",hex_ptr(arr)+","+trace_number(mode)+","+values,"null");
+}
+jfloat* JNICALL h_GetFloatArrayElements(JNIEnv* env, jfloatArray arr, jboolean* copy) {
+    auto r=ORIG(GetFloatArrayElements)(env,arr,copy);
+    if (r && !ORIG(ExceptionCheck)(env)) {
+        auto len=ORIG(GetArrayLength)(env,arr);
+        emit("GetFloatArrayElements",hex_ptr(arr)+","+trace_number(len),trace_buffer(r,len));
+    }
+    return r;
+}
+void JNICALL h_ReleaseFloatArrayElements(JNIEnv* env, jfloatArray arr, jfloat* buf, jint mode) {
+    // Pending exceptions permit release, but not an extra GetArrayLength call.
+    std::string values="null";
+    if (buf && !ORIG(ExceptionCheck)(env)) values=trace_buffer(buf,ORIG(GetArrayLength)(env,arr));
+    ORIG(ReleaseFloatArrayElements)(env,arr,buf,mode);
+    emit("ReleaseFloatArrayElements",hex_ptr(arr)+","+trace_number(mode)+","+values,"null");
+}
+jdouble* JNICALL h_GetDoubleArrayElements(JNIEnv* env, jdoubleArray arr, jboolean* copy) {
+    auto r=ORIG(GetDoubleArrayElements)(env,arr,copy);
+    if (r && !ORIG(ExceptionCheck)(env)) {
+        auto len=ORIG(GetArrayLength)(env,arr);
+        emit("GetDoubleArrayElements",hex_ptr(arr)+","+trace_number(len),trace_buffer(r,len));
+    }
+    return r;
+}
+void JNICALL h_ReleaseDoubleArrayElements(JNIEnv* env, jdoubleArray arr, jdouble* buf, jint mode) {
+    // Pending exceptions permit release, but not an extra GetArrayLength call.
+    std::string values="null";
+    if (buf && !ORIG(ExceptionCheck)(env)) values=trace_buffer(buf,ORIG(GetArrayLength)(env,arr));
+    ORIG(ReleaseDoubleArrayElements)(env,arr,buf,mode);
+    emit("ReleaseDoubleArrayElements",hex_ptr(arr)+","+trace_number(mode)+","+values,"null");
+}
+jstring JNICALL h_NewString(JNIEnv* env, const jchar* chars, jsize len) {
+    auto r=ORIG(NewString)(env,chars,len);
+    emit("NewString",trace_buffer(chars,len),hex_ptr(r)); return r;
+}
+const jchar* JNICALL h_GetStringChars(JNIEnv* env, jstring str, jboolean* copy) {
+    auto r=ORIG(GetStringChars)(env,str,copy);
+    if(r && !ORIG(ExceptionCheck)(env)) emit("GetStringChars",hex_ptr(str),trace_buffer(r,ORIG(GetStringLength)(env,str)));
+    return r;
+}
+void JNICALL h_ReleaseStringChars(JNIEnv* env,jstring str,const jchar* chars) {
+    ORIG(ReleaseStringChars)(env,str,chars); emit("ReleaseStringChars",hex_ptr(str),"null");
+}
+const char* JNICALL h_GetStringUTFChars(JNIEnv* env,jstring str,jboolean* copy) {
+    auto r=ORIG(GetStringUTFChars)(env,str,copy);
+    emit("GetStringUTFChars",hex_ptr(str),r ? esc(r) : "null"); return r;
+}
+void JNICALL h_ReleaseStringUTFChars(JNIEnv* env,jstring str,const char* chars) {
+    ORIG(ReleaseStringUTFChars)(env,str,chars); emit("ReleaseStringUTFChars",hex_ptr(str),"null");
+}
+jsize JNICALL h_GetStringLength(JNIEnv* env,jstring str) { auto r=ORIG(GetStringLength)(env,str); emit("GetStringLength",hex_ptr(str),trace_number(r)); return r; }
+jsize JNICALL h_GetStringUTFLength(JNIEnv* env,jstring str) { auto r=ORIG(GetStringUTFLength)(env,str); emit("GetStringUTFLength",hex_ptr(str),trace_number(r)); return r; }
+
 void build_hook_table() {
     g_hooked = new JNINativeInterface_(*g_original);
+    g_hooked->GetBooleanArrayElements = h_GetBooleanArrayElements;
+    g_hooked->ReleaseBooleanArrayElements = h_ReleaseBooleanArrayElements;
+    g_hooked->GetByteArrayElements = h_GetByteArrayElements;
+    g_hooked->ReleaseByteArrayElements = h_ReleaseByteArrayElements;
+    g_hooked->GetCharArrayElements = h_GetCharArrayElements;
+    g_hooked->ReleaseCharArrayElements = h_ReleaseCharArrayElements;
+    g_hooked->GetShortArrayElements = h_GetShortArrayElements;
+    g_hooked->ReleaseShortArrayElements = h_ReleaseShortArrayElements;
+    g_hooked->GetIntArrayElements = h_GetIntArrayElements;
+    g_hooked->ReleaseIntArrayElements = h_ReleaseIntArrayElements;
+    g_hooked->GetLongArrayElements = h_GetLongArrayElements;
+    g_hooked->ReleaseLongArrayElements = h_ReleaseLongArrayElements;
+    g_hooked->GetFloatArrayElements = h_GetFloatArrayElements;
+    g_hooked->ReleaseFloatArrayElements = h_ReleaseFloatArrayElements;
+    g_hooked->GetDoubleArrayElements = h_GetDoubleArrayElements;
+    g_hooked->ReleaseDoubleArrayElements = h_ReleaseDoubleArrayElements;
+    g_hooked->NewString = h_NewString;
+    g_hooked->GetStringChars = h_GetStringChars;
+    g_hooked->ReleaseStringChars = h_ReleaseStringChars;
+    g_hooked->GetStringUTFChars = h_GetStringUTFChars;
+    g_hooked->ReleaseStringUTFChars = h_ReleaseStringUTFChars;
+    g_hooked->GetStringLength = h_GetStringLength;
+    g_hooked->GetStringUTFLength = h_GetStringUTFLength;
+    g_hooked->GetFloatField = h_GetFloatField;
+    g_hooked->SetFloatField = h_SetFloatField;
+    g_hooked->GetStaticFloatField = h_GetStaticFloatField;
+    g_hooked->CallFloatMethod = h_CallFloatMethod;
+    g_hooked->CallFloatMethodV = h_CallFloatMethodV;
+    g_hooked->CallFloatMethodA = h_CallFloatMethodA;
+    g_hooked->GetDoubleField = h_GetDoubleField;
+    g_hooked->SetDoubleField = h_SetDoubleField;
+    g_hooked->GetStaticDoubleField = h_GetStaticDoubleField;
+    g_hooked->CallDoubleMethod = h_CallDoubleMethod;
+    g_hooked->CallDoubleMethodV = h_CallDoubleMethodV;
+    g_hooked->CallDoubleMethodA = h_CallDoubleMethodA;
+    g_hooked->SetStaticObjectField = h_SetStaticObjectField;
+    g_hooked->SetStaticBooleanField = h_SetStaticBooleanField;
+    g_hooked->SetStaticByteField = h_SetStaticByteField;
+    g_hooked->SetStaticCharField = h_SetStaticCharField;
+    g_hooked->SetStaticShortField = h_SetStaticShortField;
+    g_hooked->SetStaticIntField = h_SetStaticIntField;
+    g_hooked->SetStaticLongField = h_SetStaticLongField;
+    g_hooked->SetStaticFloatField = h_SetStaticFloatField;
+    g_hooked->SetStaticDoubleField = h_SetStaticDoubleField;
+    g_hooked->CallStaticObjectMethodA = h_CallStaticObjectMethodA;
+    g_hooked->CallStaticBooleanMethodV = h_CallStaticBooleanMethodV;
+    g_hooked->CallStaticBooleanMethodA = h_CallStaticBooleanMethodA;
+    g_hooked->CallStaticBooleanMethod = h_CallStaticBooleanMethod;
+    g_hooked->CallStaticByteMethodV = h_CallStaticByteMethodV;
+    g_hooked->CallStaticByteMethodA = h_CallStaticByteMethodA;
+    g_hooked->CallStaticByteMethod = h_CallStaticByteMethod;
+    g_hooked->CallStaticCharMethodV = h_CallStaticCharMethodV;
+    g_hooked->CallStaticCharMethodA = h_CallStaticCharMethodA;
+    g_hooked->CallStaticCharMethod = h_CallStaticCharMethod;
+    g_hooked->CallStaticShortMethodV = h_CallStaticShortMethodV;
+    g_hooked->CallStaticShortMethodA = h_CallStaticShortMethodA;
+    g_hooked->CallStaticShortMethod = h_CallStaticShortMethod;
+    g_hooked->CallStaticIntMethodA = h_CallStaticIntMethodA;
+    g_hooked->CallStaticLongMethodV = h_CallStaticLongMethodV;
+    g_hooked->CallStaticLongMethodA = h_CallStaticLongMethodA;
+    g_hooked->CallStaticLongMethod = h_CallStaticLongMethod;
+    g_hooked->CallStaticFloatMethodV = h_CallStaticFloatMethodV;
+    g_hooked->CallStaticFloatMethodA = h_CallStaticFloatMethodA;
+    g_hooked->CallStaticFloatMethod = h_CallStaticFloatMethod;
+    g_hooked->CallStaticDoubleMethodV = h_CallStaticDoubleMethodV;
+    g_hooked->CallStaticDoubleMethodA = h_CallStaticDoubleMethodA;
+    g_hooked->CallStaticDoubleMethod = h_CallStaticDoubleMethod;
+    g_hooked->CallStaticVoidMethodA = h_CallStaticVoidMethodA;
+    g_hooked->CallNonvirtualObjectMethodA = h_CallNonvirtualObjectMethodA;
+    g_hooked->CallNonvirtualBooleanMethodV = h_CallNonvirtualBooleanMethodV;
+    g_hooked->CallNonvirtualBooleanMethodA = h_CallNonvirtualBooleanMethodA;
+    g_hooked->CallNonvirtualBooleanMethod = h_CallNonvirtualBooleanMethod;
+    g_hooked->CallNonvirtualByteMethodV = h_CallNonvirtualByteMethodV;
+    g_hooked->CallNonvirtualByteMethodA = h_CallNonvirtualByteMethodA;
+    g_hooked->CallNonvirtualByteMethod = h_CallNonvirtualByteMethod;
+    g_hooked->CallNonvirtualCharMethodV = h_CallNonvirtualCharMethodV;
+    g_hooked->CallNonvirtualCharMethodA = h_CallNonvirtualCharMethodA;
+    g_hooked->CallNonvirtualCharMethod = h_CallNonvirtualCharMethod;
+    g_hooked->CallNonvirtualShortMethodV = h_CallNonvirtualShortMethodV;
+    g_hooked->CallNonvirtualShortMethodA = h_CallNonvirtualShortMethodA;
+    g_hooked->CallNonvirtualShortMethod = h_CallNonvirtualShortMethod;
+    g_hooked->CallNonvirtualIntMethodV = h_CallNonvirtualIntMethodV;
+    g_hooked->CallNonvirtualIntMethodA = h_CallNonvirtualIntMethodA;
+    g_hooked->CallNonvirtualIntMethod = h_CallNonvirtualIntMethod;
+    g_hooked->CallNonvirtualLongMethodV = h_CallNonvirtualLongMethodV;
+    g_hooked->CallNonvirtualLongMethodA = h_CallNonvirtualLongMethodA;
+    g_hooked->CallNonvirtualLongMethod = h_CallNonvirtualLongMethod;
+    g_hooked->CallNonvirtualFloatMethodV = h_CallNonvirtualFloatMethodV;
+    g_hooked->CallNonvirtualFloatMethodA = h_CallNonvirtualFloatMethodA;
+    g_hooked->CallNonvirtualFloatMethod = h_CallNonvirtualFloatMethod;
+    g_hooked->CallNonvirtualDoubleMethodV = h_CallNonvirtualDoubleMethodV;
+    g_hooked->CallNonvirtualDoubleMethodA = h_CallNonvirtualDoubleMethodA;
+    g_hooked->CallNonvirtualDoubleMethod = h_CallNonvirtualDoubleMethod;
+    g_hooked->CallNonvirtualVoidMethodA = h_CallNonvirtualVoidMethodA;
+    g_hooked->ExceptionCheck = h_ExceptionCheck;
+    g_hooked->ExceptionOccurred = h_ExceptionOccurred;
+    g_hooked->MonitorEnter = h_MonitorEnter;
+    g_hooked->MonitorExit = h_MonitorExit;
+    g_hooked->ExceptionClear = h_ExceptionClear;
+    g_hooked->NewObjectA = h_NewObjectA;
     g_hooked->FindClass             = h_FindClass;
     g_hooked->GetMethodID           = h_GetMethodID;
     g_hooked->GetStaticMethodID     = h_GetStaticMethodID;

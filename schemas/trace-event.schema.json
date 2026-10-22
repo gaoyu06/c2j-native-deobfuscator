@@ -5,49 +5,177 @@
   "oneOf": [
     {
       "type": "object",
-      "required": ["ev", "ts", "thr", "fn"],
+      "required": [
+        "ev",
+        "ts",
+        "thr"
+      ],
       "properties": {
-        "ev":   { "const": "enter" },
-        "ts":   { "type": "integer" },
-        "thr":  { "type": "integer" },
-        "fn":   { "type": "string", "description": "JNI mangled native function name" },
-        "args": { "type": "array" }
-      }
+        "ev": {
+          "const": "enter"
+        },
+        "ts": {
+          "type": "integer"
+        },
+        "thr": {
+          "type": "integer"
+        },
+        "fn": {
+          "type": "string",
+          "description": "JNI mangled native function name"
+        },
+        "args": {
+          "type": "array"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "desc": {
+          "type": "string"
+        },
+        "argsCaptured": {
+          "type": "boolean"
+        },
+        "argsGap": {
+          "type": "string"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "fn"
+          ]
+        },
+        {
+          "required": [
+            "owner",
+            "name",
+            "desc"
+          ]
+        }
+      ]
     },
     {
       "type": "object",
-      "required": ["ev", "ts", "thr", "fn"],
+      "required": [
+        "ev",
+        "ts",
+        "thr"
+      ],
       "properties": {
-        "ev":  { "const": "exit" },
-        "ts":  { "type": "integer" },
-        "thr": { "type": "integer" },
-        "fn":  { "type": "string" },
+        "ev": {
+          "const": "exit"
+        },
+        "ts": {
+          "type": "integer"
+        },
+        "thr": {
+          "type": "integer"
+        },
+        "fn": {
+          "type": "string"
+        },
+        "ret": {},
+        "owner": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "desc": {
+          "type": "string"
+        },
+        "retType": {
+          "type": "string"
+        },
+        "exc": {
+          "type": "boolean"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "fn"
+          ]
+        },
+        {
+          "required": [
+            "owner",
+            "name",
+            "desc"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "object",
+      "required": [
+        "ev",
+        "ts",
+        "thr",
+        "call"
+      ],
+      "properties": {
+        "ev": {
+          "const": "jni"
+        },
+        "ts": {
+          "type": "integer"
+        },
+        "thr": {
+          "type": "integer"
+        },
+        "call": {
+          "type": "string",
+          "description": "JNI function name (e.g. CallIntMethod)"
+        },
+        "args": {
+          "type": "array"
+        },
         "ret": {}
       }
     },
     {
       "type": "object",
-      "required": ["ev", "ts", "thr", "call"],
+      "required": [
+        "ev",
+        "ts",
+        "thr",
+        "kind",
+        "slot"
+      ],
       "properties": {
-        "ev":   { "const": "jni" },
-        "ts":   { "type": "integer" },
-        "thr":  { "type": "integer" },
-        "call": { "type": "string", "description": "JNI function name (e.g. CallIntMethod)" },
-        "args": { "type": "array" },
-        "ret":  {}
-      }
-    },
-    {
-      "type": "object",
-      "required": ["ev", "ts", "thr", "kind", "slot"],
-      "properties": {
-        "ev":   { "const": "slot" },
-        "ts":   { "type": "integer" },
-        "thr":  { "type": "integer" },
-        "kind": { "enum": ["cstack", "clocal"] },
-        "slot": { "type": "integer" },
-        "field":{ "enum": ["i", "j", "f", "d", "l"] },
-        "val":  {}
+        "ev": {
+          "const": "slot"
+        },
+        "ts": {
+          "type": "integer"
+        },
+        "thr": {
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "cstack",
+            "clocal"
+          ]
+        },
+        "slot": {
+          "type": "integer"
+        },
+        "field": {
+          "enum": [
+            "i",
+            "j",
+            "f",
+            "d",
+            "l"
+          ]
+        },
+        "val": {}
       }
     }
   ]
