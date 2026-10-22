@@ -107,6 +107,9 @@ def jvm_bin(name: str) -> Path:
     """Path to a Gradle-installed JVM CLI script."""
     root = project_root()
     suffix = ".bat" if os.name == "nt" else ""
+    packaged = root / "prebuilt" / "jvm" / "bin" / f"{name}{suffix}"
+    if os.environ.get("J2C_USE_BUILT_JVM") != "1" and packaged.exists() and (packaged.parent.parent / "c2j-reference-tools.jar").exists():
+        return packaged
     candidate = root / "jvm" / name / "build" / "install" / name / "bin" / f"{name}{suffix}"
     if not candidate.exists():
         raise FileNotFoundError(
@@ -400,10 +403,14 @@ def _run_dynamic_trace(run_cmd: str, output: Path) -> None:
     run(args)
 
 
-def _run_trace_to_bc(trace: Path, manifest: Path, output: Path, confidence: str = "low") -> None:
-    run([jvm_bin("trace-to-bytecode"),
-         "--trace", trace, "--manifest", manifest,
-         "-o", output, "--confidence", confidence])
+def _run_trace_to_bc(trace: Path, manifest: Path, output: Path, confidence: str = "low", owner_map: Optional[Path] = None, allow_partial: bool = False) -> None:
+    args = [jvm_bin("trace-to-bytecode"), "--trace", trace, "--manifest", manifest,
+            "-o", output, "--confidence", confidence]
+    if owner_map:
+        args += ["--owner-map", owner_map]
+    if allow_partial:
+        args += ["--allow-partial"]
+    run(args)
 
 
 def _run_static_reverse(ghidra_dump: Path, output: Path, manifest: Optional[Path] = None) -> None:
@@ -418,11 +425,13 @@ def _run_static_reverse(ghidra_dump: Path, output: Path, manifest: Optional[Path
         pass
 
 
-def _run_rebuild(input: Path, recovered: Path, output: Path, manifest: Optional[Path] = None) -> None:
+def _run_rebuild(input: Path, recovered: Path, output: Path, manifest: Optional[Path] = None, analysis_only: bool = False) -> None:
     args = [jvm_bin("class-rebuilder"),
             "--input", input, "--recovered", recovered, "-o", output]
     if manifest:
         args += ["--manifest", manifest]
+    if analysis_only:
+        args += ["--analysis-only"]
     run(args)
 
 
@@ -516,9 +525,11 @@ def cli_trace_to_bc(
     manifest: Path = typer.Option(..., "--manifest", exists=True, dir_okay=False),
     output: Path = typer.Option(..., "-o", "--output"),
     confidence: str = typer.Option("low", "--confidence"),
+    owner_map: Optional[Path] = typer.Option(None, "--owner-map", exists=True, dir_okay=False),
+    allow_partial: bool = typer.Option(False, "--allow-partial"),
 ):
     """Translate trace.jsonl + manifest into recovered/*.json (dynamic path)."""
-    _run_trace_to_bc(trace, manifest, output, confidence)
+    _run_trace_to_bc(trace, manifest, output, confidence, owner_map, allow_partial)
 
 
 @app.command("static-reverse")
@@ -537,9 +548,10 @@ def cli_rebuild(
     recovered: Path = typer.Option(..., "--recovered", exists=True),
     output: Path = typer.Option(..., "-o", "--output"),
     manifest: Optional[Path] = typer.Option(None, "--manifest"),
+    analysis_only: bool = typer.Option(False, "--analysis-only"),
 ):
     """Replace native stubs with recovered bytecode and strip the loader."""
-    _run_rebuild(input, recovered, output, manifest)
+    _run_rebuild(input, recovered, output, manifest, analysis_only)
 
 
 @app.command("synth-stubs")

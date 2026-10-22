@@ -17,7 +17,7 @@ scripts/gui.sh /path/to/session    # open a session directory
 Windows: `scripts\gui.ps1 C:\path\to\session`.
 
 The module lives at [`jvm/desktop-ui/`](../jvm/desktop-ui/) and targets
-**JDK 21**. The rest of the repository stays on **JDK 17**. Gradle:
+**JDK 21**, matching every other JVM module. Gradle:
 `cd jvm && ./gradlew :desktop-ui:run --args="/path/to/session"`.
 
 A session directory is any folder that holds one or more of

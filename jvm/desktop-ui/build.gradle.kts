@@ -3,13 +3,7 @@ plugins {
     application
 }
 
-// This module drives a Swing UI, so it wants a full desktop JDK.
-// The root build applies a JDK 17 toolchain to every subproject; the
-// viewer targets JDK 21 (matching the pipeline's runtime requirement),
-// so re-configure the toolchain here.
-kotlin {
-    jvmToolchain(21)
-}
+// Swing uses the full JDK 21 toolchain configured for every module in the root build.
 
 dependencies {
     implementation(project(":common"))

@@ -1,3 +1,5 @@
+> Current build: all JVM modules and GitHub Actions now use JDK 21. Any JDK 17 / split-toolchain discussion below describes the earlier revision.
+
 # Desktop viewer — visual review
 
 Review of the Swing desktop viewer (`jvm/desktop-ui`, PR #8, branch

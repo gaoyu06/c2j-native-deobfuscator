@@ -15,7 +15,7 @@
 
 ## 0. 前置条件
 
-- **JDK 17+**，并把 `JAVA_HOME` 指向它（`java -version` 应显示 17 及以上）。
+- **JDK 21+**，并把 `JAVA_HOME` 指向它（`java -version` 应显示 21 及以上）。
 - **Python 3.11+**。
 - 仅构建 native agent 时需要：**[zig](https://ziglang.org/) 0.16.x**。
   可选；装不上就跳过它，改用模拟兜底。
@@ -133,7 +133,7 @@ scripts/gui.sh ./work
 JVM 模块或 native agent 没构建。先跑 `scripts/setup.sh`（或 `scripts/setup.ps1`），
 再 `scripts/j2c doctor`。
 
-**`doctor` 显示 `Java / JDK 17+  WARN` —— JAVA_HOME 未设置**
+**`doctor` 显示 `Java / JDK 21+  WARN` —— JAVA_HOME 未设置**
 Java 版本够新，但 `JAVA_HOME` 没设；native agent 构建需要它。这是提醒，不是阻塞：
 如果 agent 已经构建好，动态路径仍可运行。等下次需要构建 agent 时，把 `JAVA_HOME`
 指向你的 JDK 目录再重跑 `scripts/setup.sh`。
@@ -144,7 +144,7 @@ Java 版本够新，但 `JAVA_HOME` 没设；native agent 构建需要它。这�
 再 `bash scripts/setup.sh --force`。装不了 `zig` 就用下面的模拟兜底。
 
 **Gradle 找不到匹配的 Java toolchain**
-安装 JDK 17+ 并设置 `JAVA_HOME` 后重跑。`doctor` 会显示它找到的是哪个 Java。
+安装 JDK 21+ 并设置 `JAVA_HOME` 后重跑。`doctor` 会显示它找到的是哪个 Java。
 
 **`recover` 跑完了，但 `trace.jsonl` 里没有 `enter` 事件**
 你的 `--run-cmd` 没触达混淆类。换一条能真正运行到它们的命令；动态路径只能恢复

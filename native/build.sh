@@ -3,7 +3,7 @@
 # Output: build/lib/j2c_agent.{dll,so,dylib}
 set -euo pipefail
 
-ZIG="${ZIG:-$HOME/.native-obfuscator/zig/zig-x86_64-windows-0.16.0/zig.exe}"
+ZIG="${ZIG:-zig}"
 JDK_HOME="${JDK_HOME:-${JAVA_HOME:-}}"
 if [ -z "$JDK_HOME" ]; then
     echo "JDK_HOME / JAVA_HOME unset" >&2
@@ -12,12 +12,17 @@ fi
 
 # Detect host target name
 HOST_OS=$(uname -s)
-HOST_ARCH=$(uname -m)
+HOST_ARCH="${J2C_ARCH:-$(uname -m)}"
+case "$HOST_ARCH" in
+    x86_64|amd64|AMD64|x64) TARGET_ARCH="x86_64" ;;
+    aarch64|arm64|ARM64) TARGET_ARCH="aarch64" ;;
+    *) echo "Unsupported architecture: $HOST_ARCH" >&2; exit 2 ;;
+esac
 case "$HOST_OS" in
-    Linux)   TARGET="x86_64-linux-gnu";   OUT="j2c_agent.so";    JNI_MD_SUBDIR="linux" ;;
-    Darwin)  TARGET="x86_64-macos";       OUT="j2c_agent.dylib"; JNI_MD_SUBDIR="darwin" ;;
+    Linux)   TARGET="$TARGET_ARCH-linux-gnu";   OUT="j2c_agent.so";    JNI_MD_SUBDIR="linux" ;;
+    Darwin)  TARGET="$TARGET_ARCH-macos";       OUT="j2c_agent.dylib"; JNI_MD_SUBDIR="darwin" ;;
     MINGW*|MSYS*|CYGWIN*)
-             TARGET="x86_64-windows-gnu"; OUT="j2c_agent.dll";   JNI_MD_SUBDIR="win32" ;;
+             TARGET="$TARGET_ARCH-windows-gnu"; OUT="j2c_agent.dll";   JNI_MD_SUBDIR="win32" ;;
     *)       echo "Unknown OS: $HOST_OS" >&2; exit 2 ;;
 esac
 

@@ -24,7 +24,7 @@
 `scripts/j2c` 是自动化契约。可选的 Swing 查看器只展示产物，不替代 CLI。
 相邻的用户态观察模块在 JAR 管线**之外**，删掉也不影响恢复。
 
-仓库基线是 **JDK 17** 与 **Python 3.11+**。只有桌面模块需要 **JDK 21**。
+所有 JVM 模块统一使用 **JDK 21**，Python 需要 **3.11+**。
 native JVMTI agent 面向 **x86-64** 构建。
 
 ---
@@ -146,7 +146,7 @@ JAR 能跑时，`scripts/j2c recover … --run-cmd "…"` 依次执行：
 客户端。用 `scripts/gui.sh [会话目录]` 启动。它列出方法、恢复后的方法体、
 管线状态、绑定缺口，并能跟踪 `trace.jsonl`。**Attach / Listen** 是同一条
 `attach` CLI 的前端（所有权勾选、拒绝横幅，没有第二套协议）。真正的恢复
-步骤仍走 CLI。该模块用 JDK 21；仓库其余部分仍是 JDK 17。详见
+步骤仍走 CLI。所有 JVM 模块统一使用 JDK 21。详见
 [desktop-gui.md](desktop-gui.md)。
 
 ### native-x86（预览）
@@ -172,7 +172,7 @@ stealth、没有内核组件。需要同一用户 + `--i-own-this-process`。详
 
 ```
 ├── scripts/                    j2c、j2c.ps1、setup、gui.sh / gui.ps1
-├── jvm/                        Kotlin/ASM（Gradle；除 desktop-ui 外为 JDK 17）
+├── jvm/                        Kotlin/ASM（Gradle；JDK 21）
 │   ├── jar-parser/             jar → classes.json
 │   ├── trace-to-bytecode/      trace.jsonl → recovered/*.json
 │   ├── class-rebuilder/        recovered/ → output.jar

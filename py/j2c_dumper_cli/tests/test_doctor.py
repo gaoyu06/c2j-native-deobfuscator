@@ -45,14 +45,15 @@ def test_check_java_missing(monkeypatch):
     assert c.fix
 
 
-def test_check_java_too_old(monkeypatch):
-    monkeypatch.setenv("JAVA_HOME", "/opt/jdk8")
-    monkeypatch.setattr(doctor, "_java_executable", lambda: "/opt/jdk8/bin/java")
+@pytest.mark.parametrize("major", [8, 17, 20])
+def test_check_java_too_old(monkeypatch, major):
+    monkeypatch.setenv("JAVA_HOME", f"/opt/jdk{major}")
+    monkeypatch.setattr(doctor, "_java_executable", lambda: f"/opt/jdk{major}/bin/java")
     monkeypatch.setattr(doctor, "_query_java_version",
-                        lambda exe: 'openjdk version "1.8.0_202"')
+                        lambda exe: f'openjdk version "{major}.0.1"')
     c = doctor.check_java()
     assert c.status == doctor.STATUS_MISSING
-    assert "8" in c.detail
+    assert str(major) in c.detail
 
 
 def test_check_java_ok(monkeypatch):
@@ -384,11 +385,11 @@ def test_build_report_healthy_when_everything_present(tmp_path, x86_host,
 def test_warn_does_not_block():
     # A required check that only WARNs is a caveat, not a blocker.
     r = doctor.Report()
-    r.add(doctor.Check("Java / JDK 17+", doctor.STATUS_WARN, "no JAVA_HOME"))
+    r.add(doctor.Check("Java / JDK 21+", doctor.STATUS_WARN, "no JAVA_HOME"))
     r.add(doctor.Check("Python 3.11+", doctor.STATUS_OK, "3.12"))
     assert r.healthy
     assert r.blocking == []
-    assert [c.name for c in r.warnings] == ["Java / JDK 17+"]
+    assert [c.name for c in r.warnings] == ["Java / JDK 21+"]
 
 
 def test_build_report_warn_stays_healthy(tmp_path, x86_host, monkeypatch):
@@ -397,7 +398,7 @@ def test_build_report_warn_stays_healthy(tmp_path, x86_host, monkeypatch):
     monkeypatch.delenv("JAVA_HOME", raising=False)
     monkeypatch.setattr(doctor, "_java_executable", lambda: "/usr/bin/java")
     monkeypatch.setattr(doctor, "_query_java_version",
-                        lambda exe: 'openjdk version "17.0.9"')
+                        lambda exe: 'openjdk version "21.0.10"')
     monkeypatch.setattr(sys, "version_info", (3, 11, 5))
     _make_jvm_installs(tmp_path, doctor.REQUIRED_JVM_MODULES)
     _write_agent(tmp_path, doctor.host_agent_name())

@@ -24,7 +24,7 @@ STATUS_MISSING = "missing"
 STATUS_WARN = "warn"
 STATUS_OPTIONAL = "optional"
 
-MIN_JAVA = 17
+MIN_JAVA = 21
 MIN_PYTHON = (3, 11)
 
 # The name shown for the Java check; kept in one place so the required
@@ -186,7 +186,7 @@ def check_python() -> Check:
 
 
 def venv_python(root: Optional[Path]) -> Optional[Path]:
-    """The uv-managed interpreter under ``py/.venv``, if it exists.
+    """The bundled release interpreter, or uv interpreter under ``py/.venv``.
 
     ``scripts/setup.sh`` runs ``uv sync``, which installs the packages into this
     interpreter — not the system ``python3``. Probes point users at it (via the
@@ -195,6 +195,9 @@ def venv_python(root: Optional[Path]) -> Optional[Path]:
     if root is None:
         return None
     if os.name == "nt":
+        portable = root / "runtime" / "python" / "python.exe"
+        if portable.is_file():
+            return portable
         candidate = root / "py" / ".venv" / "Scripts" / "python.exe"
     else:
         candidate = root / "py" / ".venv" / "bin" / "python"
@@ -244,6 +247,9 @@ def check_python_recover_deps(root: Optional[Path] = None) -> Check:
 
 def _jvm_install_script(root: Path, module: str) -> Path:
     suffix = ".bat" if os.name == "nt" else ""
+    packaged = root / "prebuilt" / "jvm" / "bin" / f"{module}{suffix}"
+    if os.environ.get("J2C_USE_BUILT_JVM") != "1" and packaged.exists() and (packaged.parent.parent / "c2j-reference-tools.jar").exists():
+        return packaged
     return root / "jvm" / module / "build" / "install" / module / "bin" / f"{module}{suffix}"
 
 

@@ -1,3 +1,5 @@
+> Current build: all JVM modules and GitHub Actions now use JDK 21. Any JDK 17 / split-toolchain discussion below describes the earlier revision.
+
 # CLI doctor/setup review
 
 PR: https://github.com/gaoyu06/c2j-native-deobfuscator/pull/6

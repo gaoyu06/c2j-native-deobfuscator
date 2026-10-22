@@ -1,3 +1,5 @@
+> Modified source: see [PATCH-NOTES.zh-TW.md](PATCH-NOTES.zh-TW.md). No build/tests were run. Dynamic JNI recovery is analysis-only until native control/data flow is reconstructed.
+
 **English** | [中文](README.zh-CN.md)
 
 # c2j-native-deobfuscator
@@ -44,6 +46,39 @@ Current architecture, every surface, and default-vs-preview status:
 ([中文](docs/overview.zh-CN.md)).
 
 ---
+
+## Filter native tracing by class
+
+This version implements `include` in the native agent. Replace/rebuild the DLL/SO;
+an older agent silently ignores this option. A rebuilt Windows x64 DLL is included
+at `prebuilt/windows/x64/j2c_agent-windows-x64.dll`.
+
+PowerShell (quote the **whole** `-agentpath` argument so `;` reaches Java):
+
+```powershell
+java "-agentpath:C:\c2j\prebuilt\windows\x64\j2c_agent-windows-x64.dll=trace=C:\c2j\trace.jsonl,include=obf.*;native.*" -jar app.jar
+```
+
+Patterns are case-sensitive and separated by `;`. `*` matches any suffix,
+including subpackages; both `obf.*` and `obf/*` match JVM names such as
+`obf/Example`. An exact name matches only that class. Omitted/empty `include`
+keeps the previous unfiltered behavior. `log-all=true` does not override an
+active include filter.
+
+The filter applies to native bind/entry/exit records, JNI calls and exception
+records. JNI calls made by selected native methods are retained even when they
+access JDK classes or other dependencies; this preserves recovery data. Nested
+excluded native calls are suppressed, and selected nested calls resume tracing.
+Exception sites in Java callees of selected native frames may also appear.
+Lifecycle/capability records remain in the trace. The first `agent-loaded` or
+`agent-attached` record reports `include` and `includeActive` so you can confirm
+the newly built agent actually received the option. Use a fresh trace file.
+
+Regression test on Linux with a JDK:
+
+```bash
+python3 native/tests/include-filter/test_filter.py --agent /path/to/j2c_agent.so --headers "$JAVA_HOME/include"
+```
 
 ## Architecture at a glance
 
@@ -344,7 +379,7 @@ render them.
 
 ## Quick start
 
-Prerequisites: **JDK 17+** (with `JAVA_HOME` set) and **Python 3.11+**. On
+Prerequisites: **JDK 21+** (with `JAVA_HOME` set) and **Python 3.11+**. On
 Windows, building the native agent also needs **Git Bash** (from Git for
 Windows); WSL builds a Linux `.so`, not the Windows `.dll` the JVM loads here.
 New here? Follow the [10-minute getting-started guide](docs/getting-started.md)
@@ -448,8 +483,7 @@ scripts/gui.sh ./work          # Windows: scripts\gui.ps1 .\work
 ```
 
 It shows methods, recovered bodies, pipeline status, and can run or
-listen to `attach`. The module needs **JDK 21**; the rest of the
-repository stays on JDK 17. See [`docs/desktop-gui.md`](docs/desktop-gui.md).
+listen to `attach`. All JVM modules use **JDK 21**. See [`docs/desktop-gui.md`](docs/desktop-gui.md).
 
 ### Offline discovery and static-lite (no live run, no Ghidra)
 
@@ -632,7 +666,7 @@ source**. See [`docs/privileged-observer.md`](docs/privileged-observer.md).
 
 ```
 ├── scripts/                    j2c / j2c.ps1, setup, gui.sh / gui.ps1
-├── jvm/                        Kotlin/ASM modules (Gradle; JDK 17 except desktop-ui)
+├── jvm/                        Kotlin/ASM modules (Gradle; JDK 21)
 │   ├── jar-parser/             input.jar  → classes.json
 │   ├── trace-to-bytecode/      manifest + trace.jsonl → recovered/*.json
 │   ├── class-rebuilder/        input.jar + recovered/ → output.jar

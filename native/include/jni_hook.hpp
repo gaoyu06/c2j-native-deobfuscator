@@ -5,6 +5,9 @@
 
 namespace j2c::jni_hook {
 
+// Use JVMTI declaring-class metadata instead of guessing JNI owners.
+void set_jvmti(jvmtiEnv* env);
+
 // Save the original JNI function table for delegation. Called from VMInit.
 void capture_original(JNIEnv* env);
 
@@ -18,6 +21,9 @@ void install(JNIEnv* env);
 void enter_native_frame();
 void exit_native_frame();
 bool in_native_frame();
+
+// Current native frame selected by include (independent of ancestor frames).
+void set_filter_frame_selected(bool selected);
 
 // Suspend / resume emission while inside JDK-native methods invoked from
 // within a user native frame (their JNI calls are noise from the

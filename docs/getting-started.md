@@ -17,7 +17,7 @@ live attach, native-x86, privileged observer), see
 
 ## 0. Prerequisites
 
-- **JDK 17+** with `JAVA_HOME` pointing at it (`java -version` should print 17+).
+- **JDK 21+** with `JAVA_HOME` pointing at it (`java -version` should print 21+).
 - **Python 3.11+**.
 - For the native agent build only: **[zig](https://ziglang.org/) 0.16.x**.
   Optional; skip it and use the emulation fallback if you can't install it.
@@ -147,7 +147,7 @@ needs a human pass — see [`manual-restoration.md`](manual-restoration.md).
 The JVM modules or native agent aren't built. Run `scripts/setup.sh` (or
 `scripts/setup.ps1`) and then `scripts/j2c doctor`.
 
-**`doctor` says `Java / JDK 17+  WARN` — JAVA_HOME is not set**
+**`doctor` says `Java / JDK 21+  WARN` — JAVA_HOME is not set**
 Java is new enough but `JAVA_HOME` is unset; the native agent build needs it.
 This is a warning, not a blocker: if the agent is already built you can still
 run the dynamic path. Set `JAVA_HOME` to your JDK directory and re-run
@@ -160,7 +160,7 @@ path), set `JAVA_HOME`, then `bash scripts/setup.sh --force`. If you can't
 install `zig`, use the emulation fallback below.
 
 **The Gradle build can't find a matching Java toolchain**
-Install a JDK 17+ and set `JAVA_HOME`, then re-run. `doctor` shows which Java it
+Install a JDK 21+ and set `JAVA_HOME`, then re-run. `doctor` shows which Java it
 found.
 
 **`recover` ran but `trace.jsonl` has no `enter` events**

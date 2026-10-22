@@ -1,3 +1,5 @@
+> JNI reference/owner fix: see [START-HERE-REFERENCE-FIX.zh-TW.md](START-HERE-REFERENCE-FIX.zh-TW.md). Includes Java 21 tools and an updated Windows x64 agent.
+
 [English](README.md) | **中文**
 
 # c2j-native-deobfuscator
@@ -37,6 +39,36 @@ JAR 还原不需要它；仓库不发布内核镜像或内核源码。
 （[English](docs/overview.md)）。
 
 ---
+
+## 按类筛选 native 跟踪记录
+
+此版本已在 native agent 中实现 `include`。必须替换或重新编译 DLL/SO；旧版
+agent 会直接忽略该参数。ZIP 附带重新编译的 Windows x64 DLL：
+`prebuilt/windows/x64/j2c_agent-windows-x64.dll`。
+
+PowerShell 中必须用引号包住**整个** `-agentpath` 参数，避免分号被当成命令分隔符：
+
+```powershell
+java "-agentpath:C:\c2j\prebuilt\windows\x64\j2c_agent-windows-x64.dll=trace=C:\c2j\trace.jsonl,include=obf.*;native.*" -jar app.jar
+```
+
+多个规则以 `;` 分隔，区分大小写。`*` 包括子包；`obf.*` 和 `obf/*` 均可匹配
+`obf/Example`。不带通配符时精确匹配一个类。不传或传空 `include` 保留原来的
+未筛选行为。启用筛选时，`log-all=true` 也不会绕过筛选。
+
+筛选覆盖 native 绑定、进入、退出、JNI 与异常记录。选中 native 方法访问 JDK
+或其他依赖的 JNI 调用仍会保留，供后续还原使用。嵌套调用未选中的 native 方法
+时暂停记录，再进入选中的方法时恢复。选中 native 方法调用的 Java 方法中的异常
+位置也可能出现在记录中。生命周期与能力记录会保留。
+
+查看第一条 `agent-loaded` 或 `agent-attached` 的 `include` 与 `includeActive`
+字段，可确认新版 agent 已收到规则。请使用新的 trace 文件。
+
+Linux/JDK 回归测试：
+
+```bash
+python3 native/tests/include-filter/test_filter.py --agent /path/to/j2c_agent.so --headers "$JAVA_HOME/include"
+```
 
 ## 架构速览
 
@@ -285,7 +317,7 @@ scripts/j2c recover in.jar -o out.jar --run-cmd "java -jar in.jar"
 
 ## Quick start
 
-前置条件：**JDK 17+**（并设置 `JAVA_HOME`）与 **Python 3.11+**。在 Windows 上
+前置条件：**JDK 21+**（并设置 `JAVA_HOME`）与 **Python 3.11+**。在 Windows 上
 构建 native agent 还需要 **Git Bash**（随 Git for Windows 提供）；WSL 会构建出
 Linux 的 `.so`，而不是这里 JVM 加载的 Windows `.dll`。
 第一次上手？请按
@@ -380,7 +412,7 @@ scripts/gui.sh ./work          # Windows：scripts\gui.ps1 .\work
 ```
 
 它展示方法、恢复后的方法体、管线状态，并能运行或只监听 `attach`。
-该模块需要 **JDK 21**；仓库其余部分仍是 JDK 17。详见
+所有 JVM 模块统一使用 **JDK 21**。详见
 [`docs/desktop-gui.md`](docs/desktop-gui.md)。
 
 ### 离线发现与轻量静态（无需运行、无需 Ghidra）
@@ -541,7 +573,7 @@ py/.venv/bin/python -m ast_matcher.cli --list-flags
 
 ```
 ├── scripts/                    j2c / j2c.ps1、setup、gui.sh / gui.ps1
-├── jvm/                        Kotlin/ASM 模块（Gradle；除 desktop-ui 外为 JDK 17）
+├── jvm/                        Kotlin/ASM 模块（Gradle；JDK 21）
 │   ├── jar-parser/             input.jar  → classes.json
 │   ├── trace-to-bytecode/      manifest + trace.jsonl → recovered/*.json
 │   ├── class-rebuilder/        input.jar + recovered/ → output.jar

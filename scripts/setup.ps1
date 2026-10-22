@@ -36,7 +36,7 @@ function Die($msg)  { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
 # Preconditions
 # ------------------------------------------------------------------
 if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
-    Die "java not found. Install a JDK 17+ (Temurin/Adoptium) and set JAVA_HOME, then re-run."
+    Die "java not found. Install a JDK 21+ (Temurin/Adoptium) and set JAVA_HOME, then re-run."
 }
 
 # ------------------------------------------------------------------
@@ -92,11 +92,9 @@ if ($SkipNative) {
     # On Windows only j2c_agent.dll is loadable; a leftover .so/.dylib is a
     # wrong-platform artifact and must not count as "already built".
     $agent = Join-Path $libDir "j2c_agent.dll"
-    # native/build.sh cross-targets x86-64 only; on an ARM64 Windows host it
-    # would emit a DLL the JVM here cannot load, so do not build it and do not
-    # report the default dynamic path as ready.
-    $hostArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
-    $archOk = ($hostArch -eq "AMD64")
+    # J2C_ARCH also handles x64 Git Bash running under Windows ARM64.
+    $hostArch = if ($env:J2C_ARCH) { $env:J2C_ARCH } elseif ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    $archOk = $hostArch -in @("AMD64", "x64", "x86_64", "ARM64", "aarch64")
     # Rebuild when the DLL is missing, empty, or older than any input.
     $needsBuild = $true
     if ((Test-Path $agent) -and ((Get-Item $agent).Length -gt 0)) {
@@ -116,10 +114,8 @@ if ($SkipNative) {
     # .so, not the Windows .dll the JVM here loads, so it is NOT equivalent.
     $hasBash = Get-Command bash -ErrorAction SilentlyContinue
     if (-not $archOk) {
-        Warn "This host is $hostArch, but native/build.sh targets x86-64; skipping native agent."
-        Warn "The default dynamic path needs a host-matching agent. Use the emulation fallback,"
-        Warn "or port native/build.sh to $hostArch and rebuild."
-        $nativeNote = "native agent skipped ($hostArch host; build.sh targets x86-64); the dynamic path is unavailable"
+        Warn "Unsupported native agent architecture: $hostArch"
+        $nativeNote = "native agent skipped (unsupported host: $hostArch)"
     } elseif ((-not $needsBuild) -and (-not $Force)) {
         Info "Native agent up to date ($agent); pass -Force to rebuild."
         $nativeReady = $true
@@ -141,6 +137,7 @@ if ($SkipNative) {
         Push-Location (Join-Path $Root "native")
         try {
             $env:JDK_HOME = $jdkHome
+            $env:J2C_ARCH = $hostArch
             if (-not $env:ZIG) { $env:ZIG = "zig" }
             bash build.sh
             if ($LASTEXITCODE -ne 0) { Die "Native agent build failed. See the output above." }

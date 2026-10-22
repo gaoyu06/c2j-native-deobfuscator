@@ -11,6 +11,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
+$portablePy = Join-Path $root "runtime/python/python.exe"
+if (Test-Path $portablePy) { $env:J2C_PYTHON = $portablePy }
 Set-Location (Join-Path $root "jvm")
 
 if ($SessionDir) {

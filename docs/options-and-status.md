@@ -1,3 +1,5 @@
+> Current build: all JVM modules and GitHub Actions now use JDK 21. Any JDK 17 / split-toolchain discussion below describes the earlier revision.
+
 # Options and status report for JNI-native recovery platform work
 
 > Status checked against GitHub on 2026-08-29 after wrap-up. Pull requests

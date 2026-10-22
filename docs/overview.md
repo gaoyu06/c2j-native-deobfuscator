@@ -29,8 +29,7 @@ shows artifacts; it does not replace the CLI. Adjacent user-mode
 observation modules sit **outside** the JAR pipeline and can be ignored
 or deleted without affecting recovery.
 
-The repository baseline is **JDK 17** and **Python 3.11+**. The desktop
-module alone requires **JDK 21**. The native JVMTI agent builds for
+All JVM modules use **JDK 21**; Python requires **3.11+**. The native JVMTI agent builds for
 **x86-64**.
 
 ---
@@ -162,8 +161,7 @@ client. Launch with `scripts/gui.sh [session-dir]`. It lists methods,
 recovered bodies, pipeline status, binding gaps, and can tail
 `trace.jsonl`. **Attach / Listen** is a front end to the same `attach`
 CLI (ownership checkbox, refusal banners, no second protocol). Recovery
-steps stay in the CLI. The module uses JDK 21; the rest of the
-repository stays on JDK 17. See [desktop-gui.md](desktop-gui.md).
+steps stay in the CLI. All JVM modules use JDK 21. See [desktop-gui.md](desktop-gui.md).
 
 ### native-x86 (preview)
 
@@ -191,7 +189,7 @@ source**. See [privileged-observer.md](privileged-observer.md).
 
 ```
 ├── scripts/                    j2c, j2c.ps1, setup, gui.sh / gui.ps1
-├── jvm/                        Kotlin/ASM (Gradle; JDK 17 except desktop-ui)
+├── jvm/                        Kotlin/ASM (Gradle; JDK 21)
 │   ├── jar-parser/             jar → classes.json
 │   ├── trace-to-bytecode/      trace.jsonl → recovered/*.json
 │   ├── class-rebuilder/        recovered/ → output.jar

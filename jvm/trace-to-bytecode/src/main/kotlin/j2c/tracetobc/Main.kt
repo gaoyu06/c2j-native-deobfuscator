@@ -32,40 +32,77 @@ class TraceToBytecodeCmd : Callable<Int> {
     @Option(names = ["--confidence"], description = ["Confidence label to attach to outputs"])
     var confidence: String = "low"
 
+    @Option(names = ["--owner-map"], description = ["Verified JNI class-handle to internal-name mapping for this trace only"])
+    var ownerMap: Path? = null
+
+    @Option(names = ["--allow-partial"], description = ["Return success even when methods remain unresolved (analysis only)"])
+    var allowPartial = false
+
     override fun call(): Int {
+        val overrides: Map<String, String> = ownerMap?.let { JsonIO.mapper.readValue(Files.readString(it), JsonIO.mapper.typeFactory.constructMapType(Map::class.java, String::class.java, String::class.java)) } ?: emptyMap()
         val mani: ManifestJson = JsonIO.read(manifest)
+        val knownOwners = mani.classes.map { it.name }.toSet()
+        require(overrides.values.all { it in knownOwners }) { "Owner map names must identify classes present in the manifest" }
         val events = parseTrace(trace)
+        require(events.none { it["ev"]?.asText() == "truncate" }) {
+            "Trace has truncated frames; recapture with max-frame-events=0"
+        }
         val groups = groupByMethodInvocation(events)
         val byMethod = mutableMapOf<MethodKey, MutableList<TraceGroup>>()
         for (g in groups) {
             byMethod.getOrPut(g.method) { mutableListOf() }.add(g)
         }
         Files.createDirectories(output)
+        val existingJson = Files.list(output).use { paths -> paths.anyMatch { it.fileName.toString().endsWith(".json") } }
+        require(!existingJson) { "Output already contains JSON files. Choose a fresh directory to avoid mixing old and corrected methods." }
         // One shared translator so symbols (jclass/jmethodID/jfieldID/jstring
         // observed in any frame) carry across method invocations.
-        val translator = TraceTranslator(mani)
+        val translator = TraceTranslator(mani, overrides)
         translator.warmup(events)
         var produced = 0
+        val failures = mutableListOf<Map<String, String>>()
+        val evidenceDir = output.toAbsolutePath().resolveSibling(output.fileName.toString() + ".invocations")
+        require(!Files.exists(evidenceDir)) { "Invocation evidence directory already exists: $evidenceDir" }
+        Files.createDirectories(evidenceDir)
+        for (cls in mani.classes) for (method in cls.methods) {
+            if ((method.access and 0x0100) != 0 && MethodKey(cls.name, method.name, method.desc) !in byMethod) {
+                failures += mapOf("owner" to cls.name, "name" to method.name, "desc" to method.desc, "reason" to "native method never observed")
+            }
+        }
         for ((mk, invocations) in byMethod) {
-            // Pick the longest (most informative) trace for this method
+            // Preserve every invocation outside recovered/; these are raw evidence,
+            // not alternative bodies to overwrite each other during rebuild.
+            for ((index, invocation) in invocations.withIndex()) {
+                JsonIO.write(evidenceDir.resolve("${safeFilename(mk)}.$index.json"), invocation)
+            }
+            // Longest trace is an analysis view, not a merged CFG.
             val pick = invocations.maxByOrNull { it.events.size } ?: continue
             // Union of exception types observed across ALL invocations of
             // this method — single-invocation traces may not exercise every
             // catch path, but we want to surface every type we ever saw.
             val excTypes = invocations.flatMap { it.exceptionsObserved }.toSortedSet().toList()
-            val recovered = translator.translate(mk, pick.events, confidence)
-                .copy(exceptionsObserved = excTypes)
+            val recovered = try {
+                translator.translate(mk, pick.events, confidence).copy(exceptionsObserved = excTypes)
+            } catch (ex: IllegalStateException) {
+                System.err.println("UNRESOLVED ${mk.owner}.${mk.name}${mk.desc}: ${ex.message}")
+                Files.deleteIfExists(output.resolve("${safeFilename(mk)}.json"))
+                failures += mapOf("owner" to mk.owner, "name" to mk.name, "desc" to mk.desc, "reason" to (ex.message ?: "unknown"))
+                continue
+            }
             val file = output.resolve("${safeFilename(mk)}.json")
             JsonIO.write(file, recovered)
             produced++
         }
-        System.err.println("Recovered $produced methods → $output")
-        return 0
+        val report = output.toAbsolutePath().resolveSibling(output.fileName.toString() + ".report.json")
+        JsonIO.write(report, mapOf("schemaVersion" to 1, "produced" to produced, "unresolved" to failures,
+            "status" to "analysis-only-native-cfg-unrecovered", "invocationEvidence" to evidenceDir.toString(), "runtimeValidated" to false))
+        System.err.println("Recovered $produced methods → $output; unresolved=${failures.size}; report=$report")
+        return if (failures.isEmpty() || allowPartial) 0 else 2
     }
 
     private fun safeFilename(mk: MethodKey): String {
         val safe = "${mk.owner}__${mk.name}__${mk.desc}"
-        return safe.replace('/', '_').replace('<', '_').replace('>', '_')
+        return java.security.MessageDigest.getInstance("SHA-256").digest(safe.toByteArray()).take(12).joinToString("") { "%02x".format(it.toInt() and 255) } + "__" + safe.replace('/', '_').replace('<', '_').replace('>', '_')
             .replace('(', '_').replace(')', '_').replace(';', '_').replace('[', '_')
     }
 }
@@ -89,7 +126,7 @@ private fun parseTrace(path: Path): List<JsonNode> {
             if (l.isEmpty()) return@forEach
             try {
                 list.add(JsonIO.mapper.readTree(l))
-            } catch (ignore: Throwable) { /* skip malformed */ }
+            } catch (ex: Exception) { throw IllegalArgumentException("Malformed trace JSON; refusing partial recovery", ex) }
         }
     }
     return list
@@ -214,7 +251,7 @@ private fun groupByMethodInvocation(events: List<JsonNode>): List<TraceGroup> {
                 val frame = stack.removeLastOrNull() ?: continue
                 result.add(TraceGroup(
                     frame.key,
-                    collapseRepeats(frame.jniBuf),
+                    frame.jniBuf,
                     frame.excTypes.toList(),
                 ))
             }
@@ -235,7 +272,7 @@ private fun groupByMethodInvocation(events: List<JsonNode>): List<TraceGroup> {
     return result
 }
 
-class TraceTranslator(private val manifest: ManifestJson) {
+class TraceTranslator(private val manifest: ManifestJson, private val ownerOverrides: Map<String, String> = emptyMap()) {
 
     // Symbol table: maps jobject hex string -> known semantic.
     // Persists across method translations so jclass / jmethodID observed in
@@ -340,9 +377,25 @@ class TraceTranslator(private val manifest: ManifestJson) {
      */
     fun warmup(allEvents: List<JsonNode>) {
         for (ev in allEvents) {
-            if (ev["ev"]?.asText() != "jni") continue
+            if (ev["ev"]?.asText() !in setOf("jni", "jni-init")) continue
             val call = ev["call"]?.asText() ?: continue
             updateSymbols(call, ev)
+            if (ev is com.fasterxml.jackson.databind.node.ObjectNode && ev["memberOwner"]?.isTextual == true) {
+                ev.put("_resolvedOwner", ev["memberOwner"].asText())
+                val args = ev["args"]
+                val midIndex = if (call.startsWith("CallNonvirtual")) 2 else 1
+                if (call.startsWith("Call") && args != null && midIndex < args.size()) {
+                    symbols[args[midIndex].asText()] = Sym.MethodId(ev["memberOwner"].asText(), ev["memberName"]?.asText(), ev["memberDesc"]?.asText() ?: ev["midDesc"]?.asText())
+                }
+            }
+            // Freeze lookup ownership at the event timestamp. JNI local
+            // handles are reused; consulting the final table later is unsafe.
+            if (ev is com.fasterxml.jackson.databind.node.ObjectNode &&
+                call in setOf("GetMethodID", "GetStaticMethodID", "GetFieldID", "GetStaticFieldID")) {
+                val sym = symbols[ev["ret"]?.asText()]
+                val owner = when (sym) { is Sym.MethodId -> sym.owner; is Sym.FieldId -> sym.owner; else -> null }
+                if (owner != null) ev.put("_resolvedOwner", owner)
+            }
         }
     }
 
@@ -383,13 +436,13 @@ class TraceTranslator(private val manifest: ManifestJson) {
         // prepareCall's matchesTop already handles for free).
         val producers = mutableMapOf<String, Int>()  // hex -> earliest producer idx
         for ((i, ev) in jniEvents.withIndex()) {
-            if (ev["ev"]?.asText() != "jni") continue
+            if (ev["ev"]?.asText() !in setOf("jni", "jni-init")) continue
             val retHex = ev["ret"]?.takeIf { it.isTextual }?.asText() ?: continue
             if (retHex.startsWith("0x") && retHex !in producers) producers[retHex] = i
         }
         val needSlot = mutableSetOf<String>()
         for ((i, ev) in jniEvents.withIndex()) {
-            if (ev["ev"]?.asText() != "jni") continue
+            if (ev["ev"]?.asText() !in setOf("jni", "jni-init")) continue
             val args = ev["args"] ?: continue
             for (k in 0 until args.size()) {
                 val v = args[k]
@@ -408,7 +461,10 @@ class TraceTranslator(private val manifest: ManifestJson) {
         }
 
         balancer.slotMap = slotMap
-        balancer.typeOracle = { hex -> symbolType(hex) }
+        balancer.typeOracle = { hex ->
+            val pd = paramLayout.firstOrNull { it.first == slotMap[hex] }?.second
+            if (pd != null && pd.startsWith("[")) pd else symbolType(hex)
+        }
 
         // 3) Initialize each SSA slot to `null` at method entry. Subsequent
         //    producers will overwrite via DUP+ASTORE; consumers (ALOAD) are
@@ -416,11 +472,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
         //    emit (e.g. it was dropped as infrastructure noise). Slots 0..
         //    paramSlotsTotal-1 are NOT initialized — the JVM already placed
         //    the real `this` and method parameter values there.
-        for ((_, slot) in slotMap.toList().sortedBy { it.second }) {
-            if (slot < paramSlotsTotal) continue
-            balancer.out += RecoveredInsn(op = "ACONST_NULL")
-            balancer.out += RecoveredInsn(op = "ASTORE", `var` = slot)
-        }
+        balancer.initializedSlots.addAll(0 until paramSlotsTotal)
 
         for (ev in jniEvents) {
             val call = ev["call"]?.asText() ?: continue
@@ -472,10 +524,23 @@ class TraceTranslator(private val manifest: ManifestJson) {
         updateSymbols(call, ev)
 
         val args = ev["args"]
+        if (call in setOf("NewGlobalRef", "NewWeakGlobalRef", "NewLocalRef")) {
+            val src = args?.get(0)?.asText()
+            val ret = ev["ret"]?.asText()
+            val slots = b.slotMap.toMutableMap()
+            if (src != null && ret != null && slots[src] != null) { slots[ret] = slots.getValue(src); b.slotMap = slots }
+        }
+        if (call.startsWith("Call") && ev["memberOwner"]?.isTextual == true && args != null) {
+            val idx = if (call.startsWith("CallNonvirtual")) 2 else 1
+            if (idx < args.size()) symbols[args[idx].asText()] = Sym.MethodId(ev["memberOwner"].asText(), ev["memberName"]?.asText(), ev["memberDesc"]?.asText() ?: ev["midDesc"]?.asText())
+        }
         val midDesc = ev["midDesc"]?.asText()
         val isIndyEvent = looksLikeIndyChainEvent(call, ev, midDesc)
         val outSizeBefore = b.out.size
         translateCallInner(call, ev, args, midDesc, b)
+        if (call in setOf("NewObjectArray", "NewBooleanArray", "NewCharArray", "NewFloatArray", "NewDoubleArray", "NewByteArray", "NewShortArray", "NewIntArray", "NewLongArray", "GetObjectArrayElement")) {
+            if (b.out.size > outSizeBefore) b.maybeStash(ev["ret"]?.asText())
+        }
         if (isIndyEvent) {
             for (i in outSizeBefore until b.out.size) {
                 if (b.out[i].dynamic == null) {
@@ -517,9 +582,9 @@ class TraceTranslator(private val manifest: ManifestJson) {
         when (call) {
             "GetStaticObjectField", "GetStaticBooleanField", "GetStaticByteField",
             "GetStaticCharField", "GetStaticShortField", "GetStaticIntField",
-            "GetStaticLongField" -> {
-                val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                val rawOwner = fid.owner ?: currentOwner
+            "GetStaticLongField", "GetStaticFloatField", "GetStaticDoubleField" -> {
+                val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: error("Unresolved field ID in $call: $args")
+                val rawOwner = fid.owner ?: error("Unresolved field owner: ${fid.name}${fid.desc}")
                 val owner = if (rawOwner.startsWith("[")) currentOwner else rawOwner
                 val produce = produceFor(fid.desc, ev["ret"]?.asText())
                 b.emitRaw(
@@ -530,9 +595,9 @@ class TraceTranslator(private val manifest: ManifestJson) {
             }
 
             "GetObjectField", "GetBooleanField", "GetByteField",
-            "GetCharField", "GetShortField", "GetIntField", "GetLongField" -> {
-                val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                val rawOwner = fid.owner ?: currentOwner
+            "GetCharField", "GetShortField", "GetIntField", "GetLongField", "GetFloatField", "GetDoubleField" -> {
+                val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: error("Unresolved field ID in $call: $args")
+                val rawOwner = fid.owner ?: error("Unresolved field owner: ${fid.name}${fid.desc}")
                 val owner = if (rawOwner.startsWith("[")) currentOwner else rawOwner
                 b.ensureReceiver(args?.get(0)?.asText(), owner)
                 val produce = produceFor(fid.desc, ev["ret"]?.asText())
@@ -544,9 +609,9 @@ class TraceTranslator(private val manifest: ManifestJson) {
             }
 
             "SetObjectField", "SetBooleanField", "SetByteField",
-            "SetCharField", "SetShortField", "SetIntField", "SetLongField" -> {
-                val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: return
-                val rawOwner = fid.owner ?: currentOwner
+            "SetCharField", "SetShortField", "SetIntField", "SetLongField", "SetFloatField", "SetDoubleField" -> {
+                val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: error("Unresolved field ID in $call: $args")
+                val rawOwner = fid.owner ?: error("Unresolved field owner: ${fid.name}${fid.desc}")
                 val owner = if (rawOwner.startsWith("[")) currentOwner else rawOwner
                 b.ensureReceiver(args?.get(0)?.asText(), owner)
                 b.pushArg(extractScalar(args?.get(2)), fid.desc ?: "I", dynamicKind = "field_value")
@@ -554,6 +619,14 @@ class TraceTranslator(private val manifest: ManifestJson) {
                     RecoveredInsn(op = "PUTFIELD", owner = owner, name = fid.name, desc = fid.desc),
                     consume = 2, produce = null,
                 )
+            }
+
+            "SetStaticObjectField", "SetStaticBooleanField", "SetStaticByteField", "SetStaticCharField",
+            "SetStaticShortField", "SetStaticIntField", "SetStaticLongField", "SetStaticFloatField", "SetStaticDoubleField" -> {
+                val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId ?: error("Unresolved static field in $call")
+                val owner = fid.owner ?: error("Unresolved static field owner")
+                b.pushArg(extractScalar(args?.get(2)), fid.desc ?: error("Missing field descriptor"), dynamicKind = "field_value")
+                b.emitRaw(RecoveredInsn(op = "PUTSTATIC", owner = owner, name = fid.name, desc = fid.desc), 1, null)
             }
 
             "AllocObject" -> {
@@ -589,8 +662,12 @@ class TraceTranslator(private val manifest: ManifestJson) {
                 }
             }
 
-            "CallNonvirtualVoidMethod", "CallNonvirtualObjectMethod" -> {
+            "CallNonvirtualVoidMethod", "CallNonvirtualObjectMethod",
+            "CallNonvirtualBooleanMethod", "CallNonvirtualByteMethod", "CallNonvirtualCharMethod",
+            "CallNonvirtualShortMethod", "CallNonvirtualIntMethod", "CallNonvirtualLongMethod",
+            "CallNonvirtualFloatMethod", "CallNonvirtualDoubleMethod" -> {
                 val mid = symbols[args?.get(2)?.asText()] as? Sym.MethodId
+                check(mid?.owner != null) { "Unresolved method owner in $call: $args" }
                 if (mid != null && mid.owner != null) {
                     val pairs = collectVariadicPairs(ev, mid.desc, midDesc, varadicStartIdx = 3)
                     b.prepareCall(receiverHex = args?.get(0)?.asText(), receiverType = mid.owner, argDescAndHex = pairs)
@@ -605,6 +682,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
             in CALL_OBJECT_VARIANTS, in CALL_PRIM_VARIANTS -> {
                 val isStaticCall = call.startsWith("CallStatic")
                 val mid = symbols[args?.get(1)?.asText()] as? Sym.MethodId
+                check(mid?.owner != null) { "Unresolved method owner in $call: $args" }
                 if (mid != null && mid.owner != null) {
                     val pairs = collectVariadicPairs(ev, mid.desc, midDesc, varadicStartIdx = 2)
                     b.prepareCall(
@@ -632,7 +710,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
             }
 
             "GetArrayLength" -> {
-                b.ensureReceiver(args?.get(0)?.asText(), "[Ljava/lang/Object;")
+                b.ensureReceiver(args?.get(0)?.asText(), null)
                 b.emitRaw(RecoveredInsn(op = "ARRAYLENGTH"), 1, StackBalancer.V.Int)
             }
 
@@ -640,23 +718,23 @@ class TraceTranslator(private val manifest: ManifestJson) {
                 val cls = symbols[args?.get(1)?.asText()] as? Sym.Class
                 if (cls != null) {
                     b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size")
-                    b.emitRaw(RecoveredInsn(op = "ANEWARRAY", type = cls.internalName), 1, StackBalancer.V.Obj)
+                    b.emitRaw(RecoveredInsn(op = "ANEWARRAY", type = cls.internalName), 1, produceFor("Ljava/lang/Object;", ev["ret"]?.asText()))
                 }
             }
 
-            "NewBooleanArray" -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 4), 1, StackBalancer.V.Obj) }
-            "NewCharArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 5), 1, StackBalancer.V.Obj) }
-            "NewFloatArray"   -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 6), 1, StackBalancer.V.Obj) }
-            "NewDoubleArray"  -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 7), 1, StackBalancer.V.Obj) }
-            "NewByteArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 8), 1, StackBalancer.V.Obj) }
-            "NewShortArray"   -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 9), 1, StackBalancer.V.Obj) }
-            "NewIntArray"     -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 10), 1, StackBalancer.V.Obj) }
-            "NewLongArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 11), 1, StackBalancer.V.Obj) }
+            "NewBooleanArray" -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 4), 1, produceFor("Ljava/lang/Object;", ev["ret"]?.asText())) }
+            "NewCharArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 5), 1, produceFor("Ljava/lang/Object;", ev["ret"]?.asText())) }
+            "NewFloatArray"   -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 6), 1, produceFor("Ljava/lang/Object;", ev["ret"]?.asText())) }
+            "NewDoubleArray"  -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 7), 1, produceFor("Ljava/lang/Object;", ev["ret"]?.asText())) }
+            "NewByteArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 8), 1, produceFor("Ljava/lang/Object;", ev["ret"]?.asText())) }
+            "NewShortArray"   -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 9), 1, produceFor("Ljava/lang/Object;", ev["ret"]?.asText())) }
+            "NewIntArray"     -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 10), 1, produceFor("Ljava/lang/Object;", ev["ret"]?.asText())) }
+            "NewLongArray"    -> { b.pushInt(args?.get(0)?.asInt() ?: 0, dynamicKind = "arr_size"); b.emitRaw(RecoveredInsn(op = "NEWARRAY", value = 11), 1, produceFor("Ljava/lang/Object;", ev["ret"]?.asText())) }
 
             "GetObjectArrayElement" -> {
                 b.ensureReceiver(args?.get(0)?.asText(), "[Ljava/lang/Object;")
                 b.pushInt(args?.get(1)?.asInt() ?: 0, dynamicKind = "arr_idx")
-                b.emitRaw(RecoveredInsn(op = "AALOAD"), 2, StackBalancer.V.Obj)
+                b.emitRaw(RecoveredInsn(op = "AALOAD"), 2, produceFor("Ljava/lang/Object;", ev["ret"]?.asText()))
             }
             "SetObjectArrayElement" -> {
                 b.ensureReceiver(args?.get(0)?.asText(), "[Ljava/lang/Object;")
@@ -683,7 +761,13 @@ class TraceTranslator(private val manifest: ManifestJson) {
             "SetFloatArrayRegion"   -> emitArrayStore(b, args, "[F", "F", "FASTORE")
             "SetDoubleArrayRegion"  -> emitArrayStore(b, args, "[D", "D", "DASTORE")
 
-            "Throw", "ThrowNew" -> b.emitRaw(RecoveredInsn(op = "ATHROW"), 1, null)
+            "GetBooleanArrayElements", "GetByteArrayElements", "GetCharArrayElements", "GetShortArrayElements",
+            "GetIntArrayElements", "GetLongArrayElements", "GetFloatArrayElements", "GetDoubleArrayElements",
+            "ReleaseBooleanArrayElements", "ReleaseByteArrayElements", "ReleaseCharArrayElements", "ReleaseShortArrayElements",
+            "ReleaseIntArrayElements", "ReleaseLongArrayElements", "ReleaseFloatArrayElements", "ReleaseDoubleArrayElements",
+            "NewString", "GetStringChars", "GetStringUTFChars", "MonitorEnter", "MonitorExit",
+            "ExceptionOccurred", "ExceptionClear" -> error("$call requires native data/control-flow reconstruction")
+            "Throw", "ThrowNew" -> error("JNI pending exception control flow requires reconstruction; refusing to emit an unrelated ATHROW")
 
             else -> {}
         }
@@ -775,10 +859,27 @@ class TraceTranslator(private val manifest: ManifestJson) {
         }
         if (targetSlots.isEmpty()) return
 
+        // Bind externally supplied arrays from their JNI role, not stale global
+        // jobject metadata. Local JNI handles can be reused across frames.
+        val arraySlots = paramLayout.filter { it.second.startsWith("[") }.map { it.first }
+        val seenProduced = mutableSetOf<String>()
+        for (ev in jniEvents) {
+            val call = ev["call"]?.asText() ?: continue
+            val h = ev["args"]?.get(0)?.takeIf { it.isTextual }?.asText()
+            if (h != null && h.startsWith("0x") && h !in seenProduced &&
+                (call == "GetArrayLength" || call.endsWith("ArrayRegion") || call == "GetObjectArrayElement" || call == "SetObjectArrayElement")) {
+                if (h !in slotMap) {
+                    val free = arraySlots.firstOrNull { it !in slotMap.values }
+                    if (free != null) slotMap[h] = free
+                }
+            }
+            val ret = ev["ret"]?.takeIf { it.isTextual }?.asText()
+            if (ret != null && ret.startsWith("0x")) seenProduced += ret
+        }
         val produced = mutableSetOf<String>()
         val firstExternalSeen = mutableListOf<String>()
         outer@ for (ev in jniEvents) {
-            if (ev["ev"]?.asText() != "jni") continue
+            if (ev["ev"]?.asText() !in setOf("jni", "jni-init")) continue
             val retNode = ev["ret"]
             if (retNode != null && retNode.isTextual) {
                 val r = retNode.asText()
@@ -796,7 +897,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
                 // jfieldID / known string literal) — these came from prior
                 // frames (e.g. registerNativesForClass), not from caller
                 // arg slots, so they aren't params.
-                if (symbols[h] != null) continue
+                if (symbols[h] is Sym.Class || symbols[h] is Sym.MethodId || symbols[h] is Sym.FieldId || symbols[h] is Sym.StringLit || symbols[h] is Sym.StringComputed) continue
                 if (h !in firstExternalSeen) firstExternalSeen += h
                 if (firstExternalSeen.size >= targetSlots.size) break@outer
             }
@@ -810,15 +911,17 @@ class TraceTranslator(private val manifest: ManifestJson) {
     private fun emitArrayLoad(b: StackBalancer, args: JsonNode?, arrType: String, op: String, produces: StackBalancer.V) {
         // ArrayRegion args: [array, start, len, (value)] — when len==1 we
         // treat this as a single element load (xALOAD).
+        require(args?.get(2)?.asInt() == 1) { "Bulk ArrayRegion needs loop/dataflow reconstruction" }
         b.ensureReceiver(args?.get(0)?.asText(), arrType)
         b.pushInt(args?.get(1)?.asInt() ?: 0, dynamicKind = "arr_idx")
         b.emitRaw(RecoveredInsn(op = op), 2, produces)
     }
 
     private fun emitArrayStore(b: StackBalancer, args: JsonNode?, arrType: String, elemDesc: String, op: String) {
+        require(args?.get(2)?.asInt() == 1) { "Bulk ArrayRegion needs loop/dataflow reconstruction" }
         b.ensureReceiver(args?.get(0)?.asText(), arrType)
         b.pushInt(args?.get(1)?.asInt() ?: 0, dynamicKind = "arr_idx")
-        b.pushArg(extractScalar(args?.get(3)), elemDesc, dynamicKind = "arr_value")
+        b.pushArg(extractScalar(args?.get(3)?.let { if (it.isArray) it.get(0) else it }), elemDesc, dynamicKind = "arr_value")
         b.emitRaw(RecoveredInsn(op = op), 3, null)
     }
 
@@ -921,8 +1024,12 @@ class TraceTranslator(private val manifest: ManifestJson) {
                 if (retHex != null) symbols[retHex] = Sym.StringLit(s)
             }
 
+            "GetObjectClass" -> {
+                val n = ev["retClassName"]?.asText()
+                if (n != null && retHex != null) symbols[retHex] = Sym.Class(n)
+            }
             "FindClass" -> {
-                val n = args?.get(0)?.takeIf { it.isTextual }?.asText() ?: return
+                val n = ev["retClassName"]?.asText() ?: args?.get(0)?.takeIf { it.isTextual }?.asText() ?: return
                 if (retHex != null) symbols[retHex] = Sym.Class(n)
             }
 
@@ -931,7 +1038,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
                 val name = args?.get(1)?.asText() ?: return
                 val desc = args?.get(2)?.asText() ?: return
                 if (retHex != null) {
-                    symbols[retHex] = Sym.MethodId(cls?.internalName, name, desc)
+                    symbols[retHex] = Sym.MethodId(ev["memberOwner"]?.asText() ?: ownerOverrides[args?.get(0)?.asText()] ?: ev["_resolvedOwner"]?.asText() ?: cls?.internalName, name, desc)
                 }
             }
 
@@ -940,7 +1047,7 @@ class TraceTranslator(private val manifest: ManifestJson) {
                 val name = args?.get(1)?.asText() ?: return
                 val desc = args?.get(2)?.asText() ?: return
                 if (retHex != null) {
-                    symbols[retHex] = Sym.FieldId(cls?.internalName, name, desc)
+                    symbols[retHex] = Sym.FieldId(ev["memberOwner"]?.asText() ?: ownerOverrides[args?.get(0)?.asText()] ?: ev["_resolvedOwner"]?.asText() ?: cls?.internalName, name, desc)
                 }
             }
 
@@ -956,42 +1063,42 @@ class TraceTranslator(private val manifest: ManifestJson) {
             "NewObject" -> {
                 val cls = symbols[args?.get(1)?.asText()] as? Sym.MethodId
                 val owner = cls?.owner
-                if (owner != null && retHex != null && symbols[retHex] == null) {
+                if (owner != null && retHex != null) {
                     symbols[retHex] = Sym.Object("L$owner;")
                 }
             }
             "AllocObject" -> {
                 val cls = symbols[args?.get(0)?.asText()] as? Sym.Class
-                if (cls != null && retHex != null && symbols[retHex] == null) {
+                if (cls != null && retHex != null) {
                     symbols[retHex] = Sym.Object("L${cls.internalName};")
                 }
             }
             "NewObjectArray" -> {
                 val cls = symbols[args?.get(1)?.asText()] as? Sym.Class
-                if (cls != null && retHex != null && symbols[retHex] == null) {
+                if (cls != null && retHex != null) {
                     symbols[retHex] = Sym.Object("[L${cls.internalName};")
                 }
             }
-            "NewBooleanArray" -> retHex?.let { if (symbols[it] == null) symbols[it] = Sym.Object("[Z") }
-            "NewCharArray"    -> retHex?.let { if (symbols[it] == null) symbols[it] = Sym.Object("[C") }
-            "NewFloatArray"   -> retHex?.let { if (symbols[it] == null) symbols[it] = Sym.Object("[F") }
-            "NewDoubleArray"  -> retHex?.let { if (symbols[it] == null) symbols[it] = Sym.Object("[D") }
-            "NewByteArray"    -> retHex?.let { if (symbols[it] == null) symbols[it] = Sym.Object("[B") }
-            "NewShortArray"   -> retHex?.let { if (symbols[it] == null) symbols[it] = Sym.Object("[S") }
-            "NewIntArray"     -> retHex?.let { if (symbols[it] == null) symbols[it] = Sym.Object("[I") }
-            "NewLongArray"    -> retHex?.let { if (symbols[it] == null) symbols[it] = Sym.Object("[J") }
+            "NewBooleanArray" -> retHex?.let { symbols[it] = Sym.Object("[Z") }
+            "NewCharArray"    -> retHex?.let { symbols[it] = Sym.Object("[C") }
+            "NewFloatArray"   -> retHex?.let { symbols[it] = Sym.Object("[F") }
+            "NewDoubleArray"  -> retHex?.let { symbols[it] = Sym.Object("[D") }
+            "NewByteArray"    -> retHex?.let { symbols[it] = Sym.Object("[B") }
+            "NewShortArray"   -> retHex?.let { symbols[it] = Sym.Object("[S") }
+            "NewIntArray"     -> retHex?.let { symbols[it] = Sym.Object("[I") }
+            "NewLongArray"    -> retHex?.let { symbols[it] = Sym.Object("[J") }
 
             "GetObjectField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId
                 val d = fid?.desc
-                if (d != null && retHex != null && (d.startsWith("L") || d.startsWith("[")) && symbols[retHex] == null) {
+                if (d != null && retHex != null && (d.startsWith("L") || d.startsWith("["))) {
                     symbols[retHex] = Sym.Object(d)
                 }
             }
             "GetStaticObjectField" -> {
                 val fid = symbols[args?.get(1)?.asText()] as? Sym.FieldId
                 val d = fid?.desc
-                if (d != null && retHex != null && (d.startsWith("L") || d.startsWith("[")) && symbols[retHex] == null) {
+                if (d != null && retHex != null && (d.startsWith("L") || d.startsWith("["))) {
                     symbols[retHex] = Sym.Object(d)
                 }
             }
@@ -1012,20 +1119,10 @@ class TraceTranslator(private val manifest: ManifestJson) {
                         }
                     }
                 }
-                // Heuristic 2: classloader.loadClass(String) -> jclass
-                if (midDesc != null && midDesc.endsWith(")Ljava/lang/Class;")) {
-                    // The first variadic arg starts at args[2]; if it is a
-                    // plain string literal (the agent inlined it), bind the
-                    // result to a Class.
-                    val first = args?.get(2)
-                    val name = if (first != null && first.isTextual) {
-                        val v = first.asText()
-                        if (!v.startsWith("0x")) v.replace('.', '/') else null
-                    } else null
-                    if (name != null && retHex != null) {
-                        symbols[retHex] = Sym.Class(name)
-                    }
-                }
+                // A classloader may map aliases or return a different class. Only
+                // actual JVMTI metadata identifies the returned jclass reliably.
+                val actualClass = ev["retClassName"]?.takeIf { it.isTextual }?.asText()
+                if (actualClass != null && retHex != null) symbols[retHex] = Sym.Class(actualClass)
                 // Heuristic 3: a Call*Method returning Ljava/lang/String;
                 //  - if the receiver was already a StringLit (e.g. .intern()),
                 //    propagate as StringLit (source-pool literal).
@@ -1059,7 +1156,9 @@ class TraceTranslator(private val manifest: ManifestJson) {
         private val CALL_PRIM_VARIANTS = setOf(
             "CallBooleanMethod", "CallByteMethod", "CallCharMethod",
             "CallShortMethod", "CallIntMethod", "CallLongMethod",
-            "CallVoidMethod",
+            "CallVoidMethod", "CallFloatMethod", "CallDoubleMethod",
+            "CallStaticBooleanMethod", "CallStaticByteMethod", "CallStaticCharMethod",
+            "CallStaticShortMethod", "CallStaticLongMethod", "CallStaticFloatMethod", "CallStaticDoubleMethod",
             "CallStaticIntMethod", "CallStaticVoidMethod",
         )
     }

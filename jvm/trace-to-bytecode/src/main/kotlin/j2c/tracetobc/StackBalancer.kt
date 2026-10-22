@@ -63,6 +63,7 @@ class StackBalancer(private val isStatic: Boolean) {
      * across the method body instead of NPE'ing on synthetic nulls.
      */
     var slotMap: Map<String, Int> = emptyMap()
+    val initializedSlots = mutableSetOf<Int>()
 
     /**
      * Optional jobject-hex -> internal type name lookup. When the translator
@@ -143,7 +144,7 @@ class StackBalancer(private val isStatic: Boolean) {
     }
 
     fun pushObjPlaceholder(type: String?) {
-        pushNullAs(type)
+        error("Unresolved object placeholder: $type")
     }
 
     fun pushObjLiteral(hex: String, type: String? = null) {
@@ -155,6 +156,7 @@ class StackBalancer(private val isStatic: Boolean) {
         // fall back to cross-frame type oracle when the caller has no idea.
         val effectiveType = type?.takeIf { it.isNotEmpty() && it != "?" } ?: typeOracle(hex)
         if (slot != null) {
+            check(slot in initializedSlots) { "JNI reference $hex reads uninitialized local $slot" }
             out += RecoveredInsn(op = "ALOAD", `var` = slot)
             if (!effectiveType.isNullOrEmpty() && effectiveType != "java/lang/Object") {
                 out += RecoveredInsn(op = "CHECKCAST", type = effectiveType)
@@ -162,6 +164,7 @@ class StackBalancer(private val isStatic: Boolean) {
             stack.addLast(V.ObjHex(hex))
             return
         }
+        check(hex == "0x0" || hex == "0x0000000000000000") { "Unresolved non-null JNI reference $hex ($effectiveType)" }
         out += RecoveredInsn(op = "ACONST_NULL")
         if (!effectiveType.isNullOrEmpty()) {
             out += RecoveredInsn(op = "CHECKCAST", type = effectiveType)
@@ -195,6 +198,7 @@ class StackBalancer(private val isStatic: Boolean) {
         // If the requested jobject is in the SSA slot map, reload it.
         val slot = slotMap[wantHex]
         if (slot != null) {
+            check(slot in initializedSlots) { "JNI receiver $wantHex reads uninitialized local $slot" }
             out += RecoveredInsn(op = "ALOAD", `var` = slot)
             if (type != null && type != "java/lang/Object" && type != "?") {
                 // ASTORE doesn't preserve the precise declared type; ALOAD
@@ -353,6 +357,7 @@ class StackBalancer(private val isStatic: Boolean) {
                     // Try the SSA slot map before falling back to null+checkcast.
                     val slot = slotMap[value]
                     if (slot != null) {
+                        check(slot in initializedSlots) { "JNI argument $value reads uninitialized local $slot" }
                         out += RecoveredInsn(op = "ALOAD", `var` = slot)
                         if (refType != null && refType != "java/lang/Object") {
                             out += RecoveredInsn(op = "CHECKCAST", type = refType)
@@ -400,6 +405,7 @@ class StackBalancer(private val isStatic: Boolean) {
         if (top !is V.Obj && top !is V.ObjHex) return
         out += RecoveredInsn(op = "DUP")
         out += RecoveredInsn(op = "ASTORE", `var` = slot)
+        initializedSlots += slot
         // model unchanged: DUP added one, ASTORE removed one
     }
 
@@ -435,7 +441,7 @@ class StackBalancer(private val isStatic: Boolean) {
                         if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
                         else out += RecoveredInsn(op = "POP")
                     }
-                    out += RecoveredInsn(op = "ICONST_0"); stack.addLast(V.Int)
+                    out += RecoveredInsn(op = "ICONST_0", dynamic = "unrecovered_return_default"); stack.addLast(V.Int)
                 }
                 stack.removeLast(); out += RecoveredInsn(op = "IRETURN")
             }
@@ -446,7 +452,7 @@ class StackBalancer(private val isStatic: Boolean) {
                         if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
                         else out += RecoveredInsn(op = "POP")
                     }
-                    out += RecoveredInsn(op = "LCONST_0"); stack.addLast(V.Long)
+                    out += RecoveredInsn(op = "LCONST_0", dynamic = "unrecovered_return_default"); stack.addLast(V.Long)
                 }
                 stack.removeLast(); out += RecoveredInsn(op = "LRETURN")
             }
@@ -457,7 +463,7 @@ class StackBalancer(private val isStatic: Boolean) {
                         if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
                         else out += RecoveredInsn(op = "POP")
                     }
-                    out += RecoveredInsn(op = "FCONST_0"); stack.addLast(V.Float)
+                    out += RecoveredInsn(op = "FCONST_0", dynamic = "unrecovered_return_default"); stack.addLast(V.Float)
                 }
                 stack.removeLast(); out += RecoveredInsn(op = "FRETURN")
             }
@@ -468,7 +474,7 @@ class StackBalancer(private val isStatic: Boolean) {
                         if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
                         else out += RecoveredInsn(op = "POP")
                     }
-                    out += RecoveredInsn(op = "DCONST_0"); stack.addLast(V.Double)
+                    out += RecoveredInsn(op = "DCONST_0", dynamic = "unrecovered_return_default"); stack.addLast(V.Double)
                 }
                 stack.removeLast(); out += RecoveredInsn(op = "DRETURN")
             }
@@ -483,7 +489,7 @@ class StackBalancer(private val isStatic: Boolean) {
                         if (t is V.Long || t is V.Double) out += RecoveredInsn(op = "POP2")
                         else out += RecoveredInsn(op = "POP")
                     }
-                    pushNullAs(expectedType)
+                    error("Unresolved object return for $methodDesc")
                 } else if (expectedType != null
                     && expectedType != "java/lang/Object"
                     && expectedType != "[Ljava/lang/Object;") {

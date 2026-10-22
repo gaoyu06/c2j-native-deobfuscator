@@ -101,7 +101,7 @@ Ghidra 反编译输出**会非常接近这个**（即便 -O2 把中间过程优�
 - 类型注解让 Ghidra 主动识别 `cstack[].i` / `cstack[].l` 等不同 union 访问
 
 **缺点**
-- 需要 Ghidra 运行环境（JDK 17+），headless 启动一次要几秒
+- 需要 Ghidra 运行环境（JDK 21+），headless 启动一次要几秒
 - 单函数 decompile 在大 jar（几百方法）上耗时，需要并行 / 缓存
 - AST 匹配规则的实现复杂度高于方案 A 的指令流匹配
 - 调试不便（Ghidra 内部不易插桩）

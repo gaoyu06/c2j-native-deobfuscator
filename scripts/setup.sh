@@ -40,7 +40,7 @@ die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 # Preconditions
 # ------------------------------------------------------------------
 command -v java >/dev/null 2>&1 || die \
-    "java not found. Install a JDK 17+ (Temurin/Adoptium) and set JAVA_HOME, then re-run."
+    "java not found. Install a JDK 21+ (Temurin/Adoptium) and set JAVA_HOME, then re-run."
 
 # ------------------------------------------------------------------
 # 1. JVM modules
@@ -91,18 +91,17 @@ else
     fi
     LIBDIR="$ROOT/native/build/lib"
     # Only the host-matching artifact is usable; a leftover build for another
-    # OS must not be treated as ready. native/build.sh currently targets
-    # x86-64, so the produced agent is x86-64 for this OS.
+    # OS must not be treated as ready. Build for the current host architecture.
     case "$(uname -s)" in
         Linux)               AGENT_NAME="j2c_agent.so" ;;
         Darwin)              AGENT_NAME="j2c_agent.dylib" ;;
         MINGW*|MSYS*|CYGWIN*) AGENT_NAME="j2c_agent.dll" ;;
         *)                   AGENT_NAME="j2c_agent.so" ;;
     esac
-    HOST_ARCH="$(uname -m)"
+    HOST_ARCH="${J2C_ARCH:-$(uname -m)}"
     AGENT="$LIBDIR/$AGENT_NAME"
     case "$HOST_ARCH" in
-        x86_64|amd64)
+        x86_64|amd64|AMD64|x64|aarch64|arm64|ARM64)
             # Rebuild when the artifact is missing, empty, or older than any input.
             needs_build=0
             if [ ! -s "$AGENT" ]; then
@@ -132,13 +131,8 @@ else
             fi
             ;;
         *)
-            # native/build.sh cross-targets x86-64 unconditionally; on any other
-            # host CPU it would emit an agent this JVM cannot load. Do not build
-            # it and do not report the default dynamic path as ready.
-            warn "This host is $HOST_ARCH, but native/build.sh targets x86-64; skipping native agent."
-            warn "The default dynamic path needs a host-matching agent. Use the emulation fallback,"
-            warn "or port native/build.sh to $HOST_ARCH and rebuild."
-            NATIVE_NOTE="native agent skipped ($HOST_ARCH host; build.sh targets x86-64); the dynamic path is unavailable"
+            warn "Unsupported native agent architecture: $HOST_ARCH"
+            NATIVE_NOTE="native agent skipped (unsupported host: $HOST_ARCH)"
             ;;
     esac
 fi

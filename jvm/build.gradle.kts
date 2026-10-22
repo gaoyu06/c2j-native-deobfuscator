@@ -14,12 +14,15 @@ subprojects {
 
     extensions.configure<JavaPluginExtension> {
         toolchain {
-            languageVersion.set(JavaLanguageVersion.of(17))
+            languageVersion.set(JavaLanguageVersion.of(21))
         }
     }
 
     extensions.configure<org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension> {
-        jvmToolchain(17)
+        jvmToolchain(21)
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
+        }
     }
 
     dependencies {
@@ -32,6 +35,10 @@ subprojects {
         implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.17.2")
         implementation("info.picocli:picocli:4.7.6")
         testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+    }
+
+    tasks.withType<JavaCompile>().configureEach {
+        options.release.set(21)
     }
 
     tasks.withType<Test>().configureEach {

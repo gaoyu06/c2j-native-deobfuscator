@@ -23,7 +23,7 @@ def _report(*checks):
 
 def test_doctor_exits_zero_when_healthy(monkeypatch):
     healthy = _report(
-        doctor_mod.Check("Java / JDK 17+", doctor_mod.STATUS_OK, "Java 17"),
+        doctor_mod.Check("Java / JDK 21+", doctor_mod.STATUS_OK, "Java 21"),
         doctor_mod.Check("Python 3.11+", doctor_mod.STATUS_OK, "3.12"),
     )
     monkeypatch.setattr(doctor_mod, "build_report", lambda root: healthy)
@@ -36,8 +36,8 @@ def test_doctor_healthy_with_warning_exits_zero(monkeypatch):
     # A WARN on a required check is a caveat, not a failure: still exit 0,
     # and the caveat is surfaced as a note.
     healthy = _report(
-        doctor_mod.Check("Java / JDK 17+", doctor_mod.STATUS_WARN,
-                         "Java 17 but JAVA_HOME is not set"),
+        doctor_mod.Check("Java / JDK 21+", doctor_mod.STATUS_WARN,
+                         "Java 21 but JAVA_HOME is not set"),
         doctor_mod.Check("Python 3.11+", doctor_mod.STATUS_OK, "3.12"),
     )
     monkeypatch.setattr(doctor_mod, "build_report", lambda root: healthy)
@@ -49,7 +49,7 @@ def test_doctor_healthy_with_warning_exits_zero(monkeypatch):
 
 def test_doctor_exits_nonzero_when_missing(monkeypatch):
     broken = _report(
-        doctor_mod.Check("Java / JDK 17+", doctor_mod.STATUS_OK, "Java 17"),
+        doctor_mod.Check("Java / JDK 21+", doctor_mod.STATUS_OK, "Java 21"),
         doctor_mod.Check(
             "Native JVMTI agent",
             doctor_mod.STATUS_MISSING,

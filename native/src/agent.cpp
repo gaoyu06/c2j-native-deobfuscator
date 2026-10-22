@@ -1,7 +1,7 @@
 // j2c-dumper JVMTI agent.
 //
 // Usage:
-//   -agentpath:j2c_agent.dll=trace=PATH[,native-only=true]
+//   "-agentpath:j2c_agent.dll=trace=PATH,include=obf.*;native.*"
 //
 // Functions:
 //   1. On VMInit: install our hooked JNIEnv function table on the main thread,
@@ -13,8 +13,14 @@
 //      and toggle a per-thread "in native frame" flag so JNI wrappers know
 //      they should log.
 
+#include <cmath>
+#include <iomanip>
+#include <limits>
 #include "trace_writer.hpp"
 #include "jni_hook.hpp"
+#include "class_filter.hpp"
+#include <vector>
+#include <tuple>
 
 #include <jvmti.h>
 #include <cstdio>
@@ -28,6 +34,9 @@ namespace hook = j2c::jni_hook;
 namespace {
 
 std::string g_trace_path = "trace.jsonl";
+// Every native frame participates, including excluded/JDK frames.
+thread_local std::vector<bool> g_selected_frames;
+std::string g_include_options;
 
 std::string esc(const char* s) {
     if (!s) return "null";
@@ -67,6 +76,11 @@ void parse_options(const char* options) {
         std::string k = pair.substr(0, eq);
         std::string v = eq == std::string::npos ? "" : pair.substr(eq + 1);
         if (k == "trace") g_trace_path = v;
+        else if (k == "include") {
+            j2c::class_filter.add(v);
+            if (!g_include_options.empty()) g_include_options += ";";
+            g_include_options += v;
+        }
         else if (k == "log-all" && (v == "1" || v == "true")) hook::set_log_all(true);
         else if (k == "max-frame-events") {
             try { hook::set_max_frame_events(std::stoi(v)); } catch (...) {}
@@ -118,6 +132,7 @@ void JNICALL on_thread_start(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
 void JNICALL on_native_method_bind(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
                                    jmethodID method, void* address, void** new_address_ptr) {
     auto [cname, nm, ds] = method_info(jvmti, method);
+    if (!j2c::class_filter.matches(cname)) return;
     std::ostringstream os;
     os << "{\"ev\":\"bind\",\"ts\":" << TraceWriter::ts_now()
        << ",\"thr\":" << TraceWriter::tid()
@@ -143,7 +158,12 @@ void JNICALL on_method_entry(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
     // JDK native methods called from inside a user native frame should not
     // contribute JNI events to the recovery trace — they're internal noise
     // (e.g. String.getBytes uses byte-array ops we'd otherwise capture).
-    if (is_jdk_native(cname)) {
+    if (j2c::class_filter.active()) {
+        const bool selected = j2c::class_filter.matches(cname);
+        g_selected_frames.push_back(selected);
+        hook::set_filter_frame_selected(selected);
+        if (!selected) return;
+    } else if (is_jdk_native(cname)) {
         if (hook::in_native_frame()) hook::enter_suppress_frame();
         return;
     }
@@ -153,7 +173,8 @@ void JNICALL on_method_entry(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
        << ",\"thr\":" << TraceWriter::tid()
        << ",\"owner\":" << esc(cname.c_str())
        << ",\"name\":" << esc(nm.c_str())
-       << ",\"desc\":" << esc(ds.c_str()) << "}";
+       << ",\"desc\":" << esc(ds.c_str())
+       << ",\"argsCaptured\":false,\"argsGap\":\"native ABI entry trampoline not implemented\"}";
     TraceWriter::instance().write_line(os.str());
 }
 
@@ -174,6 +195,12 @@ void JNICALL on_exception(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
     // looks like the "outside" thread state. We record every user-method
     // exception and let the translator filter at frame association time.
     auto [tcname, tnm, tds] = method_info(jvmti, method);
+    if (j2c::class_filter.active()) {
+        // Preserve exceptions from Java/JDK callees of a selected native frame.
+        if (!g_selected_frames.empty()) {
+            if (!g_selected_frames.back()) return;
+        } else if (!j2c::class_filter.matches(tcname)) return;
+    }
     // Resolve exception class
     jclass ec = jni->GetObjectClass(exception);
     char* ec_sig = nullptr;
@@ -206,6 +233,12 @@ void JNICALL on_exception_catch(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
                                 jmethodID method, jlocation location,
                                 jobject exception) {
     auto [tcname, tnm, tds] = method_info(jvmti, method);
+    if (j2c::class_filter.active()) {
+        // Preserve exceptions from Java/JDK callees of a selected native frame.
+        if (!g_selected_frames.empty()) {
+            if (!g_selected_frames.back()) return;
+        } else if (!j2c::class_filter.matches(tcname)) return;
+    }
     jclass ec = jni->GetObjectClass(exception);
     char* ec_sig = nullptr;
     if (ec) jvmti->GetClassSignature(ec, &ec_sig, nullptr);
@@ -230,7 +263,14 @@ void JNICALL on_method_exit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
                             jvalue return_value) {
     if (!method_is_native(jvmti, method)) return;
     auto [cname, nm, ds] = method_info(jvmti, method);
-    if (is_jdk_native(cname)) {
+    if (j2c::class_filter.active()) {
+        // Live attach can observe an exit whose entry preceded attachment.
+        if (g_selected_frames.empty()) return;
+        const bool selected = g_selected_frames.back();
+        g_selected_frames.pop_back();
+        hook::set_filter_frame_selected(!g_selected_frames.empty() && g_selected_frames.back());
+        if (!selected) return;
+    } else if (is_jdk_native(cname)) {
         if (hook::in_native_frame()) hook::exit_suppress_frame();
         return;
     }
@@ -241,6 +281,28 @@ void JNICALL on_method_exit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
        << ",\"name\":" << esc(nm.c_str())
        << ",\"desc\":" << esc(ds.c_str())
        << ",\"exc\":" << (was_popped_by_exception ? "true" : "false") << "}";
+    if (!was_popped_by_exception) {
+        const char rt = ds.empty() ? 'V' : ds[ds.find_last_of(')') + 1];
+        os.seekp(-1, std::ios_base::cur);
+        os << ",\"retType\":" << esc(std::string(1, rt).c_str()) << ",\"ret\":";
+        switch (rt) {
+            case 'V': os << "null"; break;
+            case 'Z': os << (return_value.z ? "true" : "false"); break;
+            case 'B': os << int(return_value.b); break;
+            case 'C': os << unsigned(return_value.c); break;
+            case 'S': os << return_value.s; break;
+            case 'I': os << return_value.i; break;
+            case 'J': os << return_value.j; break;
+            case 'F': case 'D': {
+                double v = rt == 'F' ? double(return_value.f) : return_value.d;
+                if (std::isfinite(v)) os << std::setprecision(17) << v;
+                else os << esc(std::isnan(v) ? "NaN" : v < 0 ? "-Infinity" : "Infinity");
+                break;
+            }
+            default: { std::ostringstream h; h << "0x" << std::hex << reinterpret_cast<uintptr_t>(return_value.l); os << esc(h.str().c_str()); }
+        }
+        os << "}";
+    }
     TraceWriter::instance().write_line(os.str());
     hook::exit_native_frame();
 }
@@ -346,6 +408,8 @@ jint init_agent(JavaVM* vm, char* options, bool live_attach) {
         return JNI_ERR;
     }
 
+    hook::set_jvmti(jvmti);
+
     jvmtiPhase phase = JVMTI_PHASE_ONLOAD;
     jvmti->GetPhase(&phase);
     const char* pname = phase_name(phase);
@@ -357,6 +421,8 @@ jint init_agent(JavaVM* vm, char* options, bool live_attach) {
        << ",\"mode\":" << esc(live_attach ? "live-attach" : "startup")
        << ",\"phase\":" << esc(pname)
        << ",\"logAll\":" << (hook::log_all() ? "true" : "false")
+       << ",\"include\":" << esc(g_include_options.c_str())
+       << ",\"includeActive\":" << (j2c::class_filter.active() ? "true" : "false")
        << ",\"trace\":" << esc(g_trace_path.c_str()) << "}";
     TraceWriter::instance().write_line(lc.str());
 
